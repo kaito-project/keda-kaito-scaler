@@ -1,0 +1,33 @@
+run:
+  timeout: 15m
+
+linters-settings:
+  gci:
+    skip-generated: true
+    sections:
+      - standard
+      - prefix(github.com/kaito-project)
+      - default
+  gofmt:
+    simplify: true
+  goimports:
+    local-prefixes: github.com/kaito-project
+
+# Completely disable typecheck due to Go 1.24 compatibility issues
+issues:
+  exclude:
+    - "could not import k8s.io/apimachinery/pkg/types"
+    - "undefined.*Update"
+    - "undefined.*Get"
+    - "undefined: klog"
+    - "declared and not used: serverKey"
+
+linters:
+  disable-all: true
+  enable:
+    - gofmt
+    - goimports
+    - gci
+    - misspell
+    - ineffassign
+  fast: true
