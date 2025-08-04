@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"fmt"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -103,41 +104,60 @@ func NewController(clk clock.Clock, kubeClient client.Client, ns, secretName, se
 	}
 }
 
+// Reconcile manages the lifecycle of TLS certificates for webhook configurations.
+// It ensures that certificates are renewed before they expire and that webhook
+// configurations are updated with the latest CA certificates.
+//
+// The reconciliation logic:
+// 1. Ignores secrets that don't match the expected name/namespace
+// 2. Checks if existing certificates need renewal (>85% of validity period elapsed)
+// 3. If renewal is not needed, updates webhook configurations and schedules next check
+// 4. If renewal is needed, generates new certificates and updates both secret and webhook configs
 func (c *Controller) Reconcile(ctx context.Context, secret *corev1.Secret) (reconcile.Result, error) {
+	// Only process the specific secret we're managing
 	if secret.Namespace != c.workingNamespace || secret.Name != c.webhookServerSecretName {
 		return reconcile.Result{}, nil
 	}
+
 	ctx = util.WithControllerName(ctx, "server.secret")
+
+	// Check if we have valid certificate data and whether it needs renewal
 	if len(secret.Data[util.ServerCert]) != 0 &&
 		len(secret.Data[util.ServerKey]) != 0 &&
 		len(secret.Data[util.CACert]) != 0 {
-		// if the certificate is valid for less than 15% of total validity , we will renew it.
+		// if the certificate has been valid for more than 85% of its total validity period, we will renew it.
 		if shouldRenew, timeUntilNextCheck := shouldRenewCert(c.clock, secret.Data[util.ServerCert], secret.Data[util.ServerKey]); !shouldRenew {
+			// Certificate is still valid, just update webhook configurations and requeue for next check
 			if err := c.updateWebhookConfigurations(ctx, secret.Data[util.CACert]); err != nil {
-				return reconcile.Result{}, err
+				return reconcile.Result{}, fmt.Errorf("failed to update webhook configurations: %w", err)
 			}
 			return reconcile.Result{RequeueAfter: timeUntilNextCheck}, nil
 		}
 	}
 
+	// Certificate needs renewal or doesn't exist - generate new one
 	updatedSecret := secret.DeepCopy()
 	newSecret, err := generateSecret(ctx, c.webhookServiceName, c.webhookServerSecretName, c.workingNamespace, c.clock.Now().Add(c.expirationDuration))
 	if err != nil {
-		return reconcile.Result{}, err
+		return reconcile.Result{}, fmt.Errorf("failed to generate new secret: %w", err)
 	}
 	updatedSecret.Data = newSecret.Data
 
-	if err := c.Update(ctx, updatedSecret); err != nil {
-		return reconcile.Result{}, err
+	// Update the secret with new certificate data
+	if err := c.Client.Update(ctx, updatedSecret); err != nil {
+		return reconcile.Result{}, fmt.Errorf("failed to update secret %s/%s: %w", c.workingNamespace, c.webhookServerSecretName, err)
 	}
 
+	// Update webhook configurations with the new CA certificate
 	return reconcile.Result{}, c.updateWebhookConfigurations(ctx, updatedSecret.Data[util.CACert])
 }
 
+// generateSecret creates a new Kubernetes secret containing TLS certificates for the webhook server.
+// It generates a complete certificate chain including server certificate, private key, and CA certificate.
 func generateSecret(ctx context.Context, serviceName, name, namespace string, notAfter time.Time) (*corev1.Secret, error) {
 	serverKey, serverCert, caCert, err := resources.CreateCerts(ctx, serviceName, namespace, notAfter)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create certificates for service %s in namespace %s: %w", serviceName, namespace, err)
 	}
 
 	return &corev1.Secret{
@@ -164,16 +184,23 @@ func shouldRenewCert(clk clock.Clock, certPEMBlock, keyPEMBlock []byte) (bool, t
 		return true, 0
 	}
 
+	// Additional certificate validation
+	if err := validateCertificate(certData, clk.Now()); err != nil {
+		return true, 0
+	}
+
 	now := clk.Now()
 	startTime := certData.NotBefore
 	expiryTime := certData.NotAfter
 	totalValidity := expiryTime.Sub(startTime)
 	elapsed := now.Sub(startTime)
 
+	// Renew when certificate has been valid for 85% of its total validity period
 	if float64(elapsed)/float64(totalValidity) >= 0.85 {
 		return true, 0
 	}
 
+	// Calculate next check time (every 5% of total validity, minimum 1 minute)
 	nextCheck := totalValidity / 20
 	timeUntilNextCheck := expiryTime.Sub(now) - nextCheck
 	if timeUntilNextCheck < time.Minute {
@@ -183,47 +210,99 @@ func shouldRenewCert(clk clock.Clock, certPEMBlock, keyPEMBlock []byte) (bool, t
 	return false, timeUntilNextCheck
 }
 
+// validateCertificate performs additional certificate validation
+func validateCertificate(cert *x509.Certificate, now time.Time) error {
+	// Check if certificate is currently valid (not expired, not before valid time)
+	if now.Before(cert.NotBefore) {
+		return fmt.Errorf("certificate is not yet valid (NotBefore: %v, Now: %v)", cert.NotBefore, now)
+	}
+	if now.After(cert.NotAfter) {
+		return fmt.Errorf("certificate has expired (NotAfter: %v, Now: %v)", cert.NotAfter, now)
+	}
+
+	// Check key usage - should include digital signature and key encipherment for TLS
+	hasDigitalSignature := cert.KeyUsage&x509.KeyUsageDigitalSignature != 0
+	hasKeyEncipherment := cert.KeyUsage&x509.KeyUsageKeyEncipherment != 0
+
+	if !hasDigitalSignature || !hasKeyEncipherment {
+		return fmt.Errorf("certificate has invalid key usage (DigitalSignature: %v, KeyEncipherment: %v)",
+			hasDigitalSignature, hasKeyEncipherment)
+	}
+
+	// Check extended key usage - should include server authentication
+	hasServerAuth := false
+	for _, eku := range cert.ExtKeyUsage {
+		if eku == x509.ExtKeyUsageServerAuth {
+			hasServerAuth = true
+			break
+		}
+	}
+	if !hasServerAuth {
+		return fmt.Errorf("certificate missing server authentication extended key usage")
+	}
+
+	return nil
+}
+
 func (c *Controller) updateWebhookConfigurations(ctx context.Context, caCert []byte) error {
-	var validatingWebhook admissionv1.ValidatingWebhookConfiguration
-	if err := c.Get(ctx, client.ObjectKey{Name: kedaKaitoScalerValidatingWebhookConfig}, &validatingWebhook); err != nil {
+	// Update validating webhook configuration
+	if err := c.updateValidatingWebhookConfiguration(ctx, caCert); err != nil {
+		return fmt.Errorf("failed to update validating webhook configuration: %w", err)
+	}
+
+	// Update mutating webhook configuration
+	if err := c.updateMutatingWebhookConfiguration(ctx, caCert); err != nil {
+		return fmt.Errorf("failed to update mutating webhook configuration: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Controller) updateValidatingWebhookConfiguration(ctx context.Context, caCert []byte) error {
+	var webhook admissionv1.ValidatingWebhookConfiguration
+	if err := c.Client.Get(ctx, client.ObjectKey{Name: kedaKaitoScalerValidatingWebhookConfig}, &webhook); err != nil {
 		return err
 	}
 
 	updated := false
-	for i := range validatingWebhook.Webhooks {
-		if caCertChanged(validatingWebhook.Webhooks[i].ClientConfig.CABundle, caCert) {
-			validatingWebhook.Webhooks[i].ClientConfig.CABundle = caCert
-			validatingWebhook.Webhooks[i].ClientConfig.Service.Namespace = c.workingNamespace
-			validatingWebhook.Webhooks[i].ClientConfig.Service.Name = c.webhookServiceName
+	for i := range webhook.Webhooks {
+		if caCertChanged(webhook.Webhooks[i].ClientConfig.CABundle, caCert) {
+			webhook.Webhooks[i].ClientConfig.CABundle = caCert
+			webhook.Webhooks[i].ClientConfig.Service.Namespace = c.workingNamespace
+			webhook.Webhooks[i].ClientConfig.Service.Name = c.webhookServiceName
 			updated = true
 		}
 	}
 
 	if updated {
-		if err := c.Update(ctx, &validatingWebhook); err != nil {
+		if err := c.Client.Update(ctx, &webhook); err != nil {
 			log.FromContext(ctx).Error(err, "failed to update validating webhook configuration", "name", kedaKaitoScalerValidatingWebhookConfig)
 			return err
 		}
 		log.FromContext(ctx).Info("updated validating webhook configuration", "name", kedaKaitoScalerValidatingWebhookConfig)
 	}
 
-	var mutatingWebhook admissionv1.MutatingWebhookConfiguration
-	if err := c.Get(ctx, client.ObjectKey{Name: kedaKaitoScalerMutatingWebhookConfig}, &mutatingWebhook); err != nil {
+	return nil
+}
+
+func (c *Controller) updateMutatingWebhookConfiguration(ctx context.Context, caCert []byte) error {
+	var webhook admissionv1.MutatingWebhookConfiguration
+	if err := c.Client.Get(ctx, client.ObjectKey{Name: kedaKaitoScalerMutatingWebhookConfig}, &webhook); err != nil {
 		return err
 	}
 
-	updated = false
-	for i := range mutatingWebhook.Webhooks {
-		if caCertChanged(mutatingWebhook.Webhooks[i].ClientConfig.CABundle, caCert) {
-			mutatingWebhook.Webhooks[i].ClientConfig.CABundle = caCert
-			mutatingWebhook.Webhooks[i].ClientConfig.Service.Namespace = c.workingNamespace
-			mutatingWebhook.Webhooks[i].ClientConfig.Service.Name = c.webhookServiceName
+	updated := false
+	for i := range webhook.Webhooks {
+		if caCertChanged(webhook.Webhooks[i].ClientConfig.CABundle, caCert) {
+			webhook.Webhooks[i].ClientConfig.CABundle = caCert
+			webhook.Webhooks[i].ClientConfig.Service.Namespace = c.workingNamespace
+			webhook.Webhooks[i].ClientConfig.Service.Name = c.webhookServiceName
 			updated = true
 		}
 	}
 
 	if updated {
-		if err := c.Update(ctx, &mutatingWebhook); err != nil {
+		if err := c.Client.Update(ctx, &webhook); err != nil {
 			log.FromContext(ctx).Error(err, "failed to update mutating webhook configuration", "name", kedaKaitoScalerMutatingWebhookConfig)
 			return err
 		}
@@ -233,8 +312,23 @@ func (c *Controller) updateWebhookConfigurations(ctx context.Context, caCert []b
 	return nil
 }
 
+// caCertChanged compares two CA certificates to determine if they are different.
+// It uses base64 encoding comparison for efficiency, but could be enhanced to
+// compare actual certificate content for semantic equivalence.
 func caCertChanged(old, new []byte) bool {
-	return base64.StdEncoding.EncodeToString(old) != base64.StdEncoding.EncodeToString(new)
+	// Handle nil cases
+	if old == nil && new == nil {
+		return false
+	}
+	if old == nil || new == nil {
+		return true
+	}
+
+	// Compare base64 encoded versions
+	oldEncoded := base64.StdEncoding.EncodeToString(old)
+	newEncoded := base64.StdEncoding.EncodeToString(new)
+
+	return oldEncoded != newEncoded
 }
 
 func (c *Controller) generateSecretPredicateFunc() predicate.Predicate {

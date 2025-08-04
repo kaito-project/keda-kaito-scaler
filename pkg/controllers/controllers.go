@@ -16,7 +16,6 @@ import (
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;patch;update
 
 func NewControllers(mgr manager.Manager, clock clock.Clock, opts *options.KedaKaitoScalerOptions) []controller.Controller {
-
 	return []controller.Controller{
 		secret.NewController(clock, mgr.GetClient(), opts.WorkingNamespace, opts.WebhookSecretName, opts.WebhookServiceName, opts.ExpirationDuration),
 		// add controllers here

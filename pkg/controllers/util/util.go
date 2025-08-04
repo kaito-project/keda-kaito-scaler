@@ -10,7 +10,7 @@ import (
 const (
 	ServerKey  = "server-key.pem"
 	ServerCert = "server-cert.pem"
-	CACert     = "ce-cert.pem"
+	CACert     = "ca-cert.pem"
 )
 
 type controllerNameKeyType struct{}

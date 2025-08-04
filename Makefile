@@ -93,6 +93,19 @@ bin/keda-kaito-scaler:
 	@mkdir -p $(OUTPUT_DIR)
 	go build -ldflags "$(LDFLAGS)" -o $(OUTPUT_DIR)/keda-kaito-scaler ./cmd/main.go
 
+.PHONY: test
+test: ## Run tests
+	@echo "Running tests..."
+	@if find ./pkg ./cmd -name "*_test.go" | grep -q .; then \
+		echo "Found test files, running tests with coverage..."; \
+		go test -v -race -coverprofile=coverage.out -covermode=atomic ./pkg/... ./cmd/...; \
+		go tool cover -html=coverage.out -o coverage.html; \
+		echo "Coverage report generated: coverage.html"; \
+	else \
+		echo "No test files found, creating example to ensure compilation works..."; \
+		go test -c ./pkg/... ./cmd/... > /dev/null 2>&1 && echo "✓ Code compiles successfully" || (echo "✗ Compilation failed" && exit 1); \
+	fi
+
 ## --------------------------------------
 ## Docker Image Build
 ## --------------------------------------
