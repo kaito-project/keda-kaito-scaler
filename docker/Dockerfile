@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=${GOCACHE} \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} GO111MODULE=on make bin/keda-kaito-scaler
 
 # Build a small image
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/devcontainers/base:ubuntu
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/cbl-mariner/distroless/minimal:2.0
 WORKDIR /
 COPY --from=builder /workspace/_output/keda-kaito-scaler .
 

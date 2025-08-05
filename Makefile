@@ -1,5 +1,4 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT license.
+# Makefile for KEDA Kaito Scaler
 
 REGISTRY ?= YOUR_REGISTRY
 VERSION ?= v0.0.1
