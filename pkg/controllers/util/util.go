@@ -18,9 +18,17 @@ import (
 )
 
 const (
-	ServerKey  = "server-key.pem"
-	ServerCert = "server-cert.pem"
-	CACert     = "ca-cert.pem"
+	// Certificate and key fields for comprehensive TLS setup
+	// CA Certificate - Root certificate authority for scaler communication
+	CACert = "ca.crt"
+
+	// Server Certificate and Key - Used by the external Kaito scaler GRPC server
+	ServerCert = "server.crt"
+	ServerKey  = "server.key"
+
+	// Client Certificate and Key - Used by KEDA core to authenticate with external scaler
+	ClientCert = "tls.crt" // Standard kubernetes.io/tls format
+	ClientKey  = "tls.key" // Standard kubernetes.io/tls format
 )
 
 type controllerNameKeyType struct{}

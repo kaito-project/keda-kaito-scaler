@@ -11,31 +11,58 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package secret provides the secret controller responsible for managing TLS certificates
+// required for secure GRPC communication between KEDA core and the external Kaito scaler.
+//
+// This controller ensures that certificates and secrets are automatically generated,
+// distributed, and renewed without manual intervention.
+//
+// Certificate Structure:
+//   - CA Certificate: Root certificate authority for the scaler communication
+//   - Server Certificate: Used by the external Kaito scaler GRPC server
+//   - Client Certificate: Used by KEDA core to authenticate with the external scaler
+//   - DNS SANs: Includes all necessary service names and IPs for flexible deployment
+//     (e.g., scaler service FQDN: kaito-scaler.keda.svc.cluster.local)
+//
+// The generated secret follows the kubernetes.io/tls format with additional fields:
+//
+//	apiVersion: v1
+//	kind: Secret
+//	metadata:
+//	  name: keda-kaito-scaler-certs
+//	  namespace: keda
+//	type: kubernetes.io/tls
+//	data:
+//	  ca.crt: <base64-encoded-ca-certificate>
+//	  tls.crt: <base64-encoded-client-certificate>
+//	  tls.key: <base64-encoded-client-private-key>
+//	  server.crt: <base64-encoded-server-certificate>
+//	  server.key: <base64-encoded-server-private-key>
 package secret
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
+	"net"
 	"time"
 
 	"golang.org/x/time/rate"
-	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
-	"knative.dev/pkg/webhook/certificates/resources"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -43,111 +70,54 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers/util"
 )
 
-const (
-	kedaKaitoScalerValidatingWebhookConfig = "keda-kaito-scaler-validating-webhook-configuration"
-	kedaKaitoScalerMutatingWebhookConfig   = "keda-kaito-scaler-mutating-webhook-configuration"
-)
-
-var (
-	validatingWebhookConfigPredicate = predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			vwc, ok := e.Object.(*admissionv1.ValidatingWebhookConfiguration)
-			if !ok {
-				return false
-			}
-
-			return vwc.Name == kedaKaitoScalerValidatingWebhookConfig
-		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			vwc, ok := e.ObjectNew.(*admissionv1.ValidatingWebhookConfiguration)
-			if !ok {
-				return false
-			}
-
-			return vwc.Name == kedaKaitoScalerValidatingWebhookConfig
-		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			return false
-		},
-	}
-
-	mutatingWebhookConfigPredicate = predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			mwc, ok := e.Object.(*admissionv1.MutatingWebhookConfiguration)
-			if !ok {
-				return false
-			}
-
-			return mwc.Name == kedaKaitoScalerMutatingWebhookConfig
-		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			mwc, ok := e.ObjectNew.(*admissionv1.MutatingWebhookConfiguration)
-			if !ok {
-				return false
-			}
-
-			return mwc.Name == kedaKaitoScalerMutatingWebhookConfig
-		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			return false
-		},
-	}
-)
-
 type Controller struct {
 	client.Client
-	clock                   clock.Clock
-	workingNamespace        string
-	webhookServerSecretName string
-	webhookServiceName      string
-	expirationDuration      time.Duration
+	clock              clock.Clock
+	workingNamespace   string
+	serverSecretName   string
+	serviceName        string
+	expirationDuration time.Duration
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, ns, secretName, serviceName string, expirationDuration time.Duration) *Controller {
 	return &Controller{
-		clock:                   clk,
-		Client:                  kubeClient,
-		workingNamespace:        ns,
-		webhookServerSecretName: secretName,
-		webhookServiceName:      serviceName,
-		expirationDuration:      expirationDuration,
+		clock:              clk,
+		Client:             kubeClient,
+		workingNamespace:   ns,
+		serverSecretName:   secretName,
+		serviceName:        serviceName,
+		expirationDuration: expirationDuration,
 	}
 }
 
-// Reconcile manages the lifecycle of TLS certificates for webhook configurations.
-// It ensures that certificates are renewed before they expire and that webhook
-// configurations are updated with the latest CA certificates.
+// Reconcile manages the lifecycle of TLS certificates.
+// It ensures that certificates are renewed before they expire.
 //
 // The reconciliation logic:
 // 1. Ignores secrets that don't match the expected name/namespace
 // 2. Checks if existing certificates need renewal (>85% of validity period elapsed)
-// 3. If renewal is not needed, updates webhook configurations and schedules next check
-// 4. If renewal is needed, generates new certificates and updates both secret and webhook configs
+// 3. If renewal is not needed, schedules next check
+// 4. If renewal is needed, generates new certificates and updates the secret
 func (c *Controller) Reconcile(ctx context.Context, secret *corev1.Secret) (reconcile.Result, error) {
 	// Only process the specific secret we're managing
-	if secret.Namespace != c.workingNamespace || secret.Name != c.webhookServerSecretName {
+	if secret.Namespace != c.workingNamespace || secret.Name != c.serverSecretName {
 		return reconcile.Result{}, nil
 	}
 
 	ctx = util.WithControllerName(ctx, "server.secret")
 
 	// Check if we have valid certificate data and whether it needs renewal
-	if len(secret.Data[util.ServerCert]) != 0 &&
-		len(secret.Data[util.ServerKey]) != 0 &&
-		len(secret.Data[util.CACert]) != 0 {
+	if hasCertificateData(secret.Data) {
 		// if the certificate has been valid for more than 85% of its total validity period, we will renew it.
 		if shouldRenew, timeUntilNextCheck := shouldRenewCert(c.clock, secret.Data[util.ServerCert], secret.Data[util.ServerKey]); !shouldRenew {
-			// Certificate is still valid, just update webhook configurations and requeue for next check
-			if err := c.updateWebhookConfigurations(ctx, secret.Data[util.CACert]); err != nil {
-				return reconcile.Result{}, fmt.Errorf("failed to update webhook configurations: %w", err)
-			}
+			// Certificate is still valid, just schedule next check
 			return reconcile.Result{RequeueAfter: timeUntilNextCheck}, nil
 		}
 	}
 
 	// Certificate needs renewal or doesn't exist - generate new one
 	updatedSecret := secret.DeepCopy()
-	newSecret, err := generateSecret(ctx, c.webhookServiceName, c.webhookServerSecretName, c.workingNamespace, c.clock.Now().Add(c.expirationDuration))
+	newSecret, err := generateSecret(ctx, c.serviceName, c.serverSecretName, c.workingNamespace, c.clock.Now().Add(c.expirationDuration))
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("failed to generate new secret: %w", err)
 	}
@@ -155,19 +125,32 @@ func (c *Controller) Reconcile(ctx context.Context, secret *corev1.Secret) (reco
 
 	// Update the secret with new certificate data
 	if err := c.Client.Update(ctx, updatedSecret); err != nil {
-		return reconcile.Result{}, fmt.Errorf("failed to update secret %s/%s: %w", c.workingNamespace, c.webhookServerSecretName, err)
+		return reconcile.Result{}, fmt.Errorf("failed to update secret %s/%s: %w", c.workingNamespace, c.serverSecretName, err)
 	}
 
-	// Update webhook configurations with the new CA certificate
-	return reconcile.Result{}, c.updateWebhookConfigurations(ctx, updatedSecret.Data[util.CACert])
+	return reconcile.Result{}, nil
 }
 
-// generateSecret creates a new Kubernetes secret containing TLS certificates for the webhook server.
-// It generates a complete certificate chain including server certificate, private key, and CA certificate.
+// CertificateBundle contains all the certificates and keys needed for GRPC communication
+type CertificateBundle struct {
+	CACert     []byte
+	ServerCert []byte
+	ServerKey  []byte
+	ClientCert []byte
+	ClientKey  []byte
+}
+
+// generateSecret creates a new Kubernetes secret containing comprehensive TLS certificates
+// for secure GRPC communication between KEDA core and the external Kaito scaler.
+// It generates a complete certificate chain including:
+// - CA Certificate: Root certificate authority for scaler communication
+// - Server Certificate: Used by the external Kaito scaler GRPC server
+// - Client Certificate: Used by KEDA core to authenticate with external scaler
+// - DNS SANs: Includes service FQDN for flexible deployment
 func generateSecret(ctx context.Context, serviceName, name, namespace string, notAfter time.Time) (*corev1.Secret, error) {
-	serverKey, serverCert, caCert, err := resources.CreateCerts(ctx, serviceName, namespace, notAfter)
+	certs, err := generateComprehensiveCerts(serviceName, namespace, notAfter)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create certificates for service %s in namespace %s: %w", serviceName, namespace, err)
+		return nil, fmt.Errorf("failed to create comprehensive certificates for service %s in namespace %s: %w", serviceName, namespace, err)
 	}
 
 	return &corev1.Secret{
@@ -175,12 +158,173 @@ func generateSecret(ctx context.Context, serviceName, name, namespace string, no
 			Name:      name,
 			Namespace: namespace,
 		},
+		Type: "kubernetes.io/tls",
 		Data: map[string][]byte{
-			util.ServerKey:  serverKey,
-			util.ServerCert: serverCert,
-			util.CACert:     caCert,
+			// Standard kubernetes.io/tls fields (client certificates)
+			util.ClientCert: certs.ClientCert,
+			util.ClientKey:  certs.ClientKey,
+
+			// Server certificates for GRPC server
+			util.ServerCert: certs.ServerCert,
+			util.ServerKey:  certs.ServerKey,
+
+			// CA certificate for trust chain
+			util.CACert: certs.CACert,
 		},
 	}, nil
+}
+
+// generateComprehensiveCerts creates a complete certificate chain for secure GRPC communication
+func generateComprehensiveCerts(serviceName, namespace string, notAfter time.Time) (*CertificateBundle, error) {
+	// Generate CA private key
+	caPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate CA private key: %w", err)
+	}
+
+	// Create CA certificate template
+	caTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"KEDA Kaito Scaler"},
+			CommonName:   "KEDA Kaito Scaler CA",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              notAfter,
+		IsCA:                  true,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+
+	// Create CA certificate
+	caBytes, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caPrivKey.PublicKey, caPrivKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create CA certificate: %w", err)
+	}
+
+	// Encode CA certificate to PEM
+	caCertPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: caBytes,
+	})
+
+	// Generate server private key
+	serverPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate server private key: %w", err)
+	}
+
+	// Create server certificate template with comprehensive DNS SANs
+	serverTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject: pkix.Name{
+			Organization: []string{"KEDA Kaito Scaler"},
+			CommonName:   serviceName,
+		},
+		NotBefore: time.Now(),
+		NotAfter:  notAfter,
+		DNSNames: []string{
+			serviceName,
+			fmt.Sprintf("%s.%s", serviceName, namespace),
+			fmt.Sprintf("%s.%s.svc", serviceName, namespace),
+			fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, namespace),
+			"localhost",
+		},
+		IPAddresses: []net.IP{
+			net.IPv4(127, 0, 0, 1),
+			net.IPv6loopback,
+		},
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+	}
+
+	// Parse CA certificate for signing
+	caCert, err := x509.ParseCertificate(caBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse CA certificate: %w", err)
+	}
+
+	// Create server certificate
+	serverBytes, err := x509.CreateCertificate(rand.Reader, &serverTemplate, caCert, &serverPrivKey.PublicKey, caPrivKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create server certificate: %w", err)
+	}
+
+	// Encode server certificate and key to PEM
+	serverCertPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: serverBytes,
+	})
+
+	serverKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(serverPrivKey),
+	})
+
+	// Generate client private key
+	clientPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate client private key: %w", err)
+	}
+
+	// Create client certificate template
+	clientTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject: pkix.Name{
+			Organization: []string{"KEDA Kaito Scaler"},
+			CommonName:   "KEDA Core Client",
+		},
+		NotBefore:   time.Now(),
+		NotAfter:    notAfter,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+	}
+
+	// Create client certificate
+	clientBytes, err := x509.CreateCertificate(rand.Reader, &clientTemplate, caCert, &clientPrivKey.PublicKey, caPrivKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client certificate: %w", err)
+	}
+
+	// Encode client certificate and key to PEM
+	clientCertPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: clientBytes,
+	})
+
+	clientKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(clientPrivKey),
+	})
+
+	return &CertificateBundle{
+		CACert:     caCertPEM,
+		ServerCert: serverCertPEM,
+		ServerKey:  serverKeyPEM,
+		ClientCert: clientCertPEM,
+		ClientKey:  clientKeyPEM,
+	}, nil
+}
+
+// hasCertificateData checks if the secret contains all required certificate data
+func hasCertificateData(data map[string][]byte) bool {
+	// Check for all required certificate fields
+	requiredFields := []string{
+		util.CACert,     // ca.crt
+		util.ServerCert, // server.crt
+		util.ServerKey,  // server.key
+		util.ClientCert, // tls.crt
+		util.ClientKey,  // tls.key
+	}
+
+	for _, field := range requiredFields {
+		if len(data[field]) == 0 {
+			return false
+		}
+	}
+
+	return true
 }
 
 func shouldRenewCert(clk clock.Clock, certPEMBlock, keyPEMBlock []byte) (bool, time.Duration) {
@@ -254,93 +398,6 @@ func validateCertificate(cert *x509.Certificate, now time.Time) error {
 	return nil
 }
 
-func (c *Controller) updateWebhookConfigurations(ctx context.Context, caCert []byte) error {
-	// Update validating webhook configuration
-	if err := c.updateValidatingWebhookConfiguration(ctx, caCert); err != nil {
-		return fmt.Errorf("failed to update validating webhook configuration: %w", err)
-	}
-
-	// Update mutating webhook configuration
-	if err := c.updateMutatingWebhookConfiguration(ctx, caCert); err != nil {
-		return fmt.Errorf("failed to update mutating webhook configuration: %w", err)
-	}
-
-	return nil
-}
-
-func (c *Controller) updateValidatingWebhookConfiguration(ctx context.Context, caCert []byte) error {
-	var webhook admissionv1.ValidatingWebhookConfiguration
-	if err := c.Client.Get(ctx, client.ObjectKey{Name: kedaKaitoScalerValidatingWebhookConfig}, &webhook); err != nil {
-		return err
-	}
-
-	updated := false
-	for i := range webhook.Webhooks {
-		if caCertChanged(webhook.Webhooks[i].ClientConfig.CABundle, caCert) {
-			webhook.Webhooks[i].ClientConfig.CABundle = caCert
-			webhook.Webhooks[i].ClientConfig.Service.Namespace = c.workingNamespace
-			webhook.Webhooks[i].ClientConfig.Service.Name = c.webhookServiceName
-			updated = true
-		}
-	}
-
-	if updated {
-		if err := c.Client.Update(ctx, &webhook); err != nil {
-			log.FromContext(ctx).Error(err, "failed to update validating webhook configuration", "name", kedaKaitoScalerValidatingWebhookConfig)
-			return err
-		}
-		log.FromContext(ctx).Info("updated validating webhook configuration", "name", kedaKaitoScalerValidatingWebhookConfig)
-	}
-
-	return nil
-}
-
-func (c *Controller) updateMutatingWebhookConfiguration(ctx context.Context, caCert []byte) error {
-	var webhook admissionv1.MutatingWebhookConfiguration
-	if err := c.Client.Get(ctx, client.ObjectKey{Name: kedaKaitoScalerMutatingWebhookConfig}, &webhook); err != nil {
-		return err
-	}
-
-	updated := false
-	for i := range webhook.Webhooks {
-		if caCertChanged(webhook.Webhooks[i].ClientConfig.CABundle, caCert) {
-			webhook.Webhooks[i].ClientConfig.CABundle = caCert
-			webhook.Webhooks[i].ClientConfig.Service.Namespace = c.workingNamespace
-			webhook.Webhooks[i].ClientConfig.Service.Name = c.webhookServiceName
-			updated = true
-		}
-	}
-
-	if updated {
-		if err := c.Client.Update(ctx, &webhook); err != nil {
-			log.FromContext(ctx).Error(err, "failed to update mutating webhook configuration", "name", kedaKaitoScalerMutatingWebhookConfig)
-			return err
-		}
-		log.FromContext(ctx).Info("updated mutating webhook configuration", "name", kedaKaitoScalerMutatingWebhookConfig)
-	}
-
-	return nil
-}
-
-// caCertChanged compares two CA certificates to determine if they are different.
-// It uses base64 encoding comparison for efficiency, but could be enhanced to
-// compare actual certificate content for semantic equivalence.
-func caCertChanged(old, new []byte) bool {
-	// Handle nil cases
-	if old == nil && new == nil {
-		return false
-	}
-	if old == nil || new == nil {
-		return true
-	}
-
-	// Compare base64 encoded versions
-	oldEncoded := base64.StdEncoding.EncodeToString(old)
-	newEncoded := base64.StdEncoding.EncodeToString(new)
-
-	return oldEncoded != newEncoded
-}
-
 func (c *Controller) generateSecretPredicateFunc() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
@@ -349,7 +406,7 @@ func (c *Controller) generateSecretPredicateFunc() predicate.Predicate {
 				return false
 			}
 
-			return secret.Namespace == c.workingNamespace && secret.Name == c.webhookServerSecretName
+			return secret.Namespace == c.workingNamespace && secret.Name == c.serverSecretName
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			secret, ok := e.ObjectNew.(*corev1.Secret)
@@ -357,7 +414,7 @@ func (c *Controller) generateSecretPredicateFunc() predicate.Predicate {
 				return false
 			}
 
-			return secret.Namespace == c.workingNamespace && secret.Name == c.webhookServerSecretName
+			return secret.Namespace == c.workingNamespace && secret.Name == c.serverSecretName
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			return false
@@ -373,20 +430,6 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("server.secret").
 		For(&corev1.Secret{}, builder.WithPredicates(c.generateSecretPredicateFunc())).
-		Watches(&admissionv1.ValidatingWebhookConfiguration{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-			return []reconcile.Request{
-				{
-					NamespacedName: types.NamespacedName{Namespace: c.workingNamespace, Name: c.webhookServerSecretName},
-				},
-			}
-		}), builder.WithPredicates(validatingWebhookConfigPredicate)).
-		Watches(&admissionv1.MutatingWebhookConfiguration{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-			return []reconcile.Request{
-				{
-					NamespacedName: types.NamespacedName{Namespace: c.workingNamespace, Name: c.webhookServerSecretName},
-				},
-			}
-		}), builder.WithPredicates(mutatingWebhookConfigPredicate)).
 		WithOptions(controller.Options{
 			RateLimiter: workqueue.NewTypedMaxOfRateLimiter(
 				workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, 300*time.Second),

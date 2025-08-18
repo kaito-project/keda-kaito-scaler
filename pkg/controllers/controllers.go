@@ -26,7 +26,7 @@ import (
 
 func NewControllers(mgr manager.Manager, clock clock.Clock, opts *options.KedaKaitoScalerOptions) []controller.Controller {
 	return []controller.Controller{
-		secret.NewController(clock, mgr.GetClient(), opts.WorkingNamespace, opts.WebhookSecretName, opts.WebhookServiceName, opts.ExpirationDuration),
+		secret.NewController(clock, mgr.GetClient(), opts.WorkingNamespace, opts.ScalerSecretName, opts.ScalerServiceName, opts.ExpirationDuration),
 		// add controllers here
 	}
 }

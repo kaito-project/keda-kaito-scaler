@@ -21,9 +21,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/open-policy-agent/cert-controller/pkg/rotator"
 	"github.com/samber/lo"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
@@ -170,6 +172,34 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	lo.Must0(mgr.AddReadyzCheck("readyz", healthz.Ping))
 
 	clk := clock.RealClock{}
+
+	// add cert controller for webhook certificates
+	if err := rotator.AddRotator(mgr, &rotator.CertRotator{
+		SecretKey: types.NamespacedName{
+			Name:      opts.WebhookSecretName,
+			Namespace: opts.WorkingNamespace,
+		},
+		CaCertDuration:        20 * 365 * 24 * time.Hour,
+		ServerCertDuration:    opts.ExpirationDuration,
+		RequireLeaderElection: opts.LeaderElection.LeaderElect,
+		Webhooks: []rotator.WebhookInfo{
+			{
+				Name: "keda-kaito-scaler-mutating-webhook-configuration",
+				Type: rotator.Mutating,
+			},
+			{
+				Name: "keda-kaito-scaler-validating-webhook-configuration",
+				Type: rotator.Validating,
+			},
+		},
+		FieldOwner:     "keda-kaito-scaler",
+		CAName:         "keda-kaito-scaler-ca",
+		CAOrganization: "kaito-project",
+		DNSName:        fmt.Sprintf("%s.%s.svc", opts.WebhookServiceName, opts.WorkingNamespace),
+	}); err != nil {
+		klog.Errorf("failed to add cert controller for webhook certificates, %v", err)
+		return err
+	}
 
 	// initialize controllers
 	controllers := controllers.NewControllers(mgr, clk, opts)

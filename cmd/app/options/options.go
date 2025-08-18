@@ -33,6 +33,8 @@ type KedaKaitoScalerOptions struct {
 	WorkingNamespace   string
 	WebhookSecretName  string
 	WebhookServiceName string
+	ScalerSecretName   string
+	ScalerServiceName  string
 	ExpirationDuration time.Duration
 }
 
@@ -54,6 +56,8 @@ func NewKedaKaitoScalerOptions() *KedaKaitoScalerOptions {
 		WorkingNamespace:   "kaito-workspace",
 		WebhookSecretName:  "keda-kaito-scaler-webhook-certs",
 		WebhookServiceName: "keda-kaito-scaler-webhook-svc",
+		ScalerSecretName:   "keda-kaito-scaler-certs",
+		ScalerServiceName:  "keda-kaito-scaler-svc",
 		ExpirationDuration: 10 * 364 * 24 * time.Hour, // 10 years
 	}
 }
@@ -70,5 +74,7 @@ func (o *KedaKaitoScalerOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.WorkingNamespace, "working-namespace", o.WorkingNamespace, "the namespace where the keda-kaito-scaler is working.")
 	fs.StringVar(&o.WebhookSecretName, "webhook-secret-name", o.WebhookSecretName, "the secret which used for storing certificates for keda-kaito-scaler webhook")
 	fs.StringVar(&o.WebhookServiceName, "webhook-service-name", o.WebhookServiceName, "the service which used for accessing keda-kaito-scaler webhook")
+	fs.StringVar(&o.ScalerSecretName, "scaler-secret-name", o.ScalerSecretName, "the secret which used for storing certificates for keda-kaito-scaler")
+	fs.StringVar(&o.ScalerServiceName, "scaler-service-name", o.ScalerServiceName, "the service which used for accessing keda-kaito-scaler")
 	fs.DurationVar(&o.ExpirationDuration, "cert-duration", o.ExpirationDuration, "the expiration duration of webhook server certificates")
 }
