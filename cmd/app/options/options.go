@@ -23,6 +23,7 @@ import (
 
 type KedaKaitoScalerOptions struct {
 	Version            bool
+	GrpcPort           int
 	WebhookPort        int
 	MetricsPort        int
 	HealthProbePort    int
@@ -32,7 +33,6 @@ type KedaKaitoScalerOptions struct {
 	KubeClientBurst    int
 	WorkingNamespace   string
 	WebhookSecretName  string
-	WebhookServiceName string
 	ScalerSecretName   string
 	ScalerServiceName  string
 	ExpirationDuration time.Duration
@@ -41,9 +41,10 @@ type KedaKaitoScalerOptions struct {
 func NewKedaKaitoScalerOptions() *KedaKaitoScalerOptions {
 	return &KedaKaitoScalerOptions{
 		Version:         false,
-		WebhookPort:     10450,
-		MetricsPort:     10451,
-		HealthProbePort: 10452,
+		GrpcPort:        10450,
+		WebhookPort:     10451,
+		MetricsPort:     10452,
+		HealthProbePort: 10453,
 		EnableProfiling: true,
 		LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
 			LeaderElect:       true,
@@ -55,7 +56,6 @@ func NewKedaKaitoScalerOptions() *KedaKaitoScalerOptions {
 		KubeClientBurst:    100,
 		WorkingNamespace:   "kaito-workspace",
 		WebhookSecretName:  "keda-kaito-scaler-webhook-certs",
-		WebhookServiceName: "keda-kaito-scaler-webhook-svc",
 		ScalerSecretName:   "keda-kaito-scaler-certs",
 		ScalerServiceName:  "keda-kaito-scaler-svc",
 		ExpirationDuration: 10 * 364 * 24 * time.Hour, // 10 years
@@ -64,6 +64,7 @@ func NewKedaKaitoScalerOptions() *KedaKaitoScalerOptions {
 
 func (o *KedaKaitoScalerOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&o.Version, "version", o.Version, "print the version information, and then exit")
+	fs.IntVar(&o.GrpcPort, "grpc-port", o.GrpcPort, "the port the grpc endpoint binds to for serving grpc requests.")
 	fs.IntVar(&o.WebhookPort, "webhook-port", o.WebhookPort, "the port the webhook endpoint binds to for validating and mutating resources.")
 	fs.IntVar(&o.MetricsPort, "metrics-port", o.MetricsPort, "the port the metric endpoint binds to for serving metrics about keda-kaito-scaler.")
 	fs.IntVar(&o.HealthProbePort, "health-probe-port", o.HealthProbePort, "the port the health probe endpoint binds to for serving livness check.")
@@ -73,7 +74,6 @@ func (o *KedaKaitoScalerOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&o.KubeClientBurst, "kube-client-burst", o.KubeClientBurst, "the max allowed burst of queries to the kube-apiserver.")
 	fs.StringVar(&o.WorkingNamespace, "working-namespace", o.WorkingNamespace, "the namespace where the keda-kaito-scaler is working.")
 	fs.StringVar(&o.WebhookSecretName, "webhook-secret-name", o.WebhookSecretName, "the secret which used for storing certificates for keda-kaito-scaler webhook")
-	fs.StringVar(&o.WebhookServiceName, "webhook-service-name", o.WebhookServiceName, "the service which used for accessing keda-kaito-scaler webhook")
 	fs.StringVar(&o.ScalerSecretName, "scaler-secret-name", o.ScalerSecretName, "the secret which used for storing certificates for keda-kaito-scaler")
 	fs.StringVar(&o.ScalerServiceName, "scaler-service-name", o.ScalerServiceName, "the service which used for accessing keda-kaito-scaler")
 	fs.DurationVar(&o.ExpirationDuration, "cert-duration", o.ExpirationDuration, "the expiration duration of webhook server certificates")

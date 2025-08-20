@@ -1,0 +1,28 @@
+log:
+  level: 5
+
+replicaCount: 1
+certDuration: 87600h
+nameOverrider: ""
+
+image:
+    registry: kaito.sh
+    repository: keda-kaito-scaler
+    tag: 0.0.1
+    pullSecrets: []
+
+ports:
+  grpc: 10450
+  metrics: 10451
+  webhook: 10452
+  healthProbe: 10453
+
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  
