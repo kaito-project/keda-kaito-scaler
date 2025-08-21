@@ -16,6 +16,7 @@ package app
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -28,6 +29,7 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -124,29 +126,8 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 			TLSOpts: []func(*tls.Config){
 				func(cfg *tls.Config) {
 					cfg.MinVersion = tls.VersionTLS13
-					// If we return (nil, error), the client sees - 'tls: internal error'
-					// If we return (nil, nil) the client sees - 'tls: no certificates configured'
 					cfg.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-						// return (nil, nil) when we don't find a certificate
-						secret, err := secretLister.Secrets(opts.WorkingNamespace).Get(opts.WebhookSecretName)
-						if err != nil {
-							return nil, nil //nolint:nilerr
-						}
-
-						serverKey, ok := secret.Data[util.ServerKey]
-						if !ok {
-							return nil, nil
-						}
-						serverCert, ok := secret.Data[util.ServerCert]
-						if !ok {
-							return nil, nil
-						}
-
-						cert, err := tls.X509KeyPair(serverCert, serverKey)
-						if err != nil {
-							return nil, err
-						}
-						return &cert, nil
+						return loadCertificateFromSecret(secretLister, opts.WorkingNamespace, opts.WebhookSecretName)
 					}
 				},
 			},
@@ -173,7 +154,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 			Name:      opts.WebhookSecretName,
 			Namespace: opts.WorkingNamespace,
 		},
-		CaCertDuration:        20 * 365 * 24 * time.Hour,
+		CaCertDuration:        10 * 365 * 24 * time.Hour, // 10 years for ca certificates
 		ServerCertDuration:    opts.ExpirationDuration,
 		RequireLeaderElection: opts.LeaderElection.LeaderElect,
 		Webhooks: []rotator.WebhookInfo{
@@ -190,6 +171,8 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		CAName:         "keda-kaito-scaler-ca",
 		CAOrganization: "kaito-project",
 		DNSName:        fmt.Sprintf("%s.%s.svc", opts.ScalerServiceName, opts.WorkingNamespace),
+		CertName:       util.ServerCert,
+		KeyName:        util.ServerKey,
 	}); err != nil {
 		klog.Errorf("failed to add cert controller for webhook certificates, %v", err)
 		return err
@@ -212,7 +195,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		lo.Must0(mgr.Start(ctx))
 	}()
 	// start grpc server
-	lo.Must0(startKaitoScalerServer(ctx, opts.GrpcPort, secretLister, opts.WorkingNamespace, opts.ScalerSecretName))
+	lo.Must0(startKaitoScalerServer(ctx, opts.GrpcPort, secretLister, opts.WorkingNamespace, opts.ScalerSecretName, opts.RequireMutualTLS))
 	return nil
 }
 
@@ -234,7 +217,7 @@ func prepareResourcesLister(ctx context.Context, cfg *rest.Config, ns string) (c
 	return secretLister, nil
 }
 
-func startKaitoScalerServer(ctx context.Context, port int, secretLister corev1listers.SecretLister, namespace, secretName string) error {
+func startKaitoScalerServer(ctx context.Context, port int, secretLister corev1listers.SecretLister, namespace, secretName string, requireMutualTLS bool) error {
 	logger := log.FromContext(ctx).WithName("grpc-server")
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 
@@ -243,19 +226,37 @@ func startKaitoScalerServer(ctx context.Context, port int, secretLister corev1li
 	if err := waitForSecret(ctx, secretLister, namespace, secretName); err != nil {
 		return fmt.Errorf("failed to wait for secret: %w", err)
 	}
-	logger.Info("secret is ready, starting TLS gRPC server", "address", addr)
+	logger.Info("secret is ready, starting TLS gRPC server", "address", addr, "mutualTLS", requireMutualTLS)
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
 
-	// Create TLS credentials with dynamic certificate loading
+	// Create TLS credentials with dynamic certificate loading and root CAs
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return loadCertificateFromSecret(secretLister, namespace, secretName)
 		},
+	}
+
+	// Configure client authentication based on the requirement
+	if requireMutualTLS {
+		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		logger.Info("TLS configuration: requiring mutual TLS authentication")
+	} else {
+		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+		logger.Info("TLS configuration: optional client certificate verification")
+	}
+
+	// Load root CAs from secret for client certificate verification
+	if rootCAs, err := loadRootCAsFromSecret(secretLister, namespace, secretName); err != nil {
+		logger.Info("failed to load root CAs, using system default", "error", err)
+		return err
+	} else if rootCAs != nil {
+		tlsConfig.ClientCAs = rootCAs
+		logger.Info("loaded root CAs from secret for TLS configuration")
 	}
 
 	creds := credentials.NewTLS(tlsConfig)
@@ -295,17 +296,23 @@ func waitForSecret(ctx context.Context, secretLister corev1listers.SecretLister,
 	}
 }
 
-// hasRequiredCertificateData checks if the secret contains server.crt and server.key
+// hasRequiredCertificateData checks if the secret contains server.crt, server.key, and ca.crt
 func hasRequiredCertificateData(data map[string][]byte) bool {
 	serverCert, hasCert := data[util.ServerCert]
 	serverKey, hasKey := data[util.ServerKey]
-	return hasCert && hasKey && len(serverCert) > 0 && len(serverKey) > 0
+	caCert, hasCA := data[util.CACert]
+	return hasCert && hasKey && hasCA && len(serverCert) > 0 && len(serverKey) > 0 && len(caCert) > 0
 }
 
 // loadCertificateFromSecret loads the TLS certificate from the secret
+// If we return (nil, error), the client sees - 'tls: internal error'
+// If we return (nil, nil) the client sees - 'tls: no certificates configured'
 func loadCertificateFromSecret(secretLister corev1listers.SecretLister, namespace, secretName string) (*tls.Certificate, error) {
 	secret, err := secretLister.Secrets(namespace).Get(secretName)
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil //nolint:nilerr
+		}
 		return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretName, err)
 	}
 
@@ -325,4 +332,29 @@ func loadCertificateFromSecret(secretLister corev1listers.SecretLister, namespac
 	}
 
 	return &cert, nil
+}
+
+// loadRootCAsFromSecret loads the root CA certificates from the secret
+func loadRootCAsFromSecret(secretLister corev1listers.SecretLister, namespace, secretName string) (*x509.CertPool, error) {
+	secret, err := secretLister.Secrets(namespace).Get(secretName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretName, err)
+	}
+
+	caCertData, ok := secret.Data[util.CACert]
+	if !ok {
+		return nil, fmt.Errorf("CA certificate not found in secret %s/%s", namespace, secretName)
+	}
+
+	if len(caCertData) == 0 {
+		return nil, fmt.Errorf("CA certificate is empty in secret %s/%s", namespace, secretName)
+	}
+
+	// Create a new certificate pool and add the CA certificate
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCertData) {
+		return nil, fmt.Errorf("failed to parse CA certificate from secret %s/%s", namespace, secretName)
+	}
+
+	return caCertPool, nil
 }
