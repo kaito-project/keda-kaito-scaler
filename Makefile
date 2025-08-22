@@ -90,7 +90,7 @@ build: bin/keda-kaito-scaler ## Build the keda-kaito-scaler binary
 .PHONY: bin/keda-kaito-scaler
 bin/keda-kaito-scaler:
 	@mkdir -p $(OUTPUT_DIR)
-	go build -ldflags "$(LDFLAGS)" -o $(OUTPUT_DIR)/keda-kaito-scaler ./cmd/main.go
+	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(OUTPUT_DIR)/keda-kaito-scaler ./cmd/main.go
 
 .PHONY: test
 test: ## Run tests
