@@ -43,6 +43,7 @@ import (
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	runtimecache "sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -195,7 +196,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		lo.Must0(mgr.Start(ctx))
 	}()
 	// start grpc server
-	lo.Must0(startKaitoScalerServer(ctx, opts.GrpcPort, secretLister, opts.WorkingNamespace, opts.ScalerSecretName, opts.RequireMutualTLS))
+	lo.Must0(startKaitoScalerServer(ctx, mgr.GetClient(), opts.GrpcPort, secretLister, opts.WorkingNamespace, opts.ScalerSecretName, opts.RequireMutualTLS))
 	return nil
 }
 
@@ -217,7 +218,7 @@ func prepareResourcesLister(ctx context.Context, cfg *rest.Config, ns string) (c
 	return secretLister, nil
 }
 
-func startKaitoScalerServer(ctx context.Context, port int, secretLister corev1listers.SecretLister, namespace, secretName string, requireMutualTLS bool) error {
+func startKaitoScalerServer(ctx context.Context, c client.Client, port int, secretLister corev1listers.SecretLister, namespace, secretName string, requireMutualTLS bool) error {
 	logger := log.FromContext(ctx).WithName("grpc-server")
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 
@@ -261,7 +262,7 @@ func startKaitoScalerServer(ctx context.Context, port int, secretLister corev1li
 
 	creds := credentials.NewTLS(tlsConfig)
 	grpcServer := grpc.NewServer(grpc.Creds(creds))
-	externalscaler.RegisterExternalScalerServer(grpcServer, scaler.NewKaitoScaler())
+	externalscaler.RegisterExternalScalerServer(grpcServer, scaler.NewKaitoScaler(c))
 
 	go func() {
 		<-ctx.Done()
