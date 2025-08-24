@@ -6,6 +6,22 @@ import (
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 )
 
+const (
+	ScalerName = "keda-kaito-scaler"
+
+	// Metadata keys
+	ScalerNameKeyInMetadata      = "scalerName"
+	WorkspaceNameInMetadata      = "workspaceName"
+	WorkspaceNamespaceInMetadata = "workspaceNamespace"
+	ScalerAddressInMetadata      = "scalerAddress"
+	MetricNameInMetadata         = "metricName"
+	ThresholdInMetadata          = "threshold"
+	MetricProtocolInMetadata     = "metricProtocol"
+	MetricPortInMetadata         = "metricPort"
+	MetricPathInMetadata         = "metricPath"
+	ScrapeTimeoutInMetadata      = "scrapeTimeout"
+)
+
 type kaitoScaler struct {
 	externalscaler.UnimplementedExternalScalerServer
 }
