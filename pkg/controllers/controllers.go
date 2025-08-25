@@ -13,12 +13,13 @@
 package controllers
 
 import (
-	"github.com/awslabs/operatorpkg/controller"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/kaito-project/keda-kaito-scaler/cmd/app/options"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers/scaledobject"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers/secret"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/util/controller"
 )
 
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;update;patch
@@ -27,6 +28,7 @@ import (
 func NewControllers(mgr manager.Manager, clock clock.Clock, opts *options.KedaKaitoScalerOptions) []controller.Controller {
 	return []controller.Controller{
 		secret.NewController(clock, mgr.GetClient(), opts.WorkingNamespace, opts.ScalerSecretName, opts.ScalerServiceName, opts.ExpirationDuration),
+		scaledobject.NewAutoProvisionController(mgr.GetClient()),
 		// add controllers here
 	}
 }
