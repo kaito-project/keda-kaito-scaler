@@ -25,6 +25,7 @@ import (
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
+	"go.uber.org/multierr"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -63,13 +64,26 @@ type ScalerConfig struct {
 // +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=get;list;watch
 
 type kaitoScaler struct {
-	kubeClient client.Client
+	kubeClient    client.Client
+	httpTransport *http.Transport
+	tlsTransport  *http.Transport
 	externalscaler.UnimplementedExternalScalerServer
 }
 
 func NewKaitoScaler(kubeClient client.Client) *kaitoScaler {
 	return &kaitoScaler{
 		kubeClient: kubeClient,
+		httpTransport: &http.Transport{
+			MaxIdleConns:        20,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     30 * time.Second,
+		},
+		tlsTransport: &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:        20,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     30 * time.Second,
+		},
 	}
 }
 
@@ -149,12 +163,14 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 	// at the same time, please count the number of pods that metric can be collected.
 	var totalMetricValue int64
 	var podCount int
-	for _, pod := range pods.Items {
+	metricErrs := make([]error, len(pods.Items))
+	for i, pod := range pods.Items {
 		if !isPodReady(&pod) {
 			continue
 		}
 		metricVal, err := e.getPodMetric(ctx, &pod, scalerConfig)
 		if err != nil {
+			metricErrs[i] = err
 			continue
 		}
 		totalMetricValue += metricVal
@@ -164,7 +180,12 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 	// if a metric cannot be resolved from a pod, the average value will be calculated using the following rules to prevent flapping:
 	// in the scale-up direction: use 0 as the metric value for missing pods.
 	// in the scale-down direction: use the metric threshold as the value for missing pods.
-	if podCount > 0 {
+	if podCount == 0 {
+		if err := multierr.Combine(metricErrs...); err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get pod metrics: %v", err))
+		}
+		return nil, status.Error(codes.Internal, "no ready pods found for the workspace")
+	} else if podCount != len(pods.Items) {
 		if totalMetricValue/int64(podCount) < scalerConfig.Threshold {
 			// scale-down direction
 			totalMetricValue += scalerConfig.Threshold * int64(len(pods.Items)-podCount)
@@ -177,7 +198,10 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 
 	return &externalscaler.GetMetricsResponse{
 		MetricValues: []*externalscaler.MetricValue{
-			{MetricValue: averageMetricValue},
+			{
+				MetricName:  scalerConfig.MetricName,
+				MetricValue: averageMetricValue,
+			},
 		},
 	}, nil
 }
@@ -257,17 +281,17 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 }
 
 func (e *kaitoScaler) getPodMetric(_ context.Context, pod *corev1.Pod, scalerConfig *ScalerConfig) (int64, error) {
-	var tlsConfig *tls.Config
+	var transport *http.Transport
 	if scalerConfig.MetricProtocol == "https" {
-		tlsConfig = &tls.Config{InsecureSkipVerify: true}
+		transport = e.tlsTransport
+	} else {
+		transport = e.httpTransport
 	}
 
 	httpClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-		},
+		Transport: transport,
+		Timeout:   scalerConfig.ScrapeTimeout,
 	}
-	httpClient.Timeout = scalerConfig.ScrapeTimeout
 
 	metricURL := fmt.Sprintf("%s://%s:%s%s", scalerConfig.MetricProtocol, pod.Status.PodIP, scalerConfig.MetricPort, scalerConfig.MetricPath)
 	resp, err := httpClient.Get(metricURL)
