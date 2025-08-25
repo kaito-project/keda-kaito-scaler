@@ -92,7 +92,7 @@ func (c *Controller) Reconcile(ctx context.Context, ws *kaitov1beta1.Workspace) 
 			Spec: v1alpha1.ScaledObjectSpec{
 				ScaleTargetRef: &v1alpha1.ScaleTarget{
 					Name:       ws.Name,
-					APIVersion: "kaito.sh",
+					APIVersion: "kaito.sh/v1beta1",
 					Kind:       "Workspace",
 				},
 				MinReplicaCount: ptr.To(int32(1)),
