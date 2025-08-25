@@ -40,12 +40,12 @@ import (
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	runtimecache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	runtimewebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 
@@ -139,7 +139,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		},
 	})
 	if err != nil {
-		klog.Errorf("failed to new manager, %v", err)
+		logger.Error(err, "failed to new manager")
 		return err
 	}
 
@@ -147,40 +147,15 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	lo.Must0(mgr.AddHealthzCheck("healthz", healthz.Ping))
 	lo.Must0(mgr.AddReadyzCheck("readyz", healthz.Ping))
 
-	clk := clock.RealClock{}
-
-	// add cert controller for webhook certificates
-	if err := rotator.AddRotator(mgr, &rotator.CertRotator{
-		SecretKey: types.NamespacedName{
-			Name:      opts.WebhookSecretName,
-			Namespace: opts.WorkingNamespace,
-		},
-		CaCertDuration:        10 * 365 * 24 * time.Hour, // 10 years for ca certificates
-		ServerCertDuration:    opts.ExpirationDuration,
-		RequireLeaderElection: opts.LeaderElection.LeaderElect,
-		Webhooks: []rotator.WebhookInfo{
-			{
-				Name: "keda-kaito-scaler-mutating-webhook-configuration",
-				Type: rotator.Mutating,
-			},
-			{
-				Name: "keda-kaito-scaler-validating-webhook-configuration",
-				Type: rotator.Validating,
-			},
-		},
-		FieldOwner:     "keda-kaito-scaler",
-		CAName:         "keda-kaito-scaler-ca",
-		CAOrganization: "kaito-project",
-		DNSName:        fmt.Sprintf("%s.%s.svc", opts.ScalerServiceName, opts.WorkingNamespace),
-		CertName:       util.ServerCert,
-		KeyName:        util.ServerKey,
-	}); err != nil {
-		klog.Errorf("failed to add cert controller for webhook certificates, %v", err)
+	// add certificate controllers
+	err = addCertificateControllers(mgr, opts)
+	if err != nil {
+		logger.Error(err, "failed to add certificate controllers")
 		return err
 	}
 
 	// initialize controllers
-	controllers := controllers.NewControllers(mgr, clk, opts)
+	controllers := controllers.NewControllers(mgr)
 	for _, c := range controllers {
 		lo.Must0(c.Register(ctx, mgr))
 	}
@@ -196,7 +171,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		lo.Must0(mgr.Start(ctx))
 	}()
 	// start grpc server
-	lo.Must0(startKaitoScalerServer(ctx, mgr.GetClient(), opts.GrpcPort, secretLister, opts.WorkingNamespace, opts.ScalerSecretName, opts.RequireMutualTLS))
+	lo.Must0(startKaitoScalerServer(ctx, mgr.GetClient(), opts.GrpcPort, secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName, opts.ScalerClientSecretName))
 	return nil
 }
 
@@ -218,16 +193,21 @@ func prepareResourcesLister(ctx context.Context, cfg *rest.Config, ns string) (c
 	return secretLister, nil
 }
 
-func startKaitoScalerServer(ctx context.Context, c client.Client, port int, secretLister corev1listers.SecretLister, namespace, secretName string, requireMutualTLS bool) error {
+func startKaitoScalerServer(ctx context.Context, c client.Client, port int, secretLister corev1listers.SecretLister, namespace, serverSecretName, clientSecretName string) error {
 	logger := log.FromContext(ctx).WithName("grpc-server")
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 
 	// Wait for the secret to be ready
-	logger.Info("waiting for secret to be ready", "secret", secretName, "namespace", namespace)
-	if err := waitForSecret(ctx, secretLister, namespace, secretName); err != nil {
+	logger.Info("waiting for server secret to be ready", "secret", serverSecretName, "namespace", namespace)
+	if err := waitForSecret(ctx, secretLister, namespace, serverSecretName, true); err != nil {
 		return fmt.Errorf("failed to wait for secret: %w", err)
 	}
-	logger.Info("secret is ready, starting TLS gRPC server", "address", addr, "mutualTLS", requireMutualTLS)
+
+	logger.Info("waiting for client secret to be ready", "secret", clientSecretName, "namespace", namespace)
+	if err := waitForSecret(ctx, secretLister, namespace, clientSecretName, false); err != nil {
+		return fmt.Errorf("failed to wait for secret: %w", err)
+	}
+	logger.Info("secret is ready, starting TLS gRPC server", "address", addr)
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -238,21 +218,13 @@ func startKaitoScalerServer(ctx context.Context, c client.Client, port int, secr
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return loadCertificateFromSecret(secretLister, namespace, secretName)
+			return loadCertificateFromSecret(secretLister, namespace, serverSecretName)
 		},
-	}
-
-	// Configure client authentication based on the requirement
-	if requireMutualTLS {
-		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		logger.Info("TLS configuration: requiring mutual TLS authentication")
-	} else {
-		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
-		logger.Info("TLS configuration: optional client certificate verification")
+		ClientAuth: tls.RequireAndVerifyClientCert,
 	}
 
 	// Load root CAs from secret for client certificate verification
-	if rootCAs, err := loadRootCAsFromSecret(secretLister, namespace, secretName); err != nil {
+	if rootCAs, err := loadRootCAsFromSecret(secretLister, namespace, clientSecretName); err != nil {
 		logger.Info("failed to load root CAs, using system default", "error", err)
 		return err
 	} else if rootCAs != nil {
@@ -274,8 +246,90 @@ func startKaitoScalerServer(ctx context.Context, c client.Client, port int, secr
 	return grpcServer.Serve(lis)
 }
 
+func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScalerOptions) error {
+	dnsNames := []string{
+		fmt.Sprintf("%s.%s", opts.ScalerServiceName, opts.WorkingNamespace),
+		fmt.Sprintf("%s.%s.svc", opts.ScalerServiceName, opts.WorkingNamespace),
+		fmt.Sprintf("%s.%s.svc.cluster", opts.ScalerServiceName, opts.WorkingNamespace),
+		fmt.Sprintf("%s.%s.svc.cluster.local", opts.ScalerServiceName, opts.WorkingNamespace),
+	}
+
+	// add cert controller for webhook certificates
+	if err := rotator.AddRotator(mgr, &rotator.CertRotator{
+		ControllerName: "scaler-webhook-cert-rotator",
+		SecretKey: types.NamespacedName{
+			Name:      opts.WebhookSecretName,
+			Namespace: opts.WorkingNamespace,
+		},
+		CaCertDuration:        10 * 365 * 24 * time.Hour, // 10 years for ca certificates
+		ServerCertDuration:    opts.ExpirationDuration,
+		RequireLeaderElection: opts.LeaderElection.LeaderElect,
+		Webhooks: []rotator.WebhookInfo{
+			{
+				Name: "keda-kaito-scaler-mutating-webhook-configuration",
+				Type: rotator.Mutating,
+			},
+			{
+				Name: "keda-kaito-scaler-validating-webhook-configuration",
+				Type: rotator.Validating,
+			},
+		},
+		FieldOwner:     "keda-kaito-scaler",
+		CAName:         "keda-kaito-scaler-ca",
+		CAOrganization: "kaito-project",
+		ExtraDNSNames:  dnsNames,
+		CertName:       util.ServerCert,
+		KeyName:        util.ServerKey,
+	}); err != nil {
+		klog.Errorf("failed to add cert controller for webhook certificates, %v", err)
+		return err
+	}
+
+	// add cert controller for managing scaler client certificates of keda-kaito-scaler
+	if err := rotator.AddRotator(mgr, &rotator.CertRotator{
+		ControllerName: "scaler-client-cert-rotator",
+		SecretKey: types.NamespacedName{
+			Name:      opts.ScalerClientSecretName,
+			Namespace: opts.WorkingNamespace,
+		},
+		CaCertDuration:        10 * 365 * 24 * time.Hour, // 10 years for ca certificates
+		ServerCertDuration:    opts.ExpirationDuration,
+		RequireLeaderElection: opts.LeaderElection.LeaderElect,
+		ExtKeyUsages:          &[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		FieldOwner:            "keda-kaito-scaler",
+		CAName:                "keda-kaito-scaler-ca",
+		CAOrganization:        "kaito-project",
+	}); err != nil {
+		klog.Errorf("failed to add cert controller for scaler client certificates, %v", err)
+		return err
+	}
+
+	// add cert controller for managing scaler server certificates of keda-kaito-scaler
+	if err := rotator.AddRotator(mgr, &rotator.CertRotator{
+		ControllerName: "scaler-server-cert-rotator",
+		SecretKey: types.NamespacedName{
+			Name:      opts.ScalerServerSecretName,
+			Namespace: opts.WorkingNamespace,
+		},
+		CaCertDuration:        10 * 365 * 24 * time.Hour, // 10 years for ca certificates
+		ServerCertDuration:    opts.ExpirationDuration,
+		RequireLeaderElection: opts.LeaderElection.LeaderElect,
+		FieldOwner:            "keda-kaito-scaler",
+		CAName:                "keda-kaito-scaler-ca",
+		CAOrganization:        "kaito-project",
+		ExtraDNSNames:         dnsNames,
+		CertName:              util.ServerCert,
+		KeyName:               util.ServerKey,
+	}); err != nil {
+		klog.Errorf("failed to add cert controller for scaler server certificates, %v", err)
+		return err
+	}
+
+	return nil
+}
+
 // waitForSecret waits until the secret exists and contains the required certificate data
-func waitForSecret(ctx context.Context, secretLister corev1listers.SecretLister, namespace, secretName string) error {
+func waitForSecret(ctx context.Context, secretLister corev1listers.SecretLister, namespace, secretName string, isServerSecret bool) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -290,19 +344,26 @@ func waitForSecret(ctx context.Context, secretLister corev1listers.SecretLister,
 			}
 
 			// Check if the secret contains the required certificate data
-			if hasRequiredCertificateData(secret.Data) {
+			if hasRequiredCertificateData(secret.Data, isServerSecret) {
 				return nil
 			}
 		}
 	}
 }
 
-// hasRequiredCertificateData checks if the secret contains server.crt, server.key, and ca.crt
-func hasRequiredCertificateData(data map[string][]byte) bool {
-	serverCert, hasCert := data[util.ServerCert]
-	serverKey, hasKey := data[util.ServerKey]
+// hasRequiredCertificateData checks if the secret contains server.crt/tls.crt, server.key/tls.key, and ca.crt
+func hasRequiredCertificateData(data map[string][]byte, isServerSecret bool) bool {
 	caCert, hasCA := data[util.CACert]
-	return hasCert && hasKey && hasCA && len(serverCert) > 0 && len(serverKey) > 0 && len(caCert) > 0
+	if isServerSecret {
+		serverCert, hasCert := data[util.ServerCert]
+		serverKey, hasKey := data[util.ServerKey]
+		return hasCert && hasKey && hasCA && len(serverCert) > 0 && len(serverKey) > 0 && len(caCert) > 0
+	} else {
+		clientCert, hasCert := data[util.ClientCert]
+		clientKey, hasKey := data[util.ClientKey]
+		return hasCert && hasKey && hasCA && len(clientCert) > 0 && len(clientKey) > 0 && len(caCert) > 0
+	}
+
 }
 
 // loadCertificateFromSecret loads the TLS certificate from the secret
