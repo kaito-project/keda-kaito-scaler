@@ -74,9 +74,9 @@ verify-mod:
 .PHONY: verify-manifests
 verify-manifests: manifests
 	@echo "verifying manifests"
-	@if [ -n "$$(git status --porcelain ./config)" ]; then \
+	@if [ -n "$$(git status --porcelain ./charts)" ]; then \
 		echo "Error: manifests are not up-to-date. please run 'make manifests' and commit the changes."; \
-		git diff ./config; \
+		git diff ./charts; \
 		exit 1; \
 	fi
 
