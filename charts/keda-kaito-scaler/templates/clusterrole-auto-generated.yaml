@@ -43,3 +43,22 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - kaito.sh
+  resources:
+  - workspace
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - keda.sh
+  resources:
+  - scaledobjects
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - update
+  - watch

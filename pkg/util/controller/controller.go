@@ -11,18 +11,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package webhooks
+package controller
 
+// Controller is a reconciler that allows registration with a controller-runtime Manager
 import (
-	"k8s.io/utils/clock"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"context"
 
-	"github.com/kaito-project/keda-kaito-scaler/pkg/util/controller"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
-func NewWebhooks(mgr manager.Manager, clk clock.Clock) []controller.Controller {
-
-	return []controller.Controller{
-		// add webhooks here
-	}
+type Controller interface {
+	Register(context.Context, manager.Manager) error
 }

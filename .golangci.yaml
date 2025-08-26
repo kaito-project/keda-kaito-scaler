@@ -6,12 +6,12 @@ linters-settings:
     skip-generated: true
     sections:
       - standard
-      - prefix(github.com/kaito-project)
+      - prefix(github.com/kaito-project/keda-kaito-scaler)
       - default
   gofmt:
     simplify: true
   goimports:
-    local-prefixes: github.com/kaito-project
+    local-prefixes: github.com/kaito-project/keda-kaito-scaler
 
 # Completely disable typecheck due to Go 1.24 compatibility issues
 issues:
