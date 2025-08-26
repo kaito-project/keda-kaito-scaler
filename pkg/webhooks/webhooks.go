@@ -14,15 +14,14 @@
 package webhooks
 
 import (
-	"k8s.io/utils/clock"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
-
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/controller"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/webhooks/scaledobject"
 )
 
-func NewWebhooks(mgr manager.Manager, clk clock.Clock) []controller.Controller {
+func NewWebhooks(workingNamespace string) []controller.Controller {
 
 	return []controller.Controller{
+		scaledobject.NewWebhook(workingNamespace),
 		// add webhooks here
 	}
 }

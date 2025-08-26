@@ -185,7 +185,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	}
 
 	// initialize webhooks
-	webhooks := webhooks.NewWebhooks(mgr, clk)
+	webhooks := webhooks.NewWebhooks(opts.WorkingNamespace)
 	for _, c := range webhooks {
 		lo.Must0(c.Register(ctx, mgr))
 	}
