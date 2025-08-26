@@ -64,14 +64,14 @@ func (w *ScaledObjectWebhook) Default(ctx context.Context, obj runtime.Object) e
 		scaledObject.Spec.MinReplicaCount = ptr.To(int32(1))
 	}
 
-	configure_default_advanced_horizontal_pod_autoscaler_config(scaledObject)
+	configureDefaultAdvancedHorizontalPodAutoscalerConfig(scaledObject)
 
-	configure_keda_kaito_scaler_trigger(scaledObject, kaitoScalerIndex, w.WorkingNamespace)
+	configureKedaKaitoScalerTrigger(scaledObject, kaitoScalerIndex, w.WorkingNamespace)
 
 	return nil
 }
 
-func configure_default_advanced_horizontal_pod_autoscaler_config(obj *v1alpha1.ScaledObject) {
+func configureDefaultAdvancedHorizontalPodAutoscalerConfig(obj *v1alpha1.ScaledObject) {
 	if obj.Spec.Advanced == nil {
 		obj.Spec.Advanced = &v1alpha1.AdvancedConfig{
 			HorizontalPodAutoscalerConfig: &v1alpha1.HorizontalPodAutoscalerConfig{
@@ -124,7 +124,7 @@ func configure_default_advanced_horizontal_pod_autoscaler_config(obj *v1alpha1.S
 	}
 }
 
-func configure_keda_kaito_scaler_trigger(obj *v1alpha1.ScaledObject, triggerIndex int, workingNamespace string) {
+func configureKedaKaitoScalerTrigger(obj *v1alpha1.ScaledObject, triggerIndex int, workingNamespace string) {
 	kaitoScalerTrigger := &obj.Spec.Triggers[triggerIndex]
 	if kaitoScalerTrigger.Metadata == nil {
 		kaitoScalerTrigger.Metadata = make(map[string]string)
