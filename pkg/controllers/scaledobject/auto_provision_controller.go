@@ -200,7 +200,7 @@ func enableAutoProvisioning(workspace *kaitov1beta1.Workspace) bool {
 }
 
 // +kubebuilder:rbac:groups="keda.sh",resources=scaledobjects,verbs=create;list;watch;get;update;delete
-// +kubebuilder:rbac:groups="kaito.sh",resources=workspace,verbs=list;watch;get
+// +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=list;watch;get
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
