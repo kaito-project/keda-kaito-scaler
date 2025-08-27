@@ -261,7 +261,7 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 			Name:      opts.WebhookSecretName,
 			Namespace: opts.WorkingNamespace,
 		},
-		CaCertDuration:        10 * 365 * 24 * time.Hour, // 10 years for ca certificates
+		CaCertDuration:        util.CACertDuration,
 		ServerCertDuration:    opts.ExpirationDuration,
 		RequireLeaderElection: opts.LeaderElection.LeaderElect,
 		Webhooks: []rotator.WebhookInfo{
@@ -274,9 +274,9 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 				Type: rotator.Validating,
 			},
 		},
-		FieldOwner:     "keda-kaito-scaler",
-		CAName:         "keda-kaito-scaler-ca",
-		CAOrganization: "kaito-project",
+		FieldOwner:     util.ControllerFieldOwner,
+		CAName:         util.CAName,
+		CAOrganization: util.CAOrganization,
 		ExtraDNSNames:  dnsNames,
 		CertName:       util.ServerCert,
 		KeyName:        util.ServerKey,
@@ -292,13 +292,13 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 			Name:      opts.ScalerClientSecretName,
 			Namespace: opts.WorkingNamespace,
 		},
-		CaCertDuration:        10 * 365 * 24 * time.Hour, // 10 years for ca certificates
+		CaCertDuration:        util.CACertDuration,
 		ServerCertDuration:    opts.ExpirationDuration,
 		RequireLeaderElection: opts.LeaderElection.LeaderElect,
 		ExtKeyUsages:          &[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		FieldOwner:            "keda-kaito-scaler",
-		CAName:                "keda-kaito-scaler-ca",
-		CAOrganization:        "kaito-project",
+		FieldOwner:            util.ControllerFieldOwner,
+		CAName:                util.CAName,
+		CAOrganization:        util.CAOrganization,
 	}); err != nil {
 		klog.Errorf("failed to add cert controller for scaler client certificates, %v", err)
 		return err
@@ -311,12 +311,12 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 			Name:      opts.ScalerServerSecretName,
 			Namespace: opts.WorkingNamespace,
 		},
-		CaCertDuration:        10 * 365 * 24 * time.Hour, // 10 years for ca certificates
+		CaCertDuration:        util.CACertDuration,
 		ServerCertDuration:    opts.ExpirationDuration,
 		RequireLeaderElection: opts.LeaderElection.LeaderElect,
-		FieldOwner:            "keda-kaito-scaler",
-		CAName:                "keda-kaito-scaler-ca",
-		CAOrganization:        "kaito-project",
+		FieldOwner:            util.ControllerFieldOwner,
+		CAName:                util.CAName,
+		CAOrganization:        util.CAOrganization,
 		ExtraDNSNames:         dnsNames,
 		CertName:              util.ServerCert,
 		KeyName:               util.ServerKey,

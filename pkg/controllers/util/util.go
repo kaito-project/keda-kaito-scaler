@@ -15,6 +15,7 @@ package util
 
 import (
 	"context"
+	"time"
 )
 
 const (
@@ -29,6 +30,11 @@ const (
 	// Client Certificate and Key - Used by KEDA core to authenticate with external scaler
 	ClientCert = "tls.crt" // Standard kubernetes.io/tls format
 	ClientKey  = "tls.key" // Standard kubernetes.io/tls format
+
+	CACertDuration       = 10 * 365 * 24 * time.Hour // 10 years
+	CAName               = "keda-kaito-scaler-ca"
+	CAOrganization       = "kaito-project"
+	ControllerFieldOwner = "keda-kaito-scaler"
 )
 
 type controllerNameKeyType struct{}
