@@ -1,4 +1,4 @@
-name: Publish keda-kaito-scaler helm chart
+name: Publish keda-kaito-scaler helm chart(auto trigger)
 
 on:
   repository_dispatch:
