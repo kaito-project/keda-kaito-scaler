@@ -30,11 +30,6 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.client_payload.tag }}
 
-      - name: Configure Git
-        run: |
-          git config user.name "kaito-dev"
-          git config user.email "kaito-dev@microsoft.com"
-
       - name: Create gh-pages branch if it doesn't exist
         run: |
           # Check if gh-pages branch exists on remote
@@ -52,7 +47,15 @@ jobs:
             echo "gh-pages branch already exists"
           fi
 
+      - name: Package scaler helm chart
+        run: |
+          mkdir -p packaged-ws
+          mv charts/keda-kaito-scaler packaged-ws
+
       - name: Publish scaler helm chart
-        uses: helm/chart-releaser-action@v1.7.0
-        env:
-          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        uses: stefanprodan/helm-gh-pages@0ad2bb377311d61ac04ad9eb6f252fb68e207260 # v1.7.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          charts_dir: packaged-ws
+          target_dir: charts/kaito-project
+          linting: off
