@@ -1,0 +1,44 @@
+name: Publish keda-kaito-scaler helm chart
+
+on:
+  repository_dispatch:
+    types: [ publish-scaler-helm-chart ]
+
+permissions:
+  id-token: write # This is required for requesting the JWT
+  packages: write
+  contents: write
+  actions: read
+  deployments: read
+  pull-requests: read
+
+jobs:
+  publish-scaler-helm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+          disable-telemetry: true
+
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          submodules: true
+          fetch-depth: 0
+          ref: ${{ github.event.client_payload.tag }}
+
+      - name: Package scaler helm chart
+        run: |
+          mkdir -p packaged-ws
+          mv charts/keda-kaito-scaler packaged-ws
+
+      - name: Publish scaler helm chart
+        uses: stefanprodan/helm-gh-pages@0ad2bb377311d61ac04ad9eb6f252fb68e207260 # v1.7.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          charts_dir: packaged-ws
+          target_dir: charts/kaito
+          linting: off
