@@ -75,7 +75,7 @@ jobs:
       - id: get-registry
         run: |
           # registry must be in lowercase
-          echo "registry_repository=$(echo "${{ env.REGISTRY }}/${{ github.repository }}" | tr [:upper:] [:lower:])" >> $GITHUB_OUTPUT
+          echo "registry_repository=$(echo "${{ env.REGISTRY }}/kaito" | tr [:upper:] [:lower:])" >> $GITHUB_OUTPUT
 
       - id: get-tag
         name: Get tag
@@ -101,7 +101,7 @@ jobs:
         env:
           VERSION: ${{ needs.check-tag.outputs.tag }}
           REGISTRY: ${{ steps.get-registry.outputs.registry_repository }}
-          KEDA_KAITO_SCALER_IMG_NAME: keda-kaito-scaler
+          KEDA_KAITO_SCALER_IMG_NAME: ${{ env.IMAGE_NAME }}
           IMG_TAG: ${{ env.IMG_TAG }}
 
       - name: Scan ${{ steps.get-registry.outputs.registry_repository }}/${{ env.IMAGE_NAME }}:${{ env.IMG_TAG }}
