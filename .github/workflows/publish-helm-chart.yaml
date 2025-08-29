@@ -30,23 +30,6 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.client_payload.tag }}
 
-      - name: Create gh-pages branch if it doesn't exist
-        run: |
-          # Check if gh-pages branch exists on remote
-          if ! git ls-remote --heads origin gh-pages | grep -q gh-pages; then
-            echo "Creating gh-pages branch..."
-            git checkout --orphan gh-pages
-            git rm -rf .
-            echo "# Helm Charts Repository" > README.md
-            git add README.md
-            git commit -m "Initialize gh-pages branch for Helm charts"
-            git push origin gh-pages
-            # Switch back to the original ref
-            git checkout ${{ github.event.client_payload.tag }}
-          else
-            echo "gh-pages branch already exists"
-          fi
-
       - name: Package scaler helm chart
         run: |
           mkdir -p packaged-ws
