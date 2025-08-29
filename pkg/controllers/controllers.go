@@ -13,22 +13,21 @@
 package controllers
 
 import (
-	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
-	"github.com/kaito-project/keda-kaito-scaler/cmd/app/options"
-	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers/scaledobject"
-	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers/secret"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers/autoprovision"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/controller"
 )
 
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;patch;update
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=list;watch;get;update
+// +kubebuilder:rbac:groups="admissionregistration.k8s.io",resources=mutatingwebhookconfigurations,verbs=list;watch;get;update
+// +kubebuilder:rbac:groups="admissionregistration.k8s.io",resources=validatingwebhookconfigurations,verbs=list;watch;get;update
 
-func NewControllers(mgr manager.Manager, clock clock.Clock, opts *options.KedaKaitoScalerOptions) []controller.Controller {
+func NewControllers(mgr manager.Manager) []controller.Controller {
 	return []controller.Controller{
-		secret.NewController(clock, mgr.GetClient(), opts.WorkingNamespace, opts.ScalerSecretName, opts.ScalerServiceName, opts.ExpirationDuration),
-		scaledobject.NewAutoProvisionController(mgr.GetClient()),
+		autoprovision.NewAutoProvisionController(mgr.GetClient()),
 		// add controllers here
 	}
 }

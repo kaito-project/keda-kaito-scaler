@@ -7,15 +7,14 @@ metadata:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: keda-kaito-scaler-certs
+  name: keda-kaito-scaler-client-certs
   namespace: {{ .Release.Namespace }}
-  type: kubernetes.io/tls
-  data:
-    ca.crt: ""
-    tls.crt: ""
-    tls.key: ""
-    server.crt: ""
-    server.key: ""
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keda-kaito-scaler-server-certs
+  namespace: {{ .Release.Namespace }}
 ---
 apiVersion: v1
 kind: ServiceAccount

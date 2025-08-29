@@ -5,11 +5,11 @@
    spec:
      secretTargetRef:
        - parameter: caCert
-         name: keda-kaito-scaler-certs
+         name: keda-kaito-scaler-server-certs
          key: ca.crt
        - parameter: tlsClientCert
-         name: keda-kaito-scaler-certs
+         name: keda-kaito-scaler-client-certs
          key: tls.crt
        - parameter: tlsClientKey
-         name: keda-kaito-scaler-certs
+         name: keda-kaito-scaler-client-certs
          key: tls.key
