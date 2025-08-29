@@ -30,15 +30,12 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.client_payload.tag }}
 
-      - name: Package scaler helm chart
+      - name: Configure Git
         run: |
-          mkdir -p packaged-ws
-          mv charts/keda-kaito-scaler packaged-ws
+          git config user.name "kaito-dev"
+          git config user.email "kaito-dev@microsoft.com"
 
       - name: Publish scaler helm chart
-        uses: stefanprodan/helm-gh-pages@0ad2bb377311d61ac04ad9eb6f252fb68e207260 # v1.7.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          charts_dir: packaged-ws
-          target_dir: charts/kaito
-          linting: off
+        uses: helm/chart-releaser-action@a917fd15b20e8b64b94d9158ad54cd6345335584 # v1.6.0
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
