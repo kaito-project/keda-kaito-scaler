@@ -2,6 +2,8 @@
 FROM --platform=$BUILDPLATFORM mcr.microsoft.com/oss/go/microsoft/golang:1.24 AS builder
 ARG TARGETOS
 ARG TARGETARCH
+ARG GIT_COMMIT
+ARG VERSION
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -27,7 +29,7 @@ COPY Makefile Makefile
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN --mount=type=cache,target=${GOCACHE} \
     --mount=type=cache,id=keda,sharing=locked,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} GO111MODULE=on make bin/keda-kaito-scaler
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} GO111MODULE=on VERSION=${VERSION} GIT_COMMIT=${GIT_COMMIT} make bin/keda-kaito-scaler
 
 # Build a small image
 FROM --platform=$BUILDPLATFORM mcr.microsoft.com/cbl-mariner/distroless/minimal:2.0
