@@ -17,7 +17,6 @@ ports:
   webhook: 10452
   healthProbe: 10453
 
-
 resources:
   limits:
     cpu: 2000m
