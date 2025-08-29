@@ -95,6 +95,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Get short commit ID
+        id: get-commit
+        run: |
+          echo "git_commit=$(git rev-parse --short=6 HEAD)" >> $GITHUB_OUTPUT
+
       - name: Build image
         run: |
           OUTPUT_TYPE=type=registry make docker-build
@@ -103,6 +108,7 @@ jobs:
           REGISTRY: ${{ steps.get-registry.outputs.registry_repository }}
           KEDA_KAITO_SCALER_IMG_NAME: ${{ env.IMAGE_NAME }}
           IMG_TAG: ${{ env.IMG_TAG }}
+          GIT_COMMIT: ${{ steps.get-commit.outputs.git_commit }}
 
       - name: Scan ${{ steps.get-registry.outputs.registry_repository }}/${{ env.IMAGE_NAME }}:${{ env.IMG_TAG }}
         uses: aquasecurity/trivy-action@master
