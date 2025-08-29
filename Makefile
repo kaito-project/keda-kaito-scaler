@@ -21,7 +21,7 @@ YQ_TOOL ?= $(LOCALBIN)/yq
 # injection variables
 INJECTION_ROOT := github.com/kaito-project/keda-kaito-scaler/pkg/injections
 BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-GIT_COMMIT := $(shell git rev-parse --short HEAD)
+GIT_COMMIT ?= $(shell git rev-parse --short HEAD)
 LDFLAGS := -X '$(INJECTION_ROOT).Version=$(VERSION)' \
 		   -X '$(INJECTION_ROOT).BuildDate=$(BUILD_DATE)' \
 		   -X '$(INJECTION_ROOT).GitCommit=$(GIT_COMMIT)'
