@@ -6,8 +6,8 @@ certDuration: 26280h
 nameOverrider: ""
 
 image:
-    registry: kaito.sh
-    repository: keda-kaito-scaler
+    registry: ghcr.io
+    repository: kaito/keda-kaito-scaler
     tag: 0.0.1
     pullSecrets: []
 
