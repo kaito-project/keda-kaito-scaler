@@ -75,7 +75,7 @@ jobs:
       - id: get-registry
         run: |
           # registry must be in lowercase
-          echo "registry_repository=$(echo "${{ env.REGISTRY }}/kaito" | tr [:upper:] [:lower:])" >> $GITHUB_OUTPUT
+          echo "registry_repository=$(echo "${{ env.REGISTRY }}/kaito-project" | tr [:upper:] [:lower:])" >> $GITHUB_OUTPUT
 
       - id: get-tag
         name: Get tag
