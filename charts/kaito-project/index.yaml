@@ -3,12 +3,12 @@ entries:
   keda-kaito-scaler:
   - apiVersion: v2
     appVersion: v0.0.1
-    created: "2025-08-29T06:13:10.582114743Z"
+    created: "2025-08-29T06:32:49.205916715Z"
     description: A Helm chart for Kaito keda-kaito-scaler component.
-    digest: ebb58bdcb79fca6cfee914a3deb5075a3dfebb29cfec79b213b42d23ffe8ea9c
+    digest: 0315637bcf38a000105be18402af3050de313b94516835683f75b260c8c6f9c0
     name: keda-kaito-scaler
     type: application
     urls:
     - https://kaito-project.github.io/keda-kaito-scaler/charts/kaito-project/keda-kaito-scaler-0.0.1.tgz
     version: 0.0.1
-generated: "2025-08-29T06:13:10.581425235Z"
+generated: "2025-08-29T06:32:49.20481927Z"
