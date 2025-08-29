@@ -1,0 +1,64 @@
+# refer to https://goreleaser.com for more options
+version: 2
+before:
+  hooks:
+    - go mod tidy
+builds:
+  - id: keda-kaito-scaler
+    main: ./cmd/
+    binary: bin/keda-kaito-scaler
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    goarm:
+      - 5
+      - 6
+      - 7
+    goamd64:
+      - v2
+      - v3
+    flags:
+      - -mod=mod
+    ldflags:
+      - -s
+      - -w
+      - -X {{.ModulePath}}/pkg/injections.BuildDate={{.Date}}
+      - -X {{.ModulePath}}/pkg/injections.Version={{.Tag}}
+      - -X {{.ModulePath}}/pkg/injections.GitCommit={{.ShortCommit}}
+    env:
+      - CGO_ENABLED=0
+      - GO111MODULE=on
+release:
+  prerelease: auto
+  header: |
+    ## {{.Tag}} - {{ time "2006-01-02" }}
+  make_latest: true
+changelog:
+  groups:
+    - title: Features 🌈
+      regexp: ^.*feat[(\\w)]*:+.*$
+
+    - title: Bug Fixes 🐞
+      regexp: ^.*fix[(\\w)]*:+.*$
+    - title: Build 🏭
+      regexp: ^.*build[(\\w)]*:+.*$
+    - title: Code Refactoring 💎
+      regexp: ^.*refactor[(\\w)]*:+.*$
+    - title: Code Style 🎶
+      regexp: ^.*style[(\\w)]*:+.*$
+    - title: Continuous Integration 💜
+      regexp: ^.*ci[(\\w)]*:+.*$
+    - title: Documentation 📘
+      regexp: ^.*docs[(\\w)]*:+.*$
+    - title: Maintenance 🔧
+      regexp: ^.*chore[(\\w)]*:+.*$
+    - title: Performance Improvements 🚀
+      regexp: ^.*perf[(\\w)]*:+.*$
+    - title: Revert Change ◀️
+      regexp: ^.*revert[(\\w)]*:+.*$
+    - title: Security Fix 🛡️
+      regexp: ^.*security[(\\w)]*:+.*$
+    - title: Testing 💚
+      regexp: ^.*test[(\\w)]*:+.*$
