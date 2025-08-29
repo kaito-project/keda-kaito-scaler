@@ -71,6 +71,7 @@ jobs:
     environment: preset-env
     outputs:
       registry_repository: ${{ steps.get-registry.outputs.registry_repository }}
+      git_commit: ${{ steps.get-commit.outputs.git_commit }}
     steps:
       - id: get-registry
         run: |
@@ -126,11 +127,11 @@ jobs:
 
   publish-helm-chart:
     runs-on: ubuntu-latest
-    needs: [ build-scan-publish-gh-images ]
+    needs: [ check-tag, build-scan-publish-gh-images ]
     steps:
       - name: 'Dispatch release tag for keda-kaito-scaler helm chart'
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           event-type: publish-scaler-helm-chart
-          client-payload: '{"tag": "${{ github.event.client_payload.tag }}"}'
+          client-payload: '{"tag": "${{ needs.check-tag.outputs.tag }}"}'
