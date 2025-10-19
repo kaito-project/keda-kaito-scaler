@@ -130,12 +130,12 @@ func configureKedaKaitoScalerTrigger(obj *v1alpha1.ScaledObject, triggerIndex in
 		kaitoScalerTrigger.Metadata = make(map[string]string)
 	}
 
-	if workspaceName, ok := kaitoScalerTrigger.Metadata[scaler.WorkspaceNameInMetadata]; !ok || len(workspaceName) == 0 {
-		kaitoScalerTrigger.Metadata[scaler.WorkspaceNameInMetadata] = obj.Spec.ScaleTargetRef.Name
+	if inferenceSetName, ok := kaitoScalerTrigger.Metadata[scaler.InferenceSetNameInMetadata]; !ok || len(inferenceSetName) == 0 {
+		kaitoScalerTrigger.Metadata[scaler.InferenceSetNameInMetadata] = obj.Spec.ScaleTargetRef.Name
 	}
 
-	if workspaceNamespace, ok := kaitoScalerTrigger.Metadata[scaler.WorkspaceNamespaceInMetadata]; !ok || len(workspaceNamespace) == 0 {
-		kaitoScalerTrigger.Metadata[scaler.WorkspaceNamespaceInMetadata] = obj.Namespace
+	if inferenceSetNamespace, ok := kaitoScalerTrigger.Metadata[scaler.InferenceSetNamespaceInMetadata]; !ok || len(inferenceSetNamespace) == 0 {
+		kaitoScalerTrigger.Metadata[scaler.InferenceSetNamespaceInMetadata] = obj.Namespace
 	}
 
 	if scalerAddress, ok := kaitoScalerTrigger.Metadata[scaler.ScalerAddressInMetadata]; !ok || len(scalerAddress) == 0 {

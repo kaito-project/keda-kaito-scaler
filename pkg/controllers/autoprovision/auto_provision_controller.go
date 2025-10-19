@@ -15,11 +15,13 @@ package autoprovision
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strconv"
 	"time"
 
-	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
+	"github.com/kaito-project/kaito/pkg/utils/inferenceset"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"golang.org/x/time/rate"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -55,24 +57,51 @@ func NewAutoProvisionController(c client.Client) *Controller {
 	}
 }
 
-func (c *Controller) Reconcile(ctx context.Context, ws *kaitov1beta1.Workspace) (reconcile.Result, error) {
-	if !enableAutoProvisioning(ws) {
+func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceSet) (reconcile.Result, error) {
+	if !enableAutoProvisioning(is) {
 		return reconcile.Result{}, nil
 	}
 
-	maxReplicas, _ := strconv.Atoi(ws.Annotations[AnnotationKeyMaxReplicas])
-	threshold := ws.Annotations[AnnotationKeyThreshold]
+	var maxReplicas int
+	if maxReplicasStr, ok := is.Annotations[AnnotationKeyMaxReplicas]; ok {
+		maxReplicas, _ = strconv.Atoi(maxReplicasStr)
+	} else {
+		// get the related workspace instances
+		workspaceList, err := inferenceset.ListWorkspaces(ctx, is, c.Client)
+		if err != nil {
+			return reconcile.Result{}, fmt.Errorf("failed to list workspaces for inference set %s/%s: %v", is.Namespace, is.Name, err)
+		}
+
+		var targetNodeCount int32
+		for i := range workspaceList.Items {
+			if workspaceList.Items[i].Status.TargetNodeCount != 0 {
+				targetNodeCount = workspaceList.Items[i].Status.TargetNodeCount
+				break
+			}
+		}
+
+		if targetNodeCount == 0 {
+			return reconcile.Result{}, fmt.Errorf("failed to get target node count from workspaces for inference set %s/%s", is.Namespace, is.Name)
+		}
+
+		maxReplicas = is.Spec.NodeCountLimit / int(targetNodeCount)
+		if maxReplicas < 1 {
+			maxReplicas = 1
+		}
+	}
+
+	threshold := is.Annotations[AnnotationKeyThreshold]
 
 	// list all scaled objects in the same namespace
 	var scaledObjectList v1alpha1.ScaledObjectList
-	if err := c.List(ctx, &scaledObjectList, client.InNamespace(ws.Namespace)); err != nil {
+	if err := c.List(ctx, &scaledObjectList, client.InNamespace(is.Namespace)); err != nil {
 		return reconcile.Result{}, err
 	}
 
 	// filter the scaled objects related to the workspace and auto provisioning
 	var filteredScaledObjects []v1alpha1.ScaledObject
 	for _, scaledObject := range scaledObjectList.Items {
-		if scaledObject.Spec.ScaleTargetRef.Name == ws.Name && scaledObject.Spec.ScaleTargetRef.Kind == "Workspace" {
+		if scaledObject.Spec.ScaleTargetRef.Name == is.Name && scaledObject.Spec.ScaleTargetRef.Kind == "InferenceSet" {
 			if scaledObject.Annotations[AnnotationKeyManagedBy] == "keda-kaito-scaler" {
 				filteredScaledObjects = append(filteredScaledObjects, scaledObject)
 			}
@@ -83,17 +112,17 @@ func (c *Controller) Reconcile(ctx context.Context, ws *kaitov1beta1.Workspace) 
 	if len(filteredScaledObjects) == 0 {
 		newScaledObject := &v1alpha1.ScaledObject{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      ws.Name,
-				Namespace: ws.Namespace,
+				Name:      is.Name,
+				Namespace: is.Namespace,
 				Annotations: map[string]string{
 					AnnotationKeyManagedBy: "keda-kaito-scaler",
 				},
 			},
 			Spec: v1alpha1.ScaledObjectSpec{
 				ScaleTargetRef: &v1alpha1.ScaleTarget{
-					Name:       ws.Name,
-					APIVersion: "kaito.sh/v1beta1",
-					Kind:       "Workspace",
+					Name:       is.Name,
+					APIVersion: "kaito.sh/v1alpha1",
+					Kind:       "InferenceSet",
 				},
 				MinReplicaCount: ptr.To(int32(1)),
 				MaxReplicaCount: ptr.To(int32(maxReplicas)),
@@ -147,31 +176,31 @@ func (c *Controller) Reconcile(ctx context.Context, ws *kaitov1beta1.Workspace) 
 	return reconcile.Result{}, nil
 }
 
-func generateWorkspacePredicateFunc() predicate.Predicate {
+func generateInferenceSetPredicateFunc() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			workspace, ok := e.Object.(*kaitov1beta1.Workspace)
+			inferenceSet, ok := e.Object.(*kaitov1alpha1.InferenceSet)
 			if !ok {
 				return false
 			}
-			return enableAutoProvisioning(workspace)
+			return enableAutoProvisioning(inferenceSet)
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldWorkspace, ok := e.ObjectOld.(*kaitov1beta1.Workspace)
+			oldInferenceSet, ok := e.ObjectOld.(*kaitov1alpha1.InferenceSet)
 			if !ok {
 				return false
 			}
 
-			newWorkspace, ok := e.ObjectNew.(*kaitov1beta1.Workspace)
+			newInferenceSet, ok := e.ObjectNew.(*kaitov1alpha1.InferenceSet)
 			if !ok {
 				return false
 			}
 
 			// check auto-provision, max-replicas, threshold annotation changes
-			if oldWorkspace.Annotations[AnnotationKeyAutoProvision] != newWorkspace.Annotations[AnnotationKeyAutoProvision] ||
-				oldWorkspace.Annotations[AnnotationKeyMaxReplicas] != newWorkspace.Annotations[AnnotationKeyMaxReplicas] ||
-				oldWorkspace.Annotations[AnnotationKeyThreshold] != newWorkspace.Annotations[AnnotationKeyThreshold] {
-				return enableAutoProvisioning(newWorkspace)
+			if oldInferenceSet.Annotations[AnnotationKeyAutoProvision] != newInferenceSet.Annotations[AnnotationKeyAutoProvision] ||
+				oldInferenceSet.Annotations[AnnotationKeyMaxReplicas] != newInferenceSet.Annotations[AnnotationKeyMaxReplicas] ||
+				oldInferenceSet.Annotations[AnnotationKeyThreshold] != newInferenceSet.Annotations[AnnotationKeyThreshold] {
+				return enableAutoProvisioning(newInferenceSet)
 			}
 			return false
 		},
@@ -181,18 +210,23 @@ func generateWorkspacePredicateFunc() predicate.Predicate {
 	}
 }
 
-func enableAutoProvisioning(workspace *kaitov1beta1.Workspace) bool {
-	if workspace.Annotations[AnnotationKeyAutoProvision] != "true" {
+func enableAutoProvisioning(inferenceSet *kaitov1alpha1.InferenceSet) bool {
+	if inferenceSet.Annotations[AnnotationKeyAutoProvision] != "true" {
 		return false
 	}
 
-	// max replicas should be more than 1
-	if maxReplicas, err := strconv.Atoi(workspace.Annotations[AnnotationKeyMaxReplicas]); err != nil || maxReplicas <= 1 {
+	// if max-replicas annotation exists, max replicas should be more than 1
+	// if not exists, NodeCountLimit should be more than 1, we will use it to calculate max replicas
+	if maxReplicasStr, ok := inferenceSet.Annotations[AnnotationKeyMaxReplicas]; ok {
+		if maxReplicas, err := strconv.Atoi(maxReplicasStr); err != nil || maxReplicas <= 1 {
+			return false
+		}
+	} else if inferenceSet.Spec.NodeCountLimit == 0 {
 		return false
 	}
 
 	// threshold should be a valid integer
-	if threshold, err := strconv.Atoi(workspace.Annotations[AnnotationKeyThreshold]); err != nil || threshold < 0 {
+	if threshold, err := strconv.Atoi(inferenceSet.Annotations[AnnotationKeyThreshold]); err != nil || threshold < 0 {
 		return false
 	}
 
@@ -200,15 +234,16 @@ func enableAutoProvisioning(workspace *kaitov1beta1.Workspace) bool {
 }
 
 // +kubebuilder:rbac:groups="keda.sh",resources=scaledobjects,verbs=create;list;watch;get;update;delete
-// +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=list;watch;get
+// +kubebuilder:rbac:groups="kaito.sh",resources=inferencesets,verbs=list;watch;get
+// +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=list;watch
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("scaledobject.provision").
-		For(&kaitov1beta1.Workspace{}, builder.WithPredicates(generateWorkspacePredicateFunc())).
+		For(&kaitov1alpha1.InferenceSet{}, builder.WithPredicates(generateInferenceSetPredicateFunc())).
 		Watches(&v1alpha1.ScaledObject{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 			if scaledObj, ok := obj.(*v1alpha1.ScaledObject); ok {
-				if scaledObj.Spec.ScaleTargetRef.Kind != "Workspace" {
+				if scaledObj.Spec.ScaleTargetRef.Kind == "InferenceSet" {
 					return []reconcile.Request{
 						{
 							NamespacedName: types.NamespacedName{Namespace: scaledObj.Namespace, Name: scaledObj.Spec.ScaleTargetRef.Name},
