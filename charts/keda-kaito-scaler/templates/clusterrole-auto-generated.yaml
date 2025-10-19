@@ -54,9 +54,16 @@ rules:
 - apiGroups:
   - kaito.sh
   resources:
-  - workspaces
+  - inferencesets
   verbs:
   - get
+  - list
+  - watch
+- apiGroups:
+  - kaito.sh
+  resources:
+  - workspaces
+  verbs:
   - list
   - watch
 - apiGroups:

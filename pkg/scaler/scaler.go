@@ -23,7 +23,9 @@ import (
 	"strings"
 	"time"
 
+	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+	"github.com/kaito-project/kaito/pkg/utils/inferenceset"
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 	"go.uber.org/multierr"
 	"google.golang.org/grpc/codes"
@@ -37,31 +39,32 @@ const (
 	ScalerName = "keda-kaito-scaler"
 
 	// Metadata keys
-	ScalerNameKeyInMetadata      = "scalerName"
-	WorkspaceNameInMetadata      = "workspaceName"
-	WorkspaceNamespaceInMetadata = "workspaceNamespace"
-	ScalerAddressInMetadata      = "scalerAddress"
-	MetricNameInMetadata         = "metricName"
-	ThresholdInMetadata          = "threshold"
-	MetricProtocolInMetadata     = "metricProtocol"
-	MetricPortInMetadata         = "metricPort"
-	MetricPathInMetadata         = "metricPath"
-	ScrapeTimeoutInMetadata      = "scrapeTimeout"
+	ScalerNameKeyInMetadata         = "scalerName"
+	InferenceSetNameInMetadata      = "inferenceSetName"
+	InferenceSetNamespaceInMetadata = "inferenceSetNamespace"
+	ScalerAddressInMetadata         = "scalerAddress"
+	MetricNameInMetadata            = "metricName"
+	ThresholdInMetadata             = "threshold"
+	MetricProtocolInMetadata        = "metricProtocol"
+	MetricPortInMetadata            = "metricPort"
+	MetricPathInMetadata            = "metricPath"
+	ScrapeTimeoutInMetadata         = "scrapeTimeout"
 )
 
 type ScalerConfig struct {
-	WorkspaceName      string
-	WorkspaceNamespace string
-	MetricName         string
-	MetricProtocol     string
-	MetricPort         string
-	MetricPath         string
-	ScrapeTimeout      time.Duration
-	Threshold          int64
+	InferenceSetName      string
+	InferenceSetNamespace string
+	MetricName            string
+	MetricProtocol        string
+	MetricPort            string
+	MetricPath            string
+	ScrapeTimeout         time.Duration
+	Threshold             int64
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups="kaito.sh",resources=inferencesets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=list;watch
 
 type kaitoScaler struct {
 	kubeClient    client.Client
@@ -94,20 +97,20 @@ func (e *kaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledOb
 	}
 
 	// get the related workspace instance
-	var workspace *kaitov1beta1.Workspace
+	var inferenceSet *kaitov1alpha1.InferenceSet
 	if err := e.kubeClient.Get(ctx, client.ObjectKey{
-		Namespace: scalerConfig.WorkspaceNamespace,
-		Name:      scalerConfig.WorkspaceName,
-	}, workspace); err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get workspace: %v", err))
+		Namespace: scalerConfig.InferenceSetNamespace,
+		Name:      scalerConfig.InferenceSetName,
+	}, inferenceSet); err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get inference set: %v", err))
 	}
 
-	// get WorkspaceConditionTypeInferenceStatus condition from workspace.Status.Conditions
+	// get InferenceSetConditionTypeInferenceStatus condition from inferenceSet.Status.Conditions
 	condition := metav1.Condition{}
-	if workspace != nil {
-		for i := range workspace.Status.Conditions {
-			if workspace.Status.Conditions[i].Type == string(kaitov1beta1.WorkspaceConditionTypeInferenceStatus) {
-				condition = workspace.Status.Conditions[i]
+	if inferenceSet != nil {
+		for i := range inferenceSet.Status.Conditions {
+			if inferenceSet.Status.Conditions[i].Type == string(kaitov1alpha1.InferenceSetConditionTypeReady) {
+				condition = inferenceSet.Status.Conditions[i]
 				break
 			}
 		}
@@ -143,28 +146,39 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		return nil, err
 	}
 
-	var workspace *kaitov1beta1.Workspace
+	var inferenceSet *kaitov1alpha1.InferenceSet
 	if err := e.kubeClient.Get(ctx, client.ObjectKey{
-		Namespace: scalerConfig.WorkspaceNamespace,
-		Name:      scalerConfig.WorkspaceName,
-	}, workspace); err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get workspace: %v", err))
+		Namespace: scalerConfig.InferenceSetNamespace,
+		Name:      scalerConfig.InferenceSetName,
+	}, inferenceSet); err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get inference set: %v", err))
 	}
 
-	// get related pods for workspace based on the label selector(kaitov1beta1.LabelWorkspaceName=<workspace.Name>)
-	var pods corev1.PodList
-	if err := e.kubeClient.List(ctx, &pods, client.InNamespace(scalerConfig.WorkspaceNamespace), client.MatchingLabels{
-		kaitov1beta1.LabelWorkspaceName: workspace.Name,
-	}); err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to list pods: %v", err))
+	// get the related workspace instances
+	workspaceList, err := inferenceset.ListWorkspaces(ctx, inferenceSet, e.kubeClient)
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to list workspaces: %v", err))
+	}
+
+	pods := make([]corev1.Pod, 0)
+	for i := range workspaceList.Items {
+		workspace := &workspaceList.Items[i]
+		// get related pods for workspace based on the label selector(kaitov1beta1.LabelWorkspaceName=<workspace.Name>)
+		var workspacePods corev1.PodList
+		if err := e.kubeClient.List(ctx, &workspacePods, client.InNamespace(scalerConfig.InferenceSetNamespace), client.MatchingLabels{
+			kaitov1beta1.LabelWorkspaceName: workspace.Name,
+		}); err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to list pods: %v", err))
+		}
+		pods = append(pods, workspacePods.Items...)
 	}
 
 	// get the metrics for the ready pods and calculate the total metric value.
 	// at the same time, please count the number of pods that metric can be collected.
 	var totalMetricValue int64
 	var podCount int
-	metricErrs := make([]error, len(pods.Items))
-	for i, pod := range pods.Items {
+	metricErrs := make([]error, len(pods))
+	for i, pod := range pods {
 		if !isPodReady(&pod) {
 			continue
 		}
@@ -185,16 +199,16 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get pod metrics: %v", err))
 		}
 		return nil, status.Error(codes.Internal, "no ready pods found for the workspace")
-	} else if podCount != len(pods.Items) {
+	} else if podCount != len(pods) {
 		if totalMetricValue/int64(podCount) < scalerConfig.Threshold {
 			// scale-down direction
-			totalMetricValue += scalerConfig.Threshold * int64(len(pods.Items)-podCount)
+			totalMetricValue += scalerConfig.Threshold * int64(len(pods)-podCount)
 		} else {
 			// scale-up direction
-			totalMetricValue += 0 * int64(len(pods.Items)-podCount)
+			totalMetricValue += 0 * int64(len(pods)-podCount)
 		}
 	}
-	averageMetricValue := totalMetricValue / int64(len(pods.Items))
+	averageMetricValue := totalMetricValue / int64(len(pods))
 
 	return &externalscaler.GetMetricsResponse{
 		MetricValues: []*externalscaler.MetricValue{
@@ -211,14 +225,14 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		return nil, status.Error(codes.InvalidArgument, "scaler name must be keda-kaito-scaler")
 	}
 
-	workspaceName, ok := sor.ScalerMetadata[WorkspaceNameInMetadata]
-	if !ok || workspaceName == "" {
-		return nil, status.Error(codes.InvalidArgument, "workspace name must be specified")
+	inferenceSetName, ok := sor.ScalerMetadata[InferenceSetNameInMetadata]
+	if !ok || inferenceSetName == "" {
+		return nil, status.Error(codes.InvalidArgument, "inference set name must be specified")
 	}
 
-	workspaceNamespace, ok := sor.ScalerMetadata[WorkspaceNamespaceInMetadata]
-	if !ok || workspaceNamespace == "" {
-		return nil, status.Error(codes.InvalidArgument, "workspace namespace must be specified")
+	inferenceSetNamespace, ok := sor.ScalerMetadata[InferenceSetNamespaceInMetadata]
+	if !ok || inferenceSetNamespace == "" {
+		return nil, status.Error(codes.InvalidArgument, "inference set namespace must be specified")
 	}
 
 	if metricName == "" {
@@ -269,14 +283,14 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 	}
 
 	return &ScalerConfig{
-		WorkspaceName:      workspaceName,
-		WorkspaceNamespace: workspaceNamespace,
-		MetricName:         metricName,
-		MetricProtocol:     metricProtocol,
-		MetricPort:         metricPort,
-		MetricPath:         metricPath,
-		ScrapeTimeout:      scrapeTimeout,
-		Threshold:          threshold,
+		InferenceSetName:      inferenceSetName,
+		InferenceSetNamespace: inferenceSetNamespace,
+		MetricName:            metricName,
+		MetricProtocol:        metricProtocol,
+		MetricPort:            metricPort,
+		MetricPath:            metricPath,
+		ScrapeTimeout:         scrapeTimeout,
+		Threshold:             threshold,
 	}, nil
 }
 
