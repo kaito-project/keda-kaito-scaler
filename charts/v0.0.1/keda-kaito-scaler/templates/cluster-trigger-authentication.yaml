@@ -1,15 +1,15 @@
-   apiVersion: keda.sh/v1alpha1
-   kind: ClusterTriggerAuthentication
-   metadata:
-     name: keda-kaito-scaler-creds
-   spec:
-     secretTargetRef:
-       - parameter: caCert
-         name: keda-kaito-scaler-server-certs
-         key: ca.crt
-       - parameter: tlsClientCert
-         name: keda-kaito-scaler-client-certs
-         key: tls.crt
-       - parameter: tlsClientKey
-         name: keda-kaito-scaler-client-certs
-         key: tls.key
+apiVersion: keda.sh/v1alpha1
+kind: ClusterTriggerAuthentication
+metadata:
+  name: keda-kaito-scaler-creds
+spec:
+  secretTargetRef:
+    - parameter: caCert
+      name: keda-kaito-scaler-server-certs
+      key: ca.crt
+    - parameter: tlsClientCert
+      name: keda-kaito-scaler-client-certs
+      key: tls.crt
+    - parameter: tlsClientKey
+      name: keda-kaito-scaler-client-certs
+      key: tls.key
