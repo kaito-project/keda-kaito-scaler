@@ -23,6 +23,9 @@ import (
 	"net/http"
 	"time"
 
+	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
+	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 	"github.com/open-policy-agent/cert-controller/pkg/rotator"
 	"github.com/samber/lo"
@@ -31,8 +34,10 @@ import (
 	"google.golang.org/grpc/credentials"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -61,6 +66,13 @@ import (
 const (
 	KedaKaitoScaler = "keda-kaito-scaler"
 )
+
+func init() {
+	// controller-runtime manager use scheme.Scheme by default
+	utilruntime.Must(kaitov1alpha1.AddToScheme(scheme.Scheme))
+	utilruntime.Must(kaitov1beta1.AddToScheme(scheme.Scheme))
+	utilruntime.Must(v1alpha1.AddToScheme(scheme.Scheme))
+}
 
 func NewKedaKaitoScalerCommand() *cobra.Command {
 	opts := options.NewKedaKaitoScalerOptions()
