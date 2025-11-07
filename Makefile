@@ -1,7 +1,7 @@
 # Makefile for KEDA Kaito Scaler
 
 REGISTRY ?= YOUR_REGISTRY
-VERSION ?= v0.0.1
+VERSION ?= v0.1.1
 IMG_TAG ?= $(subst v,,$(VERSION))
 PROJECT_ROOT ?= $(shell pwd)
 OUTPUT_DIR := $(PROJECT_ROOT)/_output

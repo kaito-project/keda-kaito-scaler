@@ -292,6 +292,7 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 		ExtraDNSNames:  dnsNames,
 		CertName:       util.ServerCert,
 		KeyName:        util.ServerKey,
+		CertDir:        util.WebhookCertDir,
 	}); err != nil {
 		klog.Errorf("failed to add cert controller for webhook certificates, %v", err)
 		return err
@@ -311,6 +312,7 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 		FieldOwner:            util.ControllerFieldOwner,
 		CAName:                util.CAName,
 		CAOrganization:        util.CAOrganization,
+		CertDir:               util.ClientCertDir,
 	}); err != nil {
 		klog.Errorf("failed to add cert controller for scaler client certificates, %v", err)
 		return err
@@ -332,6 +334,7 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 		ExtraDNSNames:         dnsNames,
 		CertName:              util.ServerCert,
 		KeyName:               util.ServerKey,
+		CertDir:               util.ServerCertDir,
 	}); err != nil {
 		klog.Errorf("failed to add cert controller for scaler server certificates, %v", err)
 		return err
