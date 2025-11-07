@@ -160,7 +160,10 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	lo.Must0(mgr.AddReadyzCheck("readyz", healthz.Ping))
 
 	// add certificate controllers
-	err = addCertificateControllers(mgr, opts)
+	webhookCertReady := make(chan struct{})
+	serverCertReady := make(chan struct{})
+	clientCertReady := make(chan struct{})
+	err = addCertificateControllers(mgr, opts, webhookCertReady, serverCertReady, clientCertReady)
 	if err != nil {
 		logger.Error(err, "failed to add certificate controllers")
 		return err
@@ -183,7 +186,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		lo.Must0(mgr.Start(ctx))
 	}()
 	// start grpc server
-	lo.Must0(startKaitoScalerServer(ctx, mgr.GetClient(), opts.GrpcPort, secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName, opts.ScalerClientSecretName))
+	lo.Must0(startKaitoScalerServer(ctx, mgr.GetClient(), secretLister, opts, webhookCertReady, serverCertReady, clientCertReady))
 	return nil
 }
 
@@ -205,20 +208,21 @@ func prepareResourcesLister(ctx context.Context, cfg *rest.Config, ns string) (c
 	return secretLister, nil
 }
 
-func startKaitoScalerServer(ctx context.Context, c client.Client, port int, secretLister corev1listers.SecretLister, namespace, serverSecretName, clientSecretName string) error {
+func startKaitoScalerServer(ctx context.Context, c client.Client, secretLister corev1listers.SecretLister, opts *options.KedaKaitoScalerOptions, webhookCertReady, serverCertReady, clientCertReady chan struct{}) error {
 	logger := log.FromContext(ctx).WithName("grpc-server")
-	addr := fmt.Sprintf("0.0.0.0:%d", port)
+	addr := fmt.Sprintf("0.0.0.0:%d", opts.GrpcPort)
 
-	// Wait for the secret to be ready
-	logger.Info("waiting for server secret to be ready", "secret", serverSecretName, "namespace", namespace)
-	if err := waitForSecret(ctx, secretLister, namespace, serverSecretName, true); err != nil {
-		return fmt.Errorf("failed to wait for secret: %w", err)
-	}
+	// wait for webhook secret to be ready
+	logger.Info("waiting for webhook secret to be ready", "secret", opts.WebhookSecretName, "namespace", opts.WorkingNamespace)
+	<-webhookCertReady
 
-	logger.Info("waiting for client secret to be ready", "secret", clientSecretName, "namespace", namespace)
-	if err := waitForSecret(ctx, secretLister, namespace, clientSecretName, false); err != nil {
-		return fmt.Errorf("failed to wait for secret: %w", err)
-	}
+	// Wait for server secret to be ready
+	logger.Info("waiting for server secret to be ready", "secret", opts.ScalerServerSecretName, "namespace", opts.WorkingNamespace)
+	<-serverCertReady
+
+	logger.Info("waiting for client secret to be ready", "secret", opts.ScalerClientSecretName, "namespace", opts.WorkingNamespace)
+	<-clientCertReady
+
 	logger.Info("secret is ready, starting TLS gRPC server", "address", addr)
 
 	lis, err := net.Listen("tcp", addr)
@@ -230,13 +234,13 @@ func startKaitoScalerServer(ctx context.Context, c client.Client, port int, secr
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return loadCertificateFromSecret(secretLister, namespace, serverSecretName)
+			return loadCertificateFromSecret(secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName)
 		},
 		ClientAuth: tls.RequireAndVerifyClientCert,
 	}
 
 	// Load root CAs from secret for client certificate verification
-	if rootCAs, err := loadRootCAsFromSecret(secretLister, namespace, clientSecretName); err != nil {
+	if rootCAs, err := loadRootCAsFromSecret(secretLister, opts.WorkingNamespace, opts.ScalerClientSecretName); err != nil {
 		logger.Info("failed to load root CAs, using system default", "error", err)
 		return err
 	} else if rootCAs != nil {
@@ -258,7 +262,7 @@ func startKaitoScalerServer(ctx context.Context, c client.Client, port int, secr
 	return grpcServer.Serve(lis)
 }
 
-func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScalerOptions) error {
+func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScalerOptions, webhookCertReady, serverCertReady, clientCertReady chan struct{}) error {
 	dnsNames := []string{
 		fmt.Sprintf("%s.%s", opts.ScalerServiceName, opts.WorkingNamespace),
 		fmt.Sprintf("%s.%s.svc", opts.ScalerServiceName, opts.WorkingNamespace),
@@ -281,10 +285,6 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 				Name: "keda-kaito-scaler-mutating-webhook-configuration",
 				Type: rotator.Mutating,
 			},
-			{
-				Name: "keda-kaito-scaler-validating-webhook-configuration",
-				Type: rotator.Validating,
-			},
 		},
 		FieldOwner:     util.ControllerFieldOwner,
 		CAName:         util.CAName,
@@ -292,6 +292,8 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 		ExtraDNSNames:  dnsNames,
 		CertName:       util.ServerCert,
 		KeyName:        util.ServerKey,
+		CertDir:        util.WebhookCertDir,
+		IsReady:        webhookCertReady,
 	}); err != nil {
 		klog.Errorf("failed to add cert controller for webhook certificates, %v", err)
 		return err
@@ -311,6 +313,8 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 		FieldOwner:            util.ControllerFieldOwner,
 		CAName:                util.CAName,
 		CAOrganization:        util.CAOrganization,
+		CertDir:               util.ClientCertDir,
+		IsReady:               clientCertReady,
 	}); err != nil {
 		klog.Errorf("failed to add cert controller for scaler client certificates, %v", err)
 		return err
@@ -332,50 +336,14 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 		ExtraDNSNames:         dnsNames,
 		CertName:              util.ServerCert,
 		KeyName:               util.ServerKey,
+		CertDir:               util.ServerCertDir,
+		IsReady:               serverCertReady,
 	}); err != nil {
 		klog.Errorf("failed to add cert controller for scaler server certificates, %v", err)
 		return err
 	}
 
 	return nil
-}
-
-// waitForSecret waits until the secret exists and contains the required certificate data
-func waitForSecret(ctx context.Context, secretLister corev1listers.SecretLister, namespace, secretName string, isServerSecret bool) error {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			secret, err := secretLister.Secrets(namespace).Get(secretName)
-			if err != nil {
-				continue // Secret doesn't exist yet, keep waiting
-			}
-
-			// Check if the secret contains the required certificate data
-			if hasRequiredCertificateData(secret.Data, isServerSecret) {
-				return nil
-			}
-		}
-	}
-}
-
-// hasRequiredCertificateData checks if the secret contains server.crt/tls.crt, server.key/tls.key, and ca.crt
-func hasRequiredCertificateData(data map[string][]byte, isServerSecret bool) bool {
-	caCert, hasCA := data[util.CACert]
-	if isServerSecret {
-		serverCert, hasCert := data[util.ServerCert]
-		serverKey, hasKey := data[util.ServerKey]
-		return hasCert && hasKey && hasCA && len(serverCert) > 0 && len(serverKey) > 0 && len(caCert) > 0
-	} else {
-		clientCert, hasCert := data[util.ClientCert]
-		clientKey, hasKey := data[util.ClientKey]
-		return hasCert && hasKey && hasCA && len(clientCert) > 0 && len(clientKey) > 0 && len(caCert) > 0
-	}
-
 }
 
 // loadCertificateFromSecret loads the TLS certificate from the secret

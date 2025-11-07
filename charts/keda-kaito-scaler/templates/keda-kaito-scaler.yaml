@@ -131,4 +131,27 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           {{- end }}
+          volumeMounts:
+            - name: webhook-certs
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
+            - name: server-certs
+              mountPath: /tmp/keda-kaito-scaler-certs/server
+              readOnly: true
+            - name: client-certs
+              mountPath: /tmp/keda-kaito-scaler-certs/client
+              readOnly: true
+      volumes:
+        - name: webhook-certs
+          secret:
+            secretName: keda-kaito-scaler-webhook-certs
+            defaultMode: 0644
+        - name: server-certs
+          secret:
+            secretName: keda-kaito-scaler-server-certs
+            defaultMode: 0644
+        - name: client-certs
+          secret:
+            secretName: keda-kaito-scaler-client-certs
+            defaultMode: 0644
       serviceAccountName: keda-kaito-scaler-sa
