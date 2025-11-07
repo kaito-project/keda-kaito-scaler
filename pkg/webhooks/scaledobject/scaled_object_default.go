@@ -174,7 +174,7 @@ func configureKedaKaitoScalerTrigger(obj *v1alpha1.ScaledObject, triggerIndex in
 	}
 }
 
-// +kubebuilder:webhook:path=/mutate-keda-sh-v1alpha1-scaledobject,mutating=true,failurePolicy=ignore,sideEffects=None,admissionReviewVersions=v1,groups="",resources=scaledobjects,verbs=create,versions=v1,name=mutating.scaledobjects.kaito.sh,serviceName=keda-kaito-scaler-svc,serviceNamespace=kube-system
+// +kubebuilder:webhook:path=/mutate-keda-sh-v1alpha1-scaledobject,mutating=true,failurePolicy=ignore,sideEffects=None,admissionReviewVersions=v1,groups="",resources=scaledobjects,verbs=create,versions=v1,name=mutating.scaledobjects.kaito.sh,serviceName=keda-kaito-scaler-svc,serviceNamespace=kaito-workspace
 
 func (w *ScaledObjectWebhook) Register(_ context.Context, mgr manager.Manager) error {
 	return controllerruntime.NewWebhookManagedBy(mgr).

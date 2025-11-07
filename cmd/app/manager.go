@@ -281,10 +281,6 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 				Name: "keda-kaito-scaler-mutating-webhook-configuration",
 				Type: rotator.Mutating,
 			},
-			{
-				Name: "keda-kaito-scaler-validating-webhook-configuration",
-				Type: rotator.Validating,
-			},
 		},
 		FieldOwner:     util.ControllerFieldOwner,
 		CAName:         util.CAName,

@@ -56,6 +56,7 @@ manifests: controller-gen install-yq ## Generate WebhookConfiguration, ClusterRo
 	$(CONTROLLER_GEN) webhook paths="./pkg/..." output:webhook:artifacts:config=charts/keda-kaito-scaler/templates
 	mv charts/keda-kaito-scaler/templates/role.yaml charts/keda-kaito-scaler/templates/clusterrole-auto-generated.yaml
 	mv charts/keda-kaito-scaler/templates/manifests.yaml charts/keda-kaito-scaler/templates/webhooks-auto-generated.yaml
+	$(YQ_TOOL) eval -i 'select(.kind=="MutatingWebhookConfiguration") .metadata.name = "keda-kaito-scaler-mutating-webhook-configuration"' charts/keda-kaito-scaler/templates/webhooks-auto-generated.yaml
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
