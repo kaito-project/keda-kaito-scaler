@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -58,15 +59,13 @@ func NewAutoProvisionController(c client.Client) *Controller {
 }
 
 func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceSet) (reconcile.Result, error) {
+	logger := log.FromContext(ctx).WithName("auto-provision-controller")
 	if !enableAutoProvisioning(is) {
 		return reconcile.Result{}, nil
 	}
 
 	var maxReplicas int
-	if maxReplicasStr, ok := is.Annotations[AnnotationKeyMaxReplicas]; ok {
-		maxReplicas, _ = strconv.Atoi(maxReplicasStr)
-	} else {
-		// get the related workspace instances
+	if is.Spec.NodeCountLimit != 0 {
 		workspaceList, err := inferenceset.ListWorkspaces(ctx, is, c.Client)
 		if err != nil {
 			return reconcile.Result{}, fmt.Errorf("failed to list workspaces for inference set %s/%s: %v", is.Namespace, is.Name, err)
@@ -81,13 +80,18 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 		}
 
 		if targetNodeCount == 0 {
-			return reconcile.Result{}, fmt.Errorf("failed to get target node count from workspaces for inference set %s/%s", is.Namespace, is.Name)
+			logger.Info("target node count from workspaces for inference set is zero, and requeue after 5 seconds", "namespace", is.Namespace, "name", is.Name)
+			return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
 		maxReplicas = is.Spec.NodeCountLimit / int(targetNodeCount)
 		if maxReplicas < 1 {
 			maxReplicas = 1
 		}
+	} else if maxReplicasStr, ok := is.Annotations[AnnotationKeyMaxReplicas]; ok {
+		maxReplicas, _ = strconv.Atoi(maxReplicasStr)
+	} else {
+		maxReplicas = 1
 	}
 
 	threshold := is.Annotations[AnnotationKeyThreshold]
@@ -116,6 +120,16 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 				Namespace: is.Namespace,
 				Annotations: map[string]string{
 					AnnotationKeyManagedBy: "keda-kaito-scaler",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion:         "kaito.sh/v1alpha1",
+						Kind:               "InferenceSet",
+						Name:               is.Name,
+						UID:                is.UID,
+						Controller:         ptr.To(true),
+						BlockOwnerDeletion: ptr.To(true),
+					},
 				},
 			},
 			Spec: v1alpha1.ScaledObjectSpec{
