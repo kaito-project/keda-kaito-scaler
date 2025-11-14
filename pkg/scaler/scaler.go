@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -97,12 +98,12 @@ func (e *kaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledOb
 	}
 
 	// get the related workspace instance
-	var inferenceSet *kaitov1alpha1.InferenceSet
+	inferenceSet := &kaitov1alpha1.InferenceSet{}
 	if err := e.kubeClient.Get(ctx, client.ObjectKey{
 		Namespace: scalerConfig.InferenceSetNamespace,
 		Name:      scalerConfig.InferenceSetName,
 	}, inferenceSet); err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get inference set: %v", err))
+		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get InferenceSet(%s) in Namespace(%s): %v", scalerConfig.InferenceSetName, scalerConfig.InferenceSetNamespace, err))
 	}
 
 	// get InferenceSetConditionTypeInferenceStatus condition from inferenceSet.Status.Conditions
@@ -146,12 +147,12 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		return nil, err
 	}
 
-	var inferenceSet *kaitov1alpha1.InferenceSet
+	inferenceSet := &kaitov1alpha1.InferenceSet{}
 	if err := e.kubeClient.Get(ctx, client.ObjectKey{
 		Namespace: scalerConfig.InferenceSetNamespace,
 		Name:      scalerConfig.InferenceSetName,
 	}, inferenceSet); err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get inference set: %v", err))
+		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get InferenceSet(%s) in Namespace(%s): %v", scalerConfig.InferenceSetName, scalerConfig.InferenceSetNamespace, err))
 	}
 
 	// get the related workspace instances
@@ -159,6 +160,7 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to list workspaces: %v", err))
 	}
+	klog.V(6).Infof("total workspaces found: %d", len(workspaceList.Items))
 
 	pods := make([]corev1.Pod, 0)
 	for i := range workspaceList.Items {
@@ -172,6 +174,7 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		}
 		pods = append(pods, workspacePods.Items...)
 	}
+	klog.V(6).Infof("total pods found: %d", len(pods))
 
 	// get the metrics for the ready pods and calculate the total metric value.
 	// at the same time, please count the number of pods that metric can be collected.
@@ -185,6 +188,7 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		metricVal, err := e.getPodMetric(ctx, &pod, scalerConfig)
 		if err != nil {
 			metricErrs[i] = err
+			klog.Errorf("failed to get metric from pod %s/%s: %v", pod.Namespace, pod.Name, err)
 			continue
 		}
 		totalMetricValue += metricVal
@@ -297,7 +301,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 func (e *kaitoScaler) getPodMetric(_ context.Context, pod *corev1.Pod, scalerConfig *ScalerConfig) (int64, error) {
 	var transport *http.Transport
 	if scalerConfig.MetricProtocol == "https" {
-		transport = e.tlsTransport
+		transport = e.httpTransport
 	} else {
 		transport = e.httpTransport
 	}
@@ -307,12 +311,14 @@ func (e *kaitoScaler) getPodMetric(_ context.Context, pod *corev1.Pod, scalerCon
 		Timeout:   scalerConfig.ScrapeTimeout,
 	}
 
-	metricURL := fmt.Sprintf("%s://%s:%s%s", scalerConfig.MetricProtocol, pod.Status.PodIP, scalerConfig.MetricPort, scalerConfig.MetricPath)
+	metricURL := fmt.Sprintf("http://%s:%s%s", pod.Status.PodIP, scalerConfig.MetricPort, scalerConfig.MetricPath)
+	klog.V(6).Infof("scraping metrics from pod %s/%s: %s", pod.Namespace, pod.Name, metricURL)
 	resp, err := httpClient.Get(metricURL)
 	if err != nil {
 		return 0, status.Error(codes.Internal, fmt.Sprintf("failed to get pod metrics: %v", err))
 	}
 	defer resp.Body.Close()
+	klog.V(6).Infof("scraped metrics from pod %s/%s: %s", pod.Namespace, pod.Name, metricURL)
 
 	// scan the response line by line, and read the metricName
 	// format is `vllm:num_requests_waiting 50`
@@ -321,11 +327,12 @@ func (e *kaitoScaler) getPodMetric(_ context.Context, pod *corev1.Pod, scalerCon
 		line := scanner.Text()
 		if strings.HasPrefix(line, scalerConfig.MetricName) {
 			// extract the metric value
+			klog.V(2).Infof("found metric line from pod %s/%s: %s", pod.Namespace, pod.Name, line)
 			parts := strings.Split(line, " ")
 			if len(parts) == 2 {
-				value, err := strconv.ParseInt(parts[1], 10, 64)
+				value, err := strconv.ParseFloat(parts[1], 64)
 				if err == nil {
-					return value, nil
+					return int64(value), nil
 				}
 			}
 		}
