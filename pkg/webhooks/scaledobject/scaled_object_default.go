@@ -147,7 +147,7 @@ func configureKedaKaitoScalerTrigger(obj *v1alpha1.ScaledObject, triggerIndex in
 	}
 
 	if protocol, ok := kaitoScalerTrigger.Metadata[scaler.MetricProtocolInMetadata]; !ok || len(protocol) == 0 {
-		kaitoScalerTrigger.Metadata[scaler.MetricProtocolInMetadata] = "https"
+		kaitoScalerTrigger.Metadata[scaler.MetricProtocolInMetadata] = "http"
 	}
 
 	if port, ok := kaitoScalerTrigger.Metadata[scaler.MetricPortInMetadata]; !ok || len(port) == 0 {
