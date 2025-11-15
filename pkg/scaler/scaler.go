@@ -301,7 +301,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 func (e *kaitoScaler) getPodMetric(_ context.Context, pod *corev1.Pod, scalerConfig *ScalerConfig) (int64, error) {
 	var transport *http.Transport
 	if scalerConfig.MetricProtocol == "https" {
-		transport = e.httpTransport
+		transport = e.tlsTransport
 	} else {
 		transport = e.httpTransport
 	}
@@ -311,7 +311,7 @@ func (e *kaitoScaler) getPodMetric(_ context.Context, pod *corev1.Pod, scalerCon
 		Timeout:   scalerConfig.ScrapeTimeout,
 	}
 
-	metricURL := fmt.Sprintf("http://%s:%s%s", pod.Status.PodIP, scalerConfig.MetricPort, scalerConfig.MetricPath)
+	metricURL := fmt.Sprintf("%s://%s:%s%s", scalerConfig.MetricProtocol, pod.Status.PodIP, scalerConfig.MetricPort, scalerConfig.MetricPath)
 	klog.V(6).Infof("scraping metrics from pod %s/%s: %s", pod.Namespace, pod.Name, metricURL)
 	resp, err := httpClient.Get(metricURL)
 	if err != nil {
