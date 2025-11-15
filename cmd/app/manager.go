@@ -82,6 +82,7 @@ func NewKedaKaitoScalerCommand() *cobra.Command {
 		Version: injections.VersionInfo(),
 		Run: func(cmd *cobra.Command, args []string) {
 			cliflag.PrintFlags(cmd.Flags())
+			klog.V(2).Infof("version: %s", injections.VersionInfo())
 
 			if err := Run(opts); err != nil {
 				klog.Fatalf("run keda-kaito-scaler failed, %v", err)
