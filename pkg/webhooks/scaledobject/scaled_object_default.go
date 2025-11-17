@@ -151,7 +151,7 @@ func configureKedaKaitoScalerTrigger(obj *v1alpha1.ScaledObject, triggerIndex in
 	}
 
 	if port, ok := kaitoScalerTrigger.Metadata[scaler.MetricPortInMetadata]; !ok || len(port) == 0 {
-		kaitoScalerTrigger.Metadata[scaler.MetricPortInMetadata] = "5000"
+		kaitoScalerTrigger.Metadata[scaler.MetricPortInMetadata] = "80"
 	}
 
 	if path, ok := kaitoScalerTrigger.Metadata[scaler.MetricPathInMetadata]; !ok || len(path) == 0 {
