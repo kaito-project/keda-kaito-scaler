@@ -24,13 +24,11 @@ import (
 	"time"
 
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
-	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kaito-project/kaito/pkg/utils/inferenceset"
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 	"go.uber.org/multierr"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -63,7 +61,6 @@ type ScalerConfig struct {
 	Threshold             int64
 }
 
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="kaito.sh",resources=inferencesets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=list;watch
 
@@ -160,59 +157,44 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to list workspaces: %v", err))
 	}
-	klog.V(6).Infof("total workspaces found: %d", len(workspaceList.Items))
+	wsNum := len(workspaceList.Items)
+	klog.V(6).Infof("total workspaces found: %d", wsNum)
 
-	pods := make([]corev1.Pod, 0)
+	// get the metrics for the ready services and calculate the total metric value.
+	// at the same time, please count the number of services that metric can be collected.
+	var totalMetricValue int64
+	var serviceCount int
+	metricErrs := make([]error, wsNum)
 	for i := range workspaceList.Items {
 		workspace := &workspaceList.Items[i]
-		// get related pods for workspace based on the label selector(kaitov1beta1.LabelWorkspaceName=<workspace.Name>)
-		var workspacePods corev1.PodList
-		if err := e.kubeClient.List(ctx, &workspacePods, client.InNamespace(scalerConfig.InferenceSetNamespace), client.MatchingLabels{
-			kaitov1beta1.LabelWorkspaceName: workspace.Name,
-		}); err != nil {
-			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to list pods: %v", err))
-		}
-		pods = append(pods, workspacePods.Items...)
-	}
-	klog.V(6).Infof("total pods found: %d", len(pods))
-
-	// get the metrics for the ready pods and calculate the total metric value.
-	// at the same time, please count the number of pods that metric can be collected.
-	var totalMetricValue int64
-	var podCount int
-	metricErrs := make([]error, len(pods))
-	for i, pod := range pods {
-		if !isPodReady(&pod) {
-			continue
-		}
-		metricVal, err := e.getPodMetric(ctx, &pod, scalerConfig)
+		metricVal, err := e.getServiceMetric(workspace.Name, workspace.Namespace, scalerConfig)
 		if err != nil {
 			metricErrs[i] = err
-			klog.Errorf("failed to get metric from pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			klog.Errorf("failed to get metric from workspace %s/%s: %v", workspace.Namespace, workspace.Name, err)
 			continue
 		}
 		totalMetricValue += metricVal
-		podCount++
+		serviceCount++
 	}
 
-	// if a metric cannot be resolved from a pod, the average value will be calculated using the following rules to prevent flapping:
-	// in the scale-up direction: use 0 as the metric value for missing pods.
-	// in the scale-down direction: use the metric threshold as the value for missing pods.
-	if podCount == 0 {
+	// if a metric cannot be resolved from a service, the average value will be calculated using the following rules to prevent flapping:
+	// in the scale-up direction: use 0 as the metric value for missing service.
+	// in the scale-down direction: use the metric threshold as the value for missing service.
+	if serviceCount == 0 {
 		if err := multierr.Combine(metricErrs...); err != nil {
-			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get pod metrics: %v", err))
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get service metrics: %v", err))
 		}
-		return nil, status.Error(codes.Internal, "no ready pods found for the workspace")
-	} else if podCount != len(pods) {
-		if totalMetricValue/int64(podCount) < scalerConfig.Threshold {
+		return nil, status.Error(codes.Internal, "no ready services found for the workspace")
+	} else if serviceCount != wsNum {
+		if totalMetricValue/int64(serviceCount) < scalerConfig.Threshold {
 			// scale-down direction
-			totalMetricValue += scalerConfig.Threshold * int64(len(pods)-podCount)
+			totalMetricValue += scalerConfig.Threshold * int64(wsNum-serviceCount)
 		} else {
 			// scale-up direction
-			totalMetricValue += 0 * int64(len(pods)-podCount)
+			totalMetricValue += 0 * int64(wsNum-serviceCount)
 		}
 	}
-	averageMetricValue := totalMetricValue / int64(len(pods))
+	averageMetricValue := totalMetricValue / int64(wsNum)
 
 	return &externalscaler.GetMetricsResponse{
 		MetricValues: []*externalscaler.MetricValue{
@@ -298,7 +280,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 	}, nil
 }
 
-func (e *kaitoScaler) getPodMetric(_ context.Context, pod *corev1.Pod, scalerConfig *ScalerConfig) (int64, error) {
+func (e *kaitoScaler) getServiceMetric(serviceName, serviceNamespace string, scalerConfig *ScalerConfig) (int64, error) {
 	var transport *http.Transport
 	if scalerConfig.MetricProtocol == "https" {
 		transport = e.tlsTransport
@@ -311,14 +293,14 @@ func (e *kaitoScaler) getPodMetric(_ context.Context, pod *corev1.Pod, scalerCon
 		Timeout:   scalerConfig.ScrapeTimeout,
 	}
 
-	metricURL := fmt.Sprintf("%s://%s:%s%s", scalerConfig.MetricProtocol, pod.Status.PodIP, scalerConfig.MetricPort, scalerConfig.MetricPath)
-	klog.V(6).Infof("scraping metrics from pod %s/%s: %s", pod.Namespace, pod.Name, metricURL)
+	metricURL := fmt.Sprintf("%s://%s.%s.svc.cluster.local:%s%s", scalerConfig.MetricProtocol, serviceName, serviceNamespace, scalerConfig.MetricPort, scalerConfig.MetricPath)
+	klog.V(6).Infof("scraping metrics from service %s/%s: %s", serviceNamespace, serviceName, metricURL)
 	resp, err := httpClient.Get(metricURL)
 	if err != nil {
-		return 0, status.Error(codes.Internal, fmt.Sprintf("failed to get pod metrics: %v", err))
+		return 0, status.Error(codes.Internal, fmt.Sprintf("failed to get service metrics: %v", err))
 	}
 	defer resp.Body.Close()
-	klog.V(6).Infof("scraped metrics from pod %s/%s: %s", pod.Namespace, pod.Name, metricURL)
+	klog.V(6).Infof("scraped metrics from service %s/%s: %s", serviceNamespace, serviceName, metricURL)
 
 	// scan the response line by line, and read the metricName
 	// format is `vllm:num_requests_waiting 50`
@@ -327,7 +309,7 @@ func (e *kaitoScaler) getPodMetric(_ context.Context, pod *corev1.Pod, scalerCon
 		line := scanner.Text()
 		if strings.HasPrefix(line, scalerConfig.MetricName) {
 			// extract the metric value
-			klog.V(2).Infof("found metric line from pod %s/%s: %s", pod.Namespace, pod.Name, line)
+			klog.V(2).Infof("found metric line from service %s/%s: %s", serviceNamespace, serviceName, line)
 			parts := strings.Split(line, " ")
 			if len(parts) == 2 {
 				value, err := strconv.ParseFloat(parts[1], 64)
@@ -338,14 +320,5 @@ func (e *kaitoScaler) getPodMetric(_ context.Context, pod *corev1.Pod, scalerCon
 		}
 	}
 
-	return 0, status.Error(codes.Internal, fmt.Sprintf("failed to resolve metric(%s) from pod: %s/%s", scalerConfig.MetricName, pod.Namespace, pod.Name))
-}
-
-func isPodReady(pod *corev1.Pod) bool {
-	for _, condition := range pod.Status.Conditions {
-		if condition.Type == corev1.PodReady {
-			return condition.Status == corev1.ConditionTrue
-		}
-	}
-	return false
+	return 0, status.Error(codes.Internal, fmt.Sprintf("failed to resolve metric(%s) from service: %s/%s", scalerConfig.MetricName, serviceNamespace, serviceName))
 }
