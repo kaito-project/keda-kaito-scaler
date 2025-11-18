@@ -17,9 +17,11 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
 	"github.com/stretchr/testify/assert"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	"k8s.io/apimachinery/pkg/api/resource"
+
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
 )
 
 func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
@@ -140,4 +142,80 @@ func TestGetDefaultKedaKaitoScalerTriggers_MetadataKeys(t *testing.T) {
 
 	// Verify metadata count matches expected keys
 	assert.Equal(t, len(expectedKeys), len(trigger.Metadata))
+}
+
+func TestGetDefaultHorizontalPodAutoscalerConfig(t *testing.T) {
+	config := getDefaultHorizontalPodAutoscalerConfig()
+
+	// Verify config is not nil
+	assert.NotNil(t, config)
+	assert.NotNil(t, config.Behavior)
+
+	// Test ScaleUp configuration
+	assert.NotNil(t, config.Behavior.ScaleUp)
+	scaleUp := config.Behavior.ScaleUp
+
+	// Check ScaleUp stabilization window
+	assert.NotNil(t, scaleUp.StabilizationWindowSeconds)
+	assert.Equal(t, int32(60), *scaleUp.StabilizationWindowSeconds)
+
+	// Check ScaleUp select policy
+	assert.NotNil(t, scaleUp.SelectPolicy)
+	assert.Equal(t, autoscalingv2.MaxChangePolicySelect, *scaleUp.SelectPolicy)
+
+	// Check ScaleUp policies
+	assert.Len(t, scaleUp.Policies, 1)
+	scaleUpPolicy := scaleUp.Policies[0]
+	assert.Equal(t, autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy), scaleUpPolicy.Type)
+	assert.Equal(t, int32(1), scaleUpPolicy.Value)
+	assert.Equal(t, int32(300), scaleUpPolicy.PeriodSeconds)
+
+	// Check ScaleUp tolerance
+	assert.NotNil(t, scaleUp.Tolerance)
+	expectedScaleUpTolerance := resource.MustParse("0.1")
+	assert.True(t, scaleUp.Tolerance.Equal(expectedScaleUpTolerance))
+
+	// Test ScaleDown configuration
+	assert.NotNil(t, config.Behavior.ScaleDown)
+	scaleDown := config.Behavior.ScaleDown
+
+	// Check ScaleDown stabilization window
+	assert.NotNil(t, scaleDown.StabilizationWindowSeconds)
+	assert.Equal(t, int32(300), *scaleDown.StabilizationWindowSeconds)
+
+	// Check ScaleDown select policy
+	assert.NotNil(t, scaleDown.SelectPolicy)
+	assert.Equal(t, autoscalingv2.MaxChangePolicySelect, *scaleDown.SelectPolicy)
+
+	// Check ScaleDown policies
+	assert.Len(t, scaleDown.Policies, 1)
+	scaleDownPolicy := scaleDown.Policies[0]
+	assert.Equal(t, autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy), scaleDownPolicy.Type)
+	assert.Equal(t, int32(1), scaleDownPolicy.Value)
+	assert.Equal(t, int32(600), scaleDownPolicy.PeriodSeconds)
+
+	// Check ScaleDown tolerance
+	assert.NotNil(t, scaleDown.Tolerance)
+	expectedScaleDownTolerance := resource.MustParse("0.5")
+	assert.True(t, scaleDown.Tolerance.Equal(expectedScaleDownTolerance))
+}
+
+func TestGetDefaultHorizontalPodAutoscalerConfig_Consistency(t *testing.T) {
+	// Test that multiple calls return equivalent configurations
+	config1 := getDefaultHorizontalPodAutoscalerConfig()
+	config2 := getDefaultHorizontalPodAutoscalerConfig()
+
+	// Verify both configurations are not nil
+	assert.NotNil(t, config1)
+	assert.NotNil(t, config2)
+
+	// Verify ScaleUp configurations are equivalent
+	assert.Equal(t, *config1.Behavior.ScaleUp.StabilizationWindowSeconds, *config2.Behavior.ScaleUp.StabilizationWindowSeconds)
+	assert.Equal(t, *config1.Behavior.ScaleUp.SelectPolicy, *config2.Behavior.ScaleUp.SelectPolicy)
+	assert.True(t, config1.Behavior.ScaleUp.Tolerance.Equal(*config2.Behavior.ScaleUp.Tolerance))
+
+	// Verify ScaleDown configurations are equivalent
+	assert.Equal(t, *config1.Behavior.ScaleDown.StabilizationWindowSeconds, *config2.Behavior.ScaleDown.StabilizationWindowSeconds)
+	assert.Equal(t, *config1.Behavior.ScaleDown.SelectPolicy, *config2.Behavior.ScaleDown.SelectPolicy)
+	assert.True(t, config1.Behavior.ScaleDown.Tolerance.Equal(*config2.Behavior.ScaleDown.Tolerance))
 }
