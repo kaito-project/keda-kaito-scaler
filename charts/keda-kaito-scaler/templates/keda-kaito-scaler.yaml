@@ -79,6 +79,7 @@ spec:
             - --v={{ .Values.log.level }}
             - --metrics-port={{ .Values.ports.metrics }}
             - --health-probe-port={{ .Values.ports.healthProbe }}
+            - --working-namespace={{ .Release.Namespace }}
             {{- if .Values.certDuration }}
             - --cert-duration={{ .Values.certDuration }}
             {{- end }}
