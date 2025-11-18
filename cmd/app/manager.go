@@ -60,7 +60,6 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/injections"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/profile"
-	"github.com/kaito-project/keda-kaito-scaler/pkg/webhooks"
 )
 
 const (
@@ -173,12 +172,6 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	// initialize controllers
 	controllers := controllers.NewControllers(mgr)
 	for _, c := range controllers {
-		lo.Must0(c.Register(ctx, mgr))
-	}
-
-	// initialize webhooks
-	webhooks := webhooks.NewWebhooks(opts.WorkingNamespace)
-	for _, c := range webhooks {
 		lo.Must0(c.Register(ctx, mgr))
 	}
 
