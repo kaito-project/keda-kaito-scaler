@@ -55,7 +55,6 @@ import (
 
 	"github.com/kaito-project/keda-kaito-scaler/cmd/app/options"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers"
-	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers/util"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/injections"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/profile"
@@ -63,6 +62,26 @@ import (
 
 const (
 	KedaKaitoScaler = "keda-kaito-scaler"
+
+	// Certificate and key fields for comprehensive TLS setup
+	// CA Certificate - Root certificate authority for scaler communication
+	CACert = "ca.crt"
+
+	// Server Certificate and Key - Used by the external Kaito scaler GRPC server
+	ServerCert = "server.crt"
+	ServerKey  = "server.key"
+
+	// Client Certificate and Key - Used by KEDA core to authenticate with external scaler
+	ClientCert = "tls.crt" // Standard kubernetes.io/tls format
+	ClientKey  = "tls.key" // Standard kubernetes.io/tls format
+
+	CACertDuration       = 10 * 365 * 24 * time.Hour // 10 years
+	CAName               = "keda-kaito-scaler-ca"
+	CAOrganization       = "kaito-project"
+	ControllerFieldOwner = KedaKaitoScaler
+
+	ServerCertDir = "/tmp/keda-kaito-scaler-certs/server"
+	ClientCertDir = "/tmp/keda-kaito-scaler-certs/client"
 )
 
 func init() {
@@ -254,14 +273,14 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 			Name:      opts.ScalerClientSecretName,
 			Namespace: opts.WorkingNamespace,
 		},
-		CaCertDuration:        util.CACertDuration,
+		CaCertDuration:        CACertDuration,
 		ServerCertDuration:    opts.ExpirationDuration,
 		RequireLeaderElection: opts.LeaderElection.LeaderElect,
 		ExtKeyUsages:          &[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		FieldOwner:            util.ControllerFieldOwner,
-		CAName:                util.CAName,
-		CAOrganization:        util.CAOrganization,
-		CertDir:               util.ClientCertDir,
+		FieldOwner:            ControllerFieldOwner,
+		CAName:                CAName,
+		CAOrganization:        CAOrganization,
+		CertDir:               ClientCertDir,
 		IsReady:               clientCertReady,
 	}); err != nil {
 		klog.Errorf("failed to add cert controller for scaler client certificates, %v", err)
@@ -275,16 +294,16 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 			Name:      opts.ScalerServerSecretName,
 			Namespace: opts.WorkingNamespace,
 		},
-		CaCertDuration:        util.CACertDuration,
+		CaCertDuration:        CACertDuration,
 		ServerCertDuration:    opts.ExpirationDuration,
 		RequireLeaderElection: opts.LeaderElection.LeaderElect,
-		FieldOwner:            util.ControllerFieldOwner,
-		CAName:                util.CAName,
-		CAOrganization:        util.CAOrganization,
+		FieldOwner:            ControllerFieldOwner,
+		CAName:                CAName,
+		CAOrganization:        CAOrganization,
 		ExtraDNSNames:         dnsNames,
-		CertName:              util.ServerCert,
-		KeyName:               util.ServerKey,
-		CertDir:               util.ServerCertDir,
+		CertName:              ServerCert,
+		KeyName:               ServerKey,
+		CertDir:               ServerCertDir,
 		IsReady:               serverCertReady,
 	}); err != nil {
 		klog.Errorf("failed to add cert controller for scaler server certificates, %v", err)
@@ -306,12 +325,12 @@ func loadCertificateFromSecret(secretLister corev1listers.SecretLister, namespac
 		return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretName, err)
 	}
 
-	serverCert, ok := secret.Data[util.ServerCert]
+	serverCert, ok := secret.Data[ServerCert]
 	if !ok {
 		return nil, fmt.Errorf("server certificate not found in secret %s/%s", namespace, secretName)
 	}
 
-	serverKey, ok := secret.Data[util.ServerKey]
+	serverKey, ok := secret.Data[ServerKey]
 	if !ok {
 		return nil, fmt.Errorf("server key not found in secret %s/%s", namespace, secretName)
 	}
@@ -331,7 +350,7 @@ func loadRootCAsFromSecret(secretLister corev1listers.SecretLister, namespace, s
 		return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretName, err)
 	}
 
-	caCertData, ok := secret.Data[util.CACert]
+	caCertData, ok := secret.Data[CACert]
 	if !ok {
 		return nil, fmt.Errorf("CA certificate not found in secret %s/%s", namespace, secretName)
 	}
