@@ -14,7 +14,6 @@ image:
 ports:
   grpc: 10450
   metrics: 10451
-  webhook: 10452
   healthProbe: 10453
 
 resources:

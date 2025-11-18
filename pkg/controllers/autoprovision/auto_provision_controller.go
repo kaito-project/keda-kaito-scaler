@@ -24,6 +24,8 @@ import (
 	"github.com/kaito-project/kaito/pkg/utils/inferenceset"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"golang.org/x/time/rate"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
@@ -38,6 +40,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
 )
 
 const (
@@ -46,6 +50,7 @@ const (
 	AnnotationKeyThreshold     = "scaledobject.kaito.sh/threshold"
 
 	AnnotationKeyManagedBy = "scaledobject.kaito.sh/managed-by"
+	InferenceSet           = "InferenceSet"
 )
 
 type Controller struct {
@@ -105,8 +110,8 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 	// filter the scaled objects related to the workspace and auto provisioning
 	var filteredScaledObjects []v1alpha1.ScaledObject
 	for _, scaledObject := range scaledObjectList.Items {
-		if scaledObject.Spec.ScaleTargetRef.Name == is.Name && scaledObject.Spec.ScaleTargetRef.Kind == "InferenceSet" {
-			if scaledObject.Annotations[AnnotationKeyManagedBy] == "keda-kaito-scaler" {
+		if scaledObject.Spec.ScaleTargetRef.Name == is.Name && scaledObject.Spec.ScaleTargetRef.Kind == InferenceSet {
+			if scaledObject.Annotations[AnnotationKeyManagedBy] == scaler.ScalerName {
 				filteredScaledObjects = append(filteredScaledObjects, scaledObject)
 			}
 		}
@@ -119,12 +124,12 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 				Name:      is.Name,
 				Namespace: is.Namespace,
 				Annotations: map[string]string{
-					AnnotationKeyManagedBy: "keda-kaito-scaler",
+					AnnotationKeyManagedBy: scaler.ScalerName,
 				},
 				OwnerReferences: []metav1.OwnerReference{
 					{
 						APIVersion:         "kaito.sh/v1alpha1",
-						Kind:               "InferenceSet",
+						Kind:               InferenceSet,
 						Name:               is.Name,
 						UID:                is.UID,
 						Controller:         ptr.To(true),
@@ -133,25 +138,20 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 				},
 			},
 			Spec: v1alpha1.ScaledObjectSpec{
+				Advanced: &v1alpha1.AdvancedConfig{
+					HorizontalPodAutoscalerConfig: getDefaultHorizontalPodAutoscalerConfig(),
+				},
 				ScaleTargetRef: &v1alpha1.ScaleTarget{
 					Name:       is.Name,
 					APIVersion: "kaito.sh/v1alpha1",
-					Kind:       "InferenceSet",
+					Kind:       InferenceSet,
 				},
 				MinReplicaCount: ptr.To(int32(1)),
 				MaxReplicaCount: ptr.To(int32(maxReplicas)),
-				Triggers: []v1alpha1.ScaleTriggers{
-					{
-						Type: "external",
-						Name: "keda-kaito-scaler",
-						Metadata: map[string]string{
-							"scalerName": "keda-kaito-scaler",
-							"threshold":  threshold,
-						},
-					},
-				},
+				Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, threshold),
 			},
 		}
+
 		if err := c.Create(ctx, newScaledObject); err != nil {
 			return reconcile.Result{}, err
 		}
@@ -257,7 +257,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		For(&kaitov1alpha1.InferenceSet{}, builder.WithPredicates(generateInferenceSetPredicateFunc())).
 		Watches(&v1alpha1.ScaledObject{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 			if scaledObj, ok := obj.(*v1alpha1.ScaledObject); ok {
-				if scaledObj.Spec.ScaleTargetRef.Kind == "InferenceSet" {
+				if scaledObj.Spec.ScaleTargetRef.Kind == InferenceSet {
 					return []reconcile.Request{
 						{
 							NamespacedName: types.NamespacedName{Namespace: scaledObj.Namespace, Name: scaledObj.Spec.ScaleTargetRef.Name},
@@ -275,4 +275,67 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			MaxConcurrentReconciles: 10,
 		}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
+}
+
+func getDefaultHorizontalPodAutoscalerConfig() *v1alpha1.HorizontalPodAutoscalerConfig {
+	return &v1alpha1.HorizontalPodAutoscalerConfig{
+		Behavior: &autoscalingv2.HorizontalPodAutoscalerBehavior{
+			ScaleUp: &autoscalingv2.HPAScalingRules{
+				StabilizationWindowSeconds: ptr.To(int32(60)),
+				SelectPolicy:               ptr.To(autoscalingv2.MaxChangePolicySelect),
+				Policies: []autoscalingv2.HPAScalingPolicy{
+					{
+						Type:          autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy),
+						Value:         1,
+						PeriodSeconds: 300,
+					},
+				},
+				Tolerance: func() *resource.Quantity {
+					q := resource.MustParse("0.1")
+					return &q
+				}(),
+			},
+			ScaleDown: &autoscalingv2.HPAScalingRules{
+				StabilizationWindowSeconds: ptr.To(int32(300)),
+				SelectPolicy:               ptr.To(autoscalingv2.MaxChangePolicySelect),
+				Policies: []autoscalingv2.HPAScalingPolicy{
+					{
+						Type:          autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy),
+						Value:         1,
+						PeriodSeconds: 600,
+					},
+				},
+				Tolerance: func() *resource.Quantity {
+					q := resource.MustParse("0.5")
+					return &q
+				}(),
+			},
+		},
+	}
+}
+
+func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, threshold string) []v1alpha1.ScaleTriggers {
+	return []v1alpha1.ScaleTriggers{
+		{
+			Type: "external",
+			Name: scaler.ScalerName,
+			Metadata: map[string]string{
+				"scalerName":                           scaler.ScalerName,
+				"threshold":                            threshold,
+				scaler.InferenceSetNameInMetadata:      inferenceSetName,
+				scaler.InferenceSetNamespaceInMetadata: inferenceSetNamespace,
+				scaler.ScalerAddressInMetadata:         fmt.Sprintf("keda-kaito-scaler-svc.%s.svc.cluster.local:%d", inferenceSetNamespace, 10450),
+				scaler.MetricNameInMetadata:            "vllm:num_requests_waiting",
+				scaler.MetricProtocolInMetadata:        "http",
+				scaler.MetricPortInMetadata:            "80",
+				scaler.MetricPathInMetadata:            "/metrics",
+				scaler.ScrapeTimeoutInMetadata:         "5s",
+			},
+			AuthenticationRef: &v1alpha1.AuthenticationRef{
+				Name: "keda-kaito-scaler-creds",
+				Kind: "ClusterTriggerAuthentication",
+			},
+			MetricType: autoscalingv2.AverageValueMetricType,
+		},
+	}
 }
