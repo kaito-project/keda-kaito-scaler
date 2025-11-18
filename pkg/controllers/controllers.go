@@ -22,8 +22,6 @@ import (
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;patch;update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=list;watch;get;update
-// +kubebuilder:rbac:groups="admissionregistration.k8s.io",resources=mutatingwebhookconfigurations,verbs=list;watch;get;update
-// +kubebuilder:rbac:groups="admissionregistration.k8s.io",resources=validatingwebhookconfigurations,verbs=list;watch;get;update
 
 func NewControllers(mgr manager.Manager) []controller.Controller {
 	return []controller.Controller{

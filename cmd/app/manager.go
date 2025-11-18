@@ -52,7 +52,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	runtimewebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"github.com/kaito-project/keda-kaito-scaler/cmd/app/options"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers"
@@ -134,18 +133,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		LeaderElectionNamespace:       opts.WorkingNamespace,
 		LeaderElectionResourceLock:    opts.LeaderElection.ResourceLock,
 		LeaderElectionReleaseOnCancel: true,
-		WebhookServer: runtimewebhook.NewServer(runtimewebhook.Options{
-			Port: opts.WebhookPort,
-			TLSOpts: []func(*tls.Config){
-				func(cfg *tls.Config) {
-					cfg.MinVersion = tls.VersionTLS13
-					cfg.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-						return loadCertificateFromSecret(secretLister, opts.WorkingNamespace, opts.WebhookSecretName)
-					}
-				},
-			},
-		}),
-		Logger: logger,
+		Logger:                        logger,
 		Cache: runtimecache.Options{
 			DefaultTransform: runtimecache.TransformStripManagedFields(),
 		},
@@ -160,10 +148,9 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	lo.Must0(mgr.AddReadyzCheck("readyz", healthz.Ping))
 
 	// add certificate controllers
-	webhookCertReady := make(chan struct{})
 	serverCertReady := make(chan struct{})
 	clientCertReady := make(chan struct{})
-	err = addCertificateControllers(mgr, opts, webhookCertReady, serverCertReady, clientCertReady)
+	err = addCertificateControllers(mgr, opts, serverCertReady, clientCertReady)
 	if err != nil {
 		logger.Error(err, "failed to add certificate controllers")
 		return err
@@ -180,7 +167,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		lo.Must0(mgr.Start(ctx))
 	}()
 	// start grpc server
-	lo.Must0(startKaitoScalerServer(ctx, mgr.GetClient(), secretLister, opts, webhookCertReady, serverCertReady, clientCertReady))
+	lo.Must0(startKaitoScalerServer(ctx, mgr.GetClient(), secretLister, opts, serverCertReady, clientCertReady))
 	return nil
 }
 
@@ -202,13 +189,9 @@ func prepareResourcesLister(ctx context.Context, cfg *rest.Config, ns string) (c
 	return secretLister, nil
 }
 
-func startKaitoScalerServer(ctx context.Context, c client.Client, secretLister corev1listers.SecretLister, opts *options.KedaKaitoScalerOptions, webhookCertReady, serverCertReady, clientCertReady chan struct{}) error {
+func startKaitoScalerServer(ctx context.Context, c client.Client, secretLister corev1listers.SecretLister, opts *options.KedaKaitoScalerOptions, serverCertReady, clientCertReady chan struct{}) error {
 	logger := log.FromContext(ctx).WithName("grpc-server")
 	addr := fmt.Sprintf("0.0.0.0:%d", opts.GrpcPort)
-
-	// wait for webhook secret to be ready
-	logger.Info("waiting for webhook secret to be ready", "secret", opts.WebhookSecretName, "namespace", opts.WorkingNamespace)
-	<-webhookCertReady
 
 	// Wait for server secret to be ready
 	logger.Info("waiting for server secret to be ready", "secret", opts.ScalerServerSecretName, "namespace", opts.WorkingNamespace)
@@ -256,41 +239,12 @@ func startKaitoScalerServer(ctx context.Context, c client.Client, secretLister c
 	return grpcServer.Serve(lis)
 }
 
-func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScalerOptions, webhookCertReady, serverCertReady, clientCertReady chan struct{}) error {
+func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScalerOptions, serverCertReady, clientCertReady chan struct{}) error {
 	dnsNames := []string{
 		fmt.Sprintf("%s.%s", opts.ScalerServiceName, opts.WorkingNamespace),
 		fmt.Sprintf("%s.%s.svc", opts.ScalerServiceName, opts.WorkingNamespace),
 		fmt.Sprintf("%s.%s.svc.cluster", opts.ScalerServiceName, opts.WorkingNamespace),
 		fmt.Sprintf("%s.%s.svc.cluster.local", opts.ScalerServiceName, opts.WorkingNamespace),
-	}
-
-	// add cert controller for webhook certificates
-	if err := rotator.AddRotator(mgr, &rotator.CertRotator{
-		ControllerName: "scaler-webhook-cert-rotator",
-		SecretKey: types.NamespacedName{
-			Name:      opts.WebhookSecretName,
-			Namespace: opts.WorkingNamespace,
-		},
-		CaCertDuration:        util.CACertDuration,
-		ServerCertDuration:    opts.ExpirationDuration,
-		RequireLeaderElection: opts.LeaderElection.LeaderElect,
-		Webhooks: []rotator.WebhookInfo{
-			{
-				Name: "keda-kaito-scaler-mutating-webhook-configuration",
-				Type: rotator.Mutating,
-			},
-		},
-		FieldOwner:     util.ControllerFieldOwner,
-		CAName:         util.CAName,
-		CAOrganization: util.CAOrganization,
-		ExtraDNSNames:  dnsNames,
-		CertName:       util.ServerCert,
-		KeyName:        util.ServerKey,
-		CertDir:        util.WebhookCertDir,
-		IsReady:        webhookCertReady,
-	}); err != nil {
-		klog.Errorf("failed to add cert controller for webhook certificates, %v", err)
-		return err
 	}
 
 	// add cert controller for managing scaler client certificates of keda-kaito-scaler

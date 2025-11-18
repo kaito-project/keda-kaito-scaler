@@ -36,23 +36,16 @@ const (
 	CAOrganization       = "kaito-project"
 	ControllerFieldOwner = "keda-kaito-scaler"
 
-	WebhookCertDir = "/tmp/k8s-webhook-server/serving-certs"
-	ServerCertDir  = "/tmp/keda-kaito-scaler-certs/server"
-	ClientCertDir  = "/tmp/keda-kaito-scaler-certs/client"
+	ServerCertDir = "/tmp/keda-kaito-scaler-certs/server"
+	ClientCertDir = "/tmp/keda-kaito-scaler-certs/client"
 )
 
 type controllerNameKeyType struct{}
-type webhookNameKeyType struct{}
 
 var (
 	controllerNameKey = controllerNameKeyType{}
-	webhookNameKey    = webhookNameKeyType{}
 )
 
 func WithControllerName(ctx context.Context, name string) context.Context {
 	return context.WithValue(ctx, controllerNameKey, name)
-}
-
-func WithWebhookName(ctx context.Context, name string) context.Context {
-	return context.WithValue(ctx, webhookNameKey, name)
 }
