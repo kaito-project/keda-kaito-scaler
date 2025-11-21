@@ -23,53 +23,51 @@ The KEDA Kaito Scaler provides intelligent autoscaling for vLLM inference worklo
 
 ### Prerequisites
 
-- Kubernetes cluster with KEDA installed
-- Kaito workspace with vLLM inference workloads
-- RBAC permissions for the scaler to access Kaito resources
+- install KEDA on a Kubernetes cluster
+   - follow guide [here](https://github.com/kedacore/keda?tab=readme-ov-file#deploying-keda)
 
-### Installation
-
-1. **Deploy the KEDA Kaito Scaler**:
+### Deploy KEDA Kaito Scaler on your cluster
 
    ```bash
-   kubectl apply -f https://raw.githubusercontent.com/kaito-project/keda-kaito-scaler/main/deploy/keda-kaito-scaler.yaml
+   helm repo add keda-kaito-scaler https://kaito-project.github.io/keda-kaito-scaler/charts/kaito-project
+   helm upgrade --install keda-kaito-scaler -n kaito-workspace keda-kaito-scaler/keda-kaito-scaler --create-namespace
    ```
 
-2. **Create a ScaledObject for your Kaito Workspace**:
+### Create a Kaito InferenceSet for your inference workloads
+ - the following example creates an inference service for the phi-2 model, annotations with the prefix `scaledobject.kaito.sh/` are used to provide parameter inputs for the KEDA Kaito Scaler.
 
-   ```yaml
-   apiVersion: keda.sh/v1alpha1
-   kind: ScaledObject
-   metadata:
-     name: kaito-vllm-workspace-scaler
-     namespace: kaito-workloads
-   spec:
-     scaleTargetRef:
-       apiVersion: kaito.sh/v1alpha1
-       kind: Workspace
-       name: my-vllm-workspace
-     
-     minReplicas: 1
-     maxReplicas: 10
-     
-     triggers:
-     - type: external
-       metadata:
-         scalerName: keda-kaito-scaler
-         threshold: "10"
-   ```
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: kaito.sh/v1alpha1
+kind: InferenceSet
+metadata:
+  annotations:
+    scaledobject.kaito.sh/auto-provision: "true"
+    scaledobject.kaito.sh/max-replicas: "5"
+    scaledobject.kaito.sh/threshold: "10"
+  name: phi-2
+  namespace: default
+spec:
+  labelSelector:
+    matchLabels:
+      apps: phi-2
+  nodeCountLimit: 10
+  replicas: 1
+  template:
+    inference:
+      preset:
+        accessMode: public
+        name: phi-2
+    resource:
+      instanceType: Standard_NC24ads_A100_v4
+EOF
+```
 
-3. **Apply the configuration**:
-
-   ```bash
-   kubectl apply -f scaledobject.yaml
-   ```
-
-That's it! Your Kaito workspace will now automatically scale based on the number of waiting inference request.
+That's it! Your Kaito workspace will now automatically scale based on the number of waiting inference request(`vllm:num_requests_waiting`).
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
 
 ## Related Projects
 
