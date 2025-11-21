@@ -55,11 +55,13 @@ const (
 
 type Controller struct {
 	client.Client
+	ScalerNamespace string
 }
 
-func NewAutoProvisionController(c client.Client) *Controller {
+func NewAutoProvisionController(c client.Client, scalerNamespace string) *Controller {
 	return &Controller{
-		Client: c,
+		Client:          c,
+		ScalerNamespace: scalerNamespace,
 	}
 }
 
@@ -148,7 +150,7 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 				},
 				MinReplicaCount: ptr.To(int32(1)),
 				MaxReplicaCount: ptr.To(int32(maxReplicas)),
-				Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, threshold),
+				Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold),
 			},
 		}
 
@@ -314,7 +316,7 @@ func getDefaultHorizontalPodAutoscalerConfig() *v1alpha1.HorizontalPodAutoscaler
 	}
 }
 
-func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, threshold string) []v1alpha1.ScaleTriggers {
+func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, threshold string) []v1alpha1.ScaleTriggers {
 	return []v1alpha1.ScaleTriggers{
 		{
 			Type: "external",
@@ -324,7 +326,7 @@ func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, 
 				"threshold":                            threshold,
 				scaler.InferenceSetNameInMetadata:      inferenceSetName,
 				scaler.InferenceSetNamespaceInMetadata: inferenceSetNamespace,
-				scaler.ScalerAddressInMetadata:         fmt.Sprintf("keda-kaito-scaler-svc.%s.svc.cluster.local:%d", inferenceSetNamespace, 10450),
+				scaler.ScalerAddressInMetadata:         fmt.Sprintf("keda-kaito-scaler-svc.%s.svc.cluster.local:%d", scalerNamespace, 10450),
 				scaler.MetricNameInMetadata:            "vllm:num_requests_waiting",
 				scaler.MetricProtocolInMetadata:        "http",
 				scaler.MetricPortInMetadata:            "80",
