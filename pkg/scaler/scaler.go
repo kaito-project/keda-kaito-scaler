@@ -262,7 +262,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		return nil, status.Error(codes.InvalidArgument, "threshold must be specified")
 	}
 
-	// covert threshold to int64 number
+	// convert threshold to int64 number
 	threshold, err := strconv.ParseInt(thresholdStr, 10, 64)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "threshold must be a valid integer")
