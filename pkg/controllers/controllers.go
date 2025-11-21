@@ -23,9 +23,9 @@ import (
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;patch;update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=list;watch;get;update
 
-func NewControllers(mgr manager.Manager) []controller.Controller {
+func NewControllers(mgr manager.Manager, scalerNamespace string) []controller.Controller {
 	return []controller.Controller{
-		autoprovision.NewAutoProvisionController(mgr.GetClient()),
+		autoprovision.NewAutoProvisionController(mgr.GetClient(), scalerNamespace),
 		// add controllers here
 	}
 }
