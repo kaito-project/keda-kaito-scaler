@@ -5,9 +5,8 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  pull_request:
-    branches:
-      - main
+  pull_request: {}
+  push: {}
 
 permissions:
   contents: read
