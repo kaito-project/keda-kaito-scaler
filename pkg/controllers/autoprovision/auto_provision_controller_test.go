@@ -29,6 +29,7 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 		name                  string
 		inferenceSetName      string
 		inferenceSetNamespace string
+		scalerNamespace       string
 		threshold             string
 		expectedTriggerCount  int
 		expectedType          string
@@ -41,6 +42,7 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 			name:                  "basic trigger creation",
 			inferenceSetName:      "test-inference-set",
 			inferenceSetNamespace: "test-namespace",
+			scalerNamespace:       "kaito-workspace",
 			threshold:             "10",
 			expectedTriggerCount:  1,
 			expectedType:          "external",
@@ -53,6 +55,7 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 			name:                  "different threshold value",
 			inferenceSetName:      "another-inference-set",
 			inferenceSetNamespace: "another-namespace",
+			scalerNamespace:       "kaito-workspace",
 			threshold:             "5",
 			expectedTriggerCount:  1,
 			expectedType:          "external",
@@ -65,6 +68,7 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 			name:                  "empty threshold",
 			inferenceSetName:      "test-inference-set",
 			inferenceSetNamespace: "test-namespace",
+			scalerNamespace:       "kaito-workspace",
 			threshold:             "",
 			expectedTriggerCount:  1,
 			expectedType:          "external",
@@ -77,7 +81,7 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			triggers := getDefaultKedaKaitoScalerTriggers(tt.inferenceSetName, tt.inferenceSetNamespace, tt.threshold)
+			triggers := getDefaultKedaKaitoScalerTriggers(tt.inferenceSetName, tt.inferenceSetNamespace, tt.scalerNamespace, tt.threshold)
 
 			// Check trigger count
 			assert.Equal(t, tt.expectedTriggerCount, len(triggers))
@@ -101,7 +105,7 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 				assert.Equal(t, tt.threshold, trigger.Metadata["threshold"])
 				assert.Equal(t, tt.inferenceSetName, trigger.Metadata[scaler.InferenceSetNameInMetadata])
 				assert.Equal(t, tt.inferenceSetNamespace, trigger.Metadata[scaler.InferenceSetNamespaceInMetadata])
-				assert.Equal(t, fmt.Sprintf("keda-kaito-scaler-svc.%s.svc.cluster.local:%d", tt.inferenceSetNamespace, 10450), trigger.Metadata[scaler.ScalerAddressInMetadata])
+				assert.Equal(t, fmt.Sprintf("keda-kaito-scaler-svc.%s.svc.cluster.local:%d", tt.scalerNamespace, 10450), trigger.Metadata[scaler.ScalerAddressInMetadata])
 				assert.Equal(t, "vllm:num_requests_waiting", trigger.Metadata[scaler.MetricNameInMetadata])
 				assert.Equal(t, "http", trigger.Metadata[scaler.MetricProtocolInMetadata])
 				assert.Equal(t, "80", trigger.Metadata[scaler.MetricPortInMetadata])
@@ -115,9 +119,10 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 func TestGetDefaultKedaKaitoScalerTriggers_MetadataKeys(t *testing.T) {
 	inferenceSetName := "test-inference-set"
 	inferenceSetNamespace := "test-namespace"
+	scalerNamespace := "kaito-workspace"
 	threshold := "10"
 
-	triggers := getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, threshold)
+	triggers := getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, threshold)
 
 	assert.Equal(t, 1, len(triggers))
 	trigger := triggers[0]

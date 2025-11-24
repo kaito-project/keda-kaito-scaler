@@ -176,7 +176,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	}
 
 	// initialize controllers
-	controllers := controllers.NewControllers(mgr)
+	controllers := controllers.NewControllers(mgr, opts.WorkingNamespace)
 	for _, c := range controllers {
 		lo.Must0(c.Register(ctx, mgr))
 	}
