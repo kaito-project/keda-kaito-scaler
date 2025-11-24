@@ -72,4 +72,5 @@ func (o *KedaKaitoScalerOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.ScalerClientSecretName, "scaler-client-secret-name", o.ScalerClientSecretName, "the secret which used for storing certificates for keda-kaito-scaler client")
 	fs.StringVar(&o.ScalerServerSecretName, "scaler-server-secret-name", o.ScalerServerSecretName, "the secret which used for storing certificates for keda-kaito-scaler server")
 	fs.StringVar(&o.ScalerServiceName, "scaler-service-name", o.ScalerServiceName, "the service which used for accessing keda-kaito-scaler")
+	fs.DurationVar(&o.ExpirationDuration, "cert-duration", o.ExpirationDuration, "the expiration duration of server certificates")
 }
