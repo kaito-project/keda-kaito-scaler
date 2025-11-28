@@ -11,7 +11,7 @@ require (
 	github.com/spf13/pflag v1.0.10
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/multierr v1.11.0
-	golang.org/x/time v0.13.0
+	golang.org/x/time v0.14.0
 	google.golang.org/grpc v1.77.0
 	k8s.io/api v0.34.2
 	k8s.io/apimachinery v0.34.2
