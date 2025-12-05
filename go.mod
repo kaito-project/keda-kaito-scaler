@@ -3,7 +3,7 @@ module github.com/kaito-project/keda-kaito-scaler
 go 1.24.7
 
 require (
-	github.com/kaito-project/kaito v0.7.1-0.20251017174528-251d9a2b4e87
+	github.com/kaito-project/kaito v0.7.2
 	github.com/kedacore/keda/v2 v2.18.1
 	github.com/open-policy-agent/cert-controller v0.15.0
 	github.com/samber/lo v1.52.0
