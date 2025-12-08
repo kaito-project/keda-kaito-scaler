@@ -22,19 +22,43 @@ The KEDA Kaito Scaler provides intelligent autoscaling for vLLM inference worklo
 ## Quick Start
 
 ### Prerequisites
+## Enable InferenceSet Controller during KAITO install
+InferenceSet, introduced as an alpha feature in KAITO `v0.8.0`, supports autoscaling of KAITO GPU inference workloads. Additionally, the InferenceSet Controller must be enabled during the KAITO installation.
 
-- install KEDA on a Kubernetes cluster
-   - follow guide [here](https://github.com/kedacore/keda?tab=readme-ov-file#deploying-keda)
+```bash
+export CLUSTER_NAME=kaito
 
-### Deploy KEDA Kaito Scaler on your cluster
+helm repo add kaito https://kaito-project.github.io/kaito/charts/kaito
+helm repo update
+helm upgrade --install kaito-workspace kaito/workspace \
+  --namespace kaito-workspace \
+  --create-namespace \
+  --set clusterName="$CLUSTER_NAME" \
+  --set featureGates.enableInferenceSetController=true \
+  --wait
+```
 
-   ```bash
-   helm repo add keda-kaito-scaler https://kaito-project.github.io/keda-kaito-scaler/charts/kaito-project
-   helm upgrade --install keda-kaito-scaler -n kaito-workspace keda-kaito-scaler/keda-kaito-scaler --create-namespace
-   ```
+- install KEDA
+> The following example demonstrates how to install KEDA using Helm chart. For instructions on installing KEDA through other methods, please refer to the guide [here](https://github.com/kedacore/keda#deploying-keda).
+```bash
+helm repo add kedacore https://kedacore.github.io/charts
+helm install keda kedacore/keda --namespace keda --create-namespace
+```
 
-### Create a Kaito InferenceSet for your inference workloads
- - the following example creates an inference service for the phi-4-mini model, annotations with the prefix `scaledobject.kaito.sh/` are used to provide parameter inputs for the KEDA Kaito Scaler.
+### Deploy KEDA Kaito Scaler
+```bash
+helm repo add keda-kaito-scaler https://kaito-project.github.io/keda-kaito-scaler/charts/kaito-project
+helm upgrade --install keda-kaito-scaler -n kaito-workspace keda-kaito-scaler/keda-kaito-scaler --create-namespace
+```
+
+### Create a Kaito InferenceSet for running inference workloads
+ - The following example creates an InferenceSet for the phi-4-mini model, using annotations with the prefix `scaledobject.kaito.sh/` to supply parameter inputs for the KEDA Kaito Scaler:
+   - `scaledobject.kaito.sh/auto-provision: "true"`
+     - KEDA Kaito Scaler will auto provision a `scaledobject` based on `InferenceSet`
+   - `scaledobject.kaito.sh/max-replicas: "5"`
+     - the max count of InferenceSet is 5
+   - `scaledobject.kaito.sh/threshold: "10"`
+     - specifies the threshold for the monitored metric that triggers the scaling operation.
 
 ```bash
 cat <<EOF | kubectl apply -f -
@@ -51,7 +75,6 @@ spec:
   labelSelector:
     matchLabels:
       apps: phi-4
-  nodeCountLimit: 10
   replicas: 1
   template:
     inference:
