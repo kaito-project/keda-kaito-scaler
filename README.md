@@ -23,7 +23,8 @@ The KEDA Kaito Scaler provides intelligent autoscaling for vLLM inference worklo
 
 ### Prerequisites
 ## Enable InferenceSet Controller during KAITO install
-InferenceSet, introduced as an alpha feature in KAITO `v0.8.0`, supports autoscaling of KAITO GPU inference workloads. Additionally, the InferenceSet Controller must be enabled during the KAITO installation.
+
+To support autoscaling of KAITO GPU inference workloads, `InferenceSet` custom resource should be used in KAITO and the InferenceSet Controller must be enabled during the KAITO installation. The `InferenceSet` was introduced as an alpha feature in KAITO `v0.8.0`.
 
 ```bash
 export CLUSTER_NAME=kaito
@@ -39,13 +40,15 @@ helm upgrade --install kaito-workspace kaito/workspace \
 ```
 
 - install KEDA
-> The following example demonstrates how to install KEDA using Helm chart. For instructions on installing KEDA through other methods, please refer to the guide [here](https://github.com/kedacore/keda#deploying-keda).
+> the following example demonstrates how to install KEDA using Helm chart. For instructions on installing KEDA through other methods, please refer to the guide [here](https://github.com/kedacore/keda#deploying-keda).
 ```bash
 helm repo add kedacore https://kedacore.github.io/charts
 helm install keda kedacore/keda --namespace keda --create-namespace
 ```
 
 ### Deploy KEDA Kaito Scaler
+> autoscaling of KAITO GPU inference workloads requires KEDA Kaito Scaler version v0.3.3 or higher.
+
 ```bash
 helm repo add keda-kaito-scaler https://kaito-project.github.io/keda-kaito-scaler/charts/kaito-project
 helm upgrade --install keda-kaito-scaler -n kaito-workspace keda-kaito-scaler/keda-kaito-scaler --create-namespace
