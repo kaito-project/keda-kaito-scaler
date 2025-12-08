@@ -34,7 +34,7 @@ The KEDA Kaito Scaler provides intelligent autoscaling for vLLM inference worklo
    ```
 
 ### Create a Kaito InferenceSet for your inference workloads
- - the following example creates an inference service for the phi-2 model, annotations with the prefix `scaledobject.kaito.sh/` are used to provide parameter inputs for the KEDA Kaito Scaler.
+ - the following example creates an inference service for the phi-4-mini model, annotations with the prefix `scaledobject.kaito.sh/` are used to provide parameter inputs for the KEDA Kaito Scaler.
 
 ```bash
 cat <<EOF | kubectl apply -f -
@@ -45,19 +45,19 @@ metadata:
     scaledobject.kaito.sh/auto-provision: "true"
     scaledobject.kaito.sh/max-replicas: "5"
     scaledobject.kaito.sh/threshold: "10"
-  name: phi-2
+  name: phi-4
   namespace: default
 spec:
   labelSelector:
     matchLabels:
-      apps: phi-2
+      apps: phi-4
   nodeCountLimit: 10
   replicas: 1
   template:
     inference:
       preset:
         accessMode: public
-        name: phi-2
+        name: phi-4-mini-instruct
     resource:
       instanceType: Standard_NC24ads_A100_v4
 EOF
