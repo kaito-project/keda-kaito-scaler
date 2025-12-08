@@ -98,8 +98,9 @@ EOF
 # kubectl get scaledobject
 NAME           SCALETARGETKIND                  SCALETARGETNAME   MIN   MAX   READY   ACTIVE    FALLBACK   PAUSED   TRIGGERS   AUTHENTICATIONS           AGE
 phi-4          kaito.sh/v1alpha1.InferenceSet   phi-4             1     5     True    True     False      False    external   keda-kaito-scaler-creds   10m
+
 # kubectl get hpa
-NAME                    REFERENCE                   TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+NAME                    REFERENCE                   TARGETS      MINPODS   MAXPODS   REPLICAS   AGE
 keda-hpa-phi-4          InferenceSet/phi-4          0/10 (avg)   1         5         1          11m
 ```
 
