@@ -24,7 +24,7 @@ The KEDA Kaito Scaler provides intelligent autoscaling for vLLM inference worklo
 ### Prerequisites
 ## Enable InferenceSet Controller during KAITO install
 
-To support autoscaling of KAITO GPU inference workloads, `InferenceSet` custom resource should be used in KAITO and the InferenceSet Controller must be enabled during the KAITO installation. The `InferenceSet` was introduced as an alpha feature in KAITO `v0.8.0`.
+To enable autoscaling of KAITO GPU inference workloads, the `InferenceSet` custom resource must be utilized in KAITO, and the InferenceSet Controller should be activated during the KAITO installation. The `InferenceSet` feature was introduced in KAITO version `v0.8.0` as an alpha feature.
 
 ```bash
 export CLUSTER_NAME=kaito
