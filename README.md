@@ -92,7 +92,18 @@ spec:
 EOF
 ```
 
-That's it! Your Kaito workloads will now automatically scale based on the number of waiting inference request(`vllm:num_requests_waiting`).
+ - In just a few seconds, the KEDA Kaito Scaler will automatically create the `scaledobject` and `hpa` objects. After a few minutes, once the inference pod is running, the KEDA Kaito Scaler will begin scraping metric values from the inference pod, and the status of the `scaledobject` and `hpa` objects will be marked as ready.
+
+```bash
+# kubectl get scaledobject
+NAME           SCALETARGETKIND                  SCALETARGETNAME   MIN   MAX   READY   ACTIVE    FALLBACK   PAUSED   TRIGGERS   AUTHENTICATIONS           AGE
+phi-4          kaito.sh/v1alpha1.InferenceSet   phi-4             1     5     True    True     False      False    external   keda-kaito-scaler-creds   10m
+# kubectl get hpa
+NAME                    REFERENCE                   TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+keda-hpa-phi-4          InferenceSet/phi-4          0/10 (avg)   1         5         1          11m
+```
+
+That's it! Your KAITO workloads will now automatically scale based on the number of waiting inference request(`vllm:num_requests_waiting`).
 
 ## License
 
