@@ -53,12 +53,14 @@ helm upgrade --install keda-kaito-scaler -n kaito-workspace keda-kaito-scaler/ke
 
 ### Create a Kaito InferenceSet for running inference workloads
  - The following example creates an InferenceSet for the phi-4-mini model, using annotations with the prefix `scaledobject.kaito.sh/` to supply parameter inputs for the KEDA Kaito Scaler:
-   - `scaledobject.kaito.sh/auto-provision: "true"`
-     - KEDA Kaito Scaler will auto provision a `scaledobject` based on `InferenceSet`
-   - `scaledobject.kaito.sh/max-replicas: "5"`
-     - the max count of InferenceSet is 5
-   - `scaledobject.kaito.sh/threshold: "10"`
-     - specifies the threshold for the monitored metric that triggers the scaling operation.
+   - `scaledobject.kaito.sh/auto-provision`
+     - indicates whether KEDA Kaito Scaler will automatically provision a ScaledObject based on the `InferenceSet` object
+   - `scaledobject.kaito.sh/max-replicas`
+     - specifies the maximum number of replicas for the `InferenceSet` during autoscaling.
+   - `scaledobject.kaito.sh/metricName`
+     - specifies the metric name collected from the vLLM pod, which is used for monitoring and triggering the scaling operation, default is `vllm:num_requests_waiting`
+   - `scaledobject.kaito.sh/threshold`
+     - specifies the threshold for the monitored metric that triggers the scaling operation
 
 ```bash
 cat <<EOF | kubectl apply -f -
@@ -68,6 +70,7 @@ metadata:
   annotations:
     scaledobject.kaito.sh/auto-provision: "true"
     scaledobject.kaito.sh/max-replicas: "5"
+    scaledobject.kaito.sh/metricName: "vllm:num_requests_waiting"
     scaledobject.kaito.sh/threshold: "10"
   name: phi-4
   namespace: default
@@ -86,7 +89,7 @@ spec:
 EOF
 ```
 
-That's it! Your Kaito workspace will now automatically scale based on the number of waiting inference request(`vllm:num_requests_waiting`).
+That's it! Your Kaito workloads will now automatically scale based on the number of waiting inference request(`vllm:num_requests_waiting`).
 
 ## License
 
