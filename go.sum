@@ -126,8 +126,8 @@ github.com/josharian/intern v1.0.0 h1:vlS4z54oSdjm0bgjRigI+G1HpF+tI+9rE5LLzOg8Hm
 github.com/josharian/intern v1.0.0/go.mod h1:5DoeVV0s6jJacbCEi61lwdGj/aVlrQvzHFFd8Hwg//Y=
 github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnrnM=
 github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=
-github.com/kaito-project/kaito v0.7.1-0.20251017174528-251d9a2b4e87 h1:Ogg785Y/aw/zkv8pwDu9pAxrQIM3Y6aOGBdnFjqZJB8=
-github.com/kaito-project/kaito v0.7.1-0.20251017174528-251d9a2b4e87/go.mod h1:D1LMSBWZ+TbJ075OgAeRRVkE8Iv+lPjcW/JmHWTP2Kw=
+github.com/kaito-project/kaito v0.8.0-rc.0 h1:PJsmEHaBzAA4gTiOks+vAoG9YYEJTBcJuteCsbK26RE=
+github.com/kaito-project/kaito v0.8.0-rc.0/go.mod h1:D1LMSBWZ+TbJ075OgAeRRVkE8Iv+lPjcW/JmHWTP2Kw=
 github.com/kedacore/keda/v2 v2.18.1 h1:h6bRt/IOxxtZpJlHSqhdH/lcInH7Z9obxg/JvWOmGAw=
 github.com/kedacore/keda/v2 v2.18.1/go.mod h1:gCYj1eF0aIy4aSlGgImeydgueBP2ThZMS1wkbRLfiW4=
 github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI2bnpBCr8=
