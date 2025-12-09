@@ -1,6 +1,6 @@
 # KEDA Kaito Scaler
 
-A specialized KEDA external scaler for automatically scaling GPU inference workloads in [Kaito](https://github.com/kaito-project/kaito) without requiring external dependencies like Prometheus.
+A dedicated KEDA external scaler designed to automatically scale GPU inference workloads in [Kaito](https://github.com/kaito-project/kaito), eliminating the need for external dependencies such as Prometheus.
 
 ## Overview
 
@@ -19,22 +19,48 @@ The KEDA Kaito Scaler provides intelligent autoscaling for vLLM inference worklo
 
 ![keda-kaito-scaler-arch](./docs/images/keda-kaito-scaler-arch.png)
 
+## Prerequisites
+### Enable InferenceSet Controller during KAITO install
+
+To enable autoscaling of KAITO GPU inference workloads, the `InferenceSet` custom resource must be utilized in KAITO, and the InferenceSet Controller should be activated during the KAITO installation. The `InferenceSet` feature was introduced in KAITO version `v0.8.0` as an alpha feature.
+
+```bash
+export CLUSTER_NAME=kaito
+
+helm repo add kaito https://kaito-project.github.io/kaito/charts/kaito
+helm repo update
+helm upgrade --install kaito-workspace kaito/workspace \
+  --namespace kaito-workspace \
+  --create-namespace \
+  --set clusterName="$CLUSTER_NAME" \
+  --set featureGates.enableInferenceSetController=true \
+  --wait
+```
+
+### install KEDA
+> the following example demonstrates how to install KEDA using Helm chart. For instructions on installing KEDA through other methods, please refer to the guide [here](https://github.com/kedacore/keda#deploying-keda).
+```bash
+helm repo add kedacore https://kedacore.github.io/charts
+helm install keda kedacore/keda --namespace keda --create-namespace
+```
+
 ## Quick Start
+### Deploy KEDA Kaito Scaler
+> autoscaling of KAITO GPU inference workloads requires KEDA Kaito Scaler version v0.3.3 or higher.
 
-### Prerequisites
+```bash
+helm repo add keda-kaito-scaler https://kaito-project.github.io/keda-kaito-scaler/charts/kaito-project
+helm upgrade --install keda-kaito-scaler -n kaito-workspace keda-kaito-scaler/keda-kaito-scaler --create-namespace
+```
 
-- install KEDA on a Kubernetes cluster
-   - follow guide [here](https://github.com/kedacore/keda?tab=readme-ov-file#deploying-keda)
-
-### Deploy KEDA Kaito Scaler on your cluster
-
-   ```bash
-   helm repo add keda-kaito-scaler https://kaito-project.github.io/keda-kaito-scaler/charts/kaito-project
-   helm upgrade --install keda-kaito-scaler -n kaito-workspace keda-kaito-scaler/keda-kaito-scaler --create-namespace
-   ```
-
-### Create a Kaito InferenceSet for your inference workloads
- - the following example creates an inference service for the phi-2 model, annotations with the prefix `scaledobject.kaito.sh/` are used to provide parameter inputs for the KEDA Kaito Scaler.
+### Create a Kaito InferenceSet for running inference workloads
+ - The following example creates an InferenceSet for the phi-4-mini model, using annotations with the prefix `scaledobject.kaito.sh/` to supply parameter inputs for the KEDA Kaito Scaler:
+   - `scaledobject.kaito.sh/auto-provision`
+     - required, specifies whether KEDA Kaito Scaler will automatically provision a ScaledObject based on the `InferenceSet` object
+   - `scaledobject.kaito.sh/metricName`
+     - optional, specifies the metric name collected from the vLLM pod, which is used for monitoring and triggering the scaling operation, default is `vllm:num_requests_waiting`
+   - `scaledobject.kaito.sh/threshold`
+     - required, specifies the threshold for the monitored metric that triggers the scaling operation
 
 ```bash
 cat <<EOF | kubectl apply -f -
@@ -43,27 +69,39 @@ kind: InferenceSet
 metadata:
   annotations:
     scaledobject.kaito.sh/auto-provision: "true"
-    scaledobject.kaito.sh/max-replicas: "5"
+    scaledobject.kaito.sh/metricName: "vllm:num_requests_waiting"
     scaledobject.kaito.sh/threshold: "10"
-  name: phi-2
+  name: phi-4
   namespace: default
 spec:
   labelSelector:
     matchLabels:
-      apps: phi-2
-  nodeCountLimit: 10
+      apps: phi-4
   replicas: 1
+  nodeCountLimit: 5
   template:
     inference:
       preset:
         accessMode: public
-        name: phi-2
+        name: phi-4-mini-instruct
     resource:
       instanceType: Standard_NC24ads_A100_v4
 EOF
 ```
 
-That's it! Your Kaito workspace will now automatically scale based on the number of waiting inference request(`vllm:num_requests_waiting`).
+ - In just a few seconds, the KEDA Kaito Scaler will automatically create the `scaledobject` and `hpa` objects. After a few minutes, once the inference pod is running, the KEDA Kaito Scaler will begin scraping metric values from the inference pod, and the status of the `scaledobject` and `hpa` objects will be marked as ready.
+
+```bash
+# kubectl get scaledobject
+NAME           SCALETARGETKIND                  SCALETARGETNAME   MIN   MAX   READY   ACTIVE    FALLBACK   PAUSED   TRIGGERS   AUTHENTICATIONS           AGE
+phi-4          kaito.sh/v1alpha1.InferenceSet   phi-4             1     5     True    True     False      False    external   keda-kaito-scaler-creds   10m
+
+# kubectl get hpa
+NAME                    REFERENCE                   TARGETS      MINPODS   MAXPODS   REPLICAS   AGE
+keda-hpa-phi-4          InferenceSet/phi-4          0/10 (avg)   1         5         1          11m
+```
+
+That's it! Your KAITO workloads will now automatically scale based on the number of waiting inference requests (`vllm:num_requests_waiting`).
 
 ## License
 
