@@ -162,7 +162,7 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 
 	// get the metrics for the ready services and calculate the total metric value.
 	// at the same time, please count the number of services that metric can be collected.
-	var totalMetricValue int64
+	var totalMetricValue float64
 	var serviceCount int
 	metricErrs := make([]error, wsNum)
 	for i := range workspaceList.Items {
@@ -186,21 +186,22 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		}
 		return nil, status.Error(codes.Internal, "no ready services found for the workspace")
 	} else if serviceCount != wsNum {
-		if totalMetricValue/int64(serviceCount) < scalerConfig.Threshold {
+		if totalMetricValue/float64(serviceCount) < float64(scalerConfig.Threshold) {
 			// scale-down direction
-			totalMetricValue += scalerConfig.Threshold * int64(wsNum-serviceCount)
+			totalMetricValue += float64(scalerConfig.Threshold) * float64(wsNum-serviceCount)
 		} else {
 			// scale-up direction
-			totalMetricValue += 0 * int64(wsNum-serviceCount)
+			totalMetricValue += 0 * float64(wsNum-serviceCount)
 		}
 	}
-	averageMetricValue := totalMetricValue / int64(wsNum)
+	averageMetricValue := totalMetricValue / float64(wsNum)
+	klog.V(4).Infof("calculated average metric value: %f, totalMetricValue: %f, wsNum: %d", averageMetricValue, totalMetricValue, wsNum)
 
 	return &externalscaler.GetMetricsResponse{
 		MetricValues: []*externalscaler.MetricValue{
 			{
-				MetricName:  scalerConfig.MetricName,
-				MetricValue: averageMetricValue,
+				MetricName:       scalerConfig.MetricName,
+				MetricValueFloat: averageMetricValue,
 			},
 		},
 	}, nil
@@ -280,7 +281,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 	}, nil
 }
 
-func (e *kaitoScaler) getServiceMetric(serviceName, serviceNamespace string, scalerConfig *ScalerConfig) (int64, error) {
+func (e *kaitoScaler) getServiceMetric(serviceName, serviceNamespace string, scalerConfig *ScalerConfig) (float64, error) {
 	var transport *http.Transport
 	if scalerConfig.MetricProtocol == "https" {
 		transport = e.tlsTransport
@@ -312,10 +313,7 @@ func (e *kaitoScaler) getServiceMetric(serviceName, serviceNamespace string, sca
 			klog.V(2).Infof("found metric line from service %s/%s: %s", serviceNamespace, serviceName, line)
 			parts := strings.Split(line, " ")
 			if len(parts) == 2 {
-				value, err := strconv.ParseFloat(parts[1], 64)
-				if err == nil {
-					return int64(value), nil
-				}
+				return strconv.ParseFloat(parts[1], 64)
 			}
 		}
 	}
