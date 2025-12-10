@@ -189,11 +189,9 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		if totalMetricValue/float64(serviceCount) < float64(scalerConfig.Threshold) {
 			// scale-down direction
 			totalMetricValue += float64(scalerConfig.Threshold) * float64(wsNum-serviceCount)
-		} else {
-			// scale-up direction
-			totalMetricValue += 0 * float64(wsNum-serviceCount)
 		}
 	}
+
 	averageMetricValue := totalMetricValue / float64(wsNum)
 	klog.V(4).Infof("calculated average metric value: %f, totalMetricValue: %f, wsNum: %d", averageMetricValue, totalMetricValue, wsNum)
 
