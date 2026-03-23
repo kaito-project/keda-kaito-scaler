@@ -1,5 +1,5 @@
 # Build the binary
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/oss/go/microsoft/golang:1.24 AS builder
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/oss/go/microsoft/golang:1.25 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG GIT_COMMIT

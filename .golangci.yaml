@@ -1,33 +1,41 @@
-run:
-  timeout: 15m
-
-linters-settings:
-  gci:
-    skip-generated: true
-    sections:
-      - standard
-      - prefix(github.com/kaito-project/keda-kaito-scaler)
-      - default
-  gofmt:
-    simplify: true
-  goimports:
-    local-prefixes: github.com/kaito-project/keda-kaito-scaler
-
-# Completely disable typecheck due to Go 1.24 compatibility issues
-issues:
-  exclude:
-    - "could not import k8s.io/apimachinery/pkg/types"
-    - "undefined.*Update"
-    - "undefined.*Get"
-    - "undefined: klog"
-    - "declared and not used: serverKey"
+version: "2"
 
 linters:
-  disable-all: true
+  default: none
+  enable:
+    - staticcheck
+  settings:
+    staticcheck:
+      checks:
+        - "S*"
+    depguard:
+      rules:
+        main:
+          files:
+            - $all
+            - "!$test"
+          allow:
+            - $gostd
+            - k8s.io
+            - sigs.k8s.io
+            - github.com
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+      - common-false-positives
+      - legacy
+    rules:
+      # unused-parameter is a new revive rule not present in v1's bundled revive.
+      - linters:
+          - revive
+        text: "^unused-parameter:"
+      # var-naming package name checks are new in v2's revive (v1 only checked variable names).
+      - linters:
+          - revive
+        text: "^var-naming: avoid"
+
+formatters:
   enable:
     - gofmt
-    - goimports
-    - gci
-    - misspell
-    - ineffassign
-  fast: true
