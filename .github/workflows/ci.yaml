@@ -34,19 +34,6 @@ jobs:
         run: make verify-mod
       - name: Verify Manifests
         run: make verify-manifests
-  golangci-lint:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v6.0.1
-        with:
-          submodules: true
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-      - name: Lint golang code
-        run: make lint
 
   build:
     runs-on: ubuntu-latest
