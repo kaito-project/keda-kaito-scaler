@@ -50,7 +50,7 @@ const (
 	ScrapeTimeoutInMetadata         = "scrapeTimeout"
 )
 
-type ScalerConfig struct {
+type Config struct {
 	InferenceSetName      string
 	InferenceSetNamespace string
 	MetricName            string
@@ -64,15 +64,15 @@ type ScalerConfig struct {
 // +kubebuilder:rbac:groups="kaito.sh",resources=inferencesets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=list;watch
 
-type kaitoScaler struct {
+type KaitoScaler struct {
 	kubeClient    client.Client
 	httpTransport *http.Transport
 	tlsTransport  *http.Transport
 	externalscaler.UnimplementedExternalScalerServer
 }
 
-func NewKaitoScaler(kubeClient client.Client) *kaitoScaler {
-	return &kaitoScaler{
+func NewKaitoScaler(kubeClient client.Client) *KaitoScaler {
+	return &KaitoScaler{
 		kubeClient: kubeClient,
 		httpTransport: &http.Transport{
 			MaxIdleConns:        20,
@@ -88,7 +88,7 @@ func NewKaitoScaler(kubeClient client.Client) *kaitoScaler {
 	}
 }
 
-func (e *kaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledObjectRef) (*externalscaler.IsActiveResponse, error) {
+func (e *KaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledObjectRef) (*externalscaler.IsActiveResponse, error) {
 	scalerConfig, err := parseScalerMetadata(sor, "")
 	if err != nil {
 		return nil, err
@@ -119,12 +119,12 @@ func (e *kaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledOb
 	}, nil
 }
 
-func (e *kaitoScaler) StreamIsActive(sor *externalscaler.ScaledObjectRef, server externalscaler.ExternalScaler_StreamIsActiveServer) error {
+func (e *KaitoScaler) StreamIsActive(sor *externalscaler.ScaledObjectRef, server externalscaler.ExternalScaler_StreamIsActiveServer) error {
 	// do nothing for stream mode
 	return nil
 }
 
-func (e *kaitoScaler) GetMetricSpec(_ context.Context, sor *externalscaler.ScaledObjectRef) (*externalscaler.GetMetricSpecResponse, error) {
+func (e *KaitoScaler) GetMetricSpec(_ context.Context, sor *externalscaler.ScaledObjectRef) (*externalscaler.GetMetricSpecResponse, error) {
 	scalerConfig, err := parseScalerMetadata(sor, "")
 	if err != nil {
 		return nil, err
@@ -138,7 +138,7 @@ func (e *kaitoScaler) GetMetricSpec(_ context.Context, sor *externalscaler.Scale
 	}, nil
 }
 
-func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMetricsRequest) (*externalscaler.GetMetricsResponse, error) {
+func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMetricsRequest) (*externalscaler.GetMetricsResponse, error) {
 	scalerConfig, err := parseScalerMetadata(gmr.ScaledObjectRef, gmr.MetricName)
 	if err != nil {
 		return nil, err
@@ -205,7 +205,7 @@ func (e *kaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 	}, nil
 }
 
-func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string) (*ScalerConfig, error) {
+func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string) (*Config, error) {
 	if scalerName, ok := sor.ScalerMetadata[ScalerNameKeyInMetadata]; !ok || scalerName != ScalerName {
 		return nil, status.Error(codes.InvalidArgument, "scaler name must be keda-kaito-scaler")
 	}
@@ -267,7 +267,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		return nil, status.Error(codes.InvalidArgument, "threshold must be a valid integer")
 	}
 
-	return &ScalerConfig{
+	return &Config{
 		InferenceSetName:      inferenceSetName,
 		InferenceSetNamespace: inferenceSetNamespace,
 		MetricName:            metricName,
@@ -279,7 +279,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 	}, nil
 }
 
-func (e *kaitoScaler) getServiceMetric(serviceName, serviceNamespace string, scalerConfig *ScalerConfig) (float64, error) {
+func (e *KaitoScaler) getServiceMetric(serviceName, serviceNamespace string, scalerConfig *Config) (float64, error) {
 	var transport *http.Transport
 	if scalerConfig.MetricProtocol == "https" {
 		transport = e.tlsTransport

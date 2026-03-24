@@ -1,40 +1,19 @@
-name: Go Lint
-
+name: Static Checks
 on:
-  pull_request: {}
-  push: {}
-
-env:
-  GO_VERSION: '1.24'
-
-permissions:
-  contents: read
-
+    pull_request: {}
+    push: {}
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
-        with:
-          egress-policy: audit
-          disable-sudo: true
-          disable-telemetry: true
-
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          submodules: true
-          fetch-depth: 0
-
-      - name: Set up Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@8e57b58e57be52ac95949151e2777ffda8501267 # v5.4.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Run go vet
-        run: |
-          make vet
-      - name: Run golangci-lint
-        run: make lint
+    go_lint:
+        name: Go Lint
+        runs-on: ubuntu-latest
+        steps:
+            - name: Set up Go 1.x
+              uses: actions/setup-go@v6
+              with:
+                  go-version: ^1.19
+            - uses: actions/checkout@master
+            - name: Run linter
+              uses: golangci/golangci-lint-action@v7
+              with:
+                  version: v2.10
+                  args: -E=errcheck,govet,unused,ineffassign,staticcheck,revive,misspell,asciicheck,bodyclose,dogsled,durationcheck,errname,forbidigo --timeout=30m0s
