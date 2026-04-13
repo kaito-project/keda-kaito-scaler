@@ -5,7 +5,7 @@ go 1.25.6
 require (
 	github.com/kaito-project/kaito v0.8.0-rc.0
 	github.com/kedacore/keda/v2 v2.18.3
-	github.com/open-policy-agent/cert-controller v0.15.0
+	github.com/open-policy-agent/cert-controller v0.16.0
 	github.com/samber/lo v1.52.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
@@ -19,7 +19,7 @@ require (
 	k8s.io/component-base v0.35.3
 	k8s.io/klog/v2 v2.140.0
 	k8s.io/utils v0.0.0-20260108192941-914a6e750570
-	sigs.k8s.io/controller-runtime v0.22.4
+	sigs.k8s.io/controller-runtime v0.23.3
 )
 
 require (
@@ -94,7 +94,7 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	k8s.io/apiextensions-apiserver v0.35.0 // indirect
+	k8s.io/apiextensions-apiserver v0.35.2 // indirect
 	k8s.io/cloud-provider v0.35.0 // indirect
 	k8s.io/component-helpers v0.35.0 // indirect
 	k8s.io/csi-translation-lib v0.35.0 // indirect
