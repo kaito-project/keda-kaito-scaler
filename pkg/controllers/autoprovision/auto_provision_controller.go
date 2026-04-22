@@ -94,7 +94,8 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 		return reconcile.Result{}, err
 	}
 	if requeue {
-		logger.Info("target node count from workspaces for inference set is zero, and requeue after 5 seconds", "namespace", is.Namespace, "name", is.Name)
+		logger.Info("target node count from workspaces for inference set is zero, requeueing",
+			"namespace", is.Namespace, "name", is.Name, "requeueAfter", requeueInterval.String())
 		return reconcile.Result{RequeueAfter: requeueInterval}, nil
 	}
 

@@ -81,7 +81,7 @@ helm upgrade --install keda-kaito-scaler -n kaito-workspace keda-kaito-scaler/ke
      - optional, specifies the minimum number of replicas for the ScaledObject. If not set or less than 1, it will be set to 1.
    - `scaledobject.kaito.sh/max-replicas`
      - optional, specifies the maximum number of replicas for the ScaledObject. When this annotation is not set, the value is computed from `spec.nodeCountLimit` when available.
-     - auto-provisioning requires either `spec.nodeCountLimit` to be set or this annotation to be present with a value greater than `1`; if neither is true, the controller will not auto-provision a ScaledObject.
+     - this annotation takes precedence when present: if set, it must have a value greater than `1`, otherwise the controller will not auto-provision a ScaledObject even when `spec.nodeCountLimit` is set. If the annotation is absent, auto-provisioning requires `spec.nodeCountLimit` to be set.
      - when set, `max-replicas` must be greater than or equal to `min-replicas`; otherwise the controller will skip reconciling the InferenceSet and emit an `InvalidReplicaRange` warning event.
 
 ```bash
