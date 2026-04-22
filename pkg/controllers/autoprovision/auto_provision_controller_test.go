@@ -224,3 +224,53 @@ func TestGetDefaultHorizontalPodAutoscalerConfig_Consistency(t *testing.T) {
 	assert.Equal(t, *config1.Behavior.ScaleDown.SelectPolicy, *config2.Behavior.ScaleDown.SelectPolicy)
 	assert.True(t, config1.Behavior.ScaleDown.Tolerance.Equal(*config2.Behavior.ScaleDown.Tolerance))
 }
+
+func TestResolveMinReplicas(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		expected    int
+	}{
+		{
+			name:        "annotation not set returns 1",
+			annotations: nil,
+			expected:    1,
+		},
+		{
+			name:        "empty annotations returns 1",
+			annotations: map[string]string{},
+			expected:    1,
+		},
+		{
+			name:        "annotation value less than 1 is clamped to 1",
+			annotations: map[string]string{AnnotationKeyMinReplicas: "0"},
+			expected:    1,
+		},
+		{
+			name:        "annotation value equal to 1 returns 1",
+			annotations: map[string]string{AnnotationKeyMinReplicas: "1"},
+			expected:    1,
+		},
+		{
+			name:        "negative annotation value is clamped to 1",
+			annotations: map[string]string{AnnotationKeyMinReplicas: "-5"},
+			expected:    1,
+		},
+		{
+			name:        "invalid annotation value falls back to 1",
+			annotations: map[string]string{AnnotationKeyMinReplicas: "abc"},
+			expected:    1,
+		},
+		{
+			name:        "valid value greater than 1 is returned",
+			annotations: map[string]string{AnnotationKeyMinReplicas: "3"},
+			expected:    3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, resolveMinReplicas(tt.annotations))
+		})
+	}
+}

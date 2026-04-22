@@ -77,6 +77,10 @@ helm upgrade --install keda-kaito-scaler -n kaito-workspace keda-kaito-scaler/ke
      - optional, specifies the metric name collected from the vLLM pod, which is used for monitoring and triggering the scaling operation, default is `vllm:num_requests_waiting`
    - `scaledobject.kaito.sh/threshold`
      - required, specifies the threshold for the monitored metric that triggers the scaling operation
+   - `scaledobject.kaito.sh/min-replicas`
+     - optional, specifies the minimum number of replicas for the ScaledObject. If not set or less than 1, it will be set to 1.
+   - `scaledobject.kaito.sh/max-replicas`
+     - optional, specifies the maximum number of replicas for the ScaledObject. If not set, it will be computed from `spec.nodeCountLimit` when available, otherwise defaults to 1.
 
 ```bash
 cat <<EOF | kubectl apply -f -
