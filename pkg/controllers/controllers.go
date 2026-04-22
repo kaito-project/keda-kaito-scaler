@@ -26,7 +26,7 @@ import (
 
 func NewControllers(mgr manager.Manager, scalerNamespace string) []controller.Controller {
 	return []controller.Controller{
-		autoprovision.NewAutoProvisionController(mgr.GetClient(), scalerNamespace),
+		autoprovision.NewAutoProvisionController(mgr.GetClient(), scalerNamespace, mgr.GetEventRecorderFor("keda-kaito-scaler")),
 		// add controllers here
 	}
 }

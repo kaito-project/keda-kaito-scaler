@@ -280,11 +280,9 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 }
 
 func (e *KaitoScaler) getServiceMetric(serviceName, serviceNamespace string, scalerConfig *Config) (float64, error) {
-	var transport *http.Transport
+	transport := e.httpTransport
 	if scalerConfig.MetricProtocol == "https" {
 		transport = e.tlsTransport
-	} else {
-		transport = e.httpTransport
 	}
 
 	httpClient := &http.Client{
@@ -292,6 +290,11 @@ func (e *KaitoScaler) getServiceMetric(serviceName, serviceNamespace string, sca
 		Timeout:   scalerConfig.ScrapeTimeout,
 	}
 
+	// NOTE: Kaito currently exposes the vLLM inference server (and its Prometheus
+	// /metrics endpoint) as plain HTTP on the workspace Service
+	// (spec.ports[name="http"], Port=80 -> TargetPort=PortInferenceServer=5000).
+	// The protocol is kept configurable via the ScaledObject metadata so that
+	// https can be used in the future if Kaito enables TLS on the inference server.
 	metricURL := fmt.Sprintf("%s://%s.%s.svc.cluster.local:%s%s", scalerConfig.MetricProtocol, serviceName, serviceNamespace, scalerConfig.MetricPort, scalerConfig.MetricPath)
 	klog.V(6).Infof("scraping metrics from service %s/%s: %s", serviceNamespace, serviceName, metricURL)
 	resp, err := httpClient.Get(metricURL)

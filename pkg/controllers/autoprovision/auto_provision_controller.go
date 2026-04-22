@@ -16,6 +16,7 @@ package autoprovision
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"time"
@@ -25,9 +26,11 @@ import (
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"golang.org/x/time/rate"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/ptr"
 	controllerruntime "sigs.k8s.io/controller-runtime"
@@ -46,22 +49,37 @@ import (
 
 const (
 	AnnotationKeyAutoProvision = "scaledobject.kaito.sh/auto-provision"
+	AnnotationKeyMinReplicas   = "scaledobject.kaito.sh/min-replicas"
 	AnnotationKeyMaxReplicas   = "scaledobject.kaito.sh/max-replicas"
 	AnnotationKeyThreshold     = "scaledobject.kaito.sh/threshold"
 
 	AnnotationKeyManagedBy = "scaledobject.kaito.sh/managed-by"
 	InferenceSet           = "InferenceSet"
+
+	inferenceSetAPIVersion = "kaito.sh/v1alpha1"
+	requeueInterval        = 5 * time.Second
 )
+
+// watchedAnnotations are the annotations whose changes should trigger a
+// reconcile of the owning InferenceSet.
+var watchedAnnotations = []string{
+	AnnotationKeyAutoProvision,
+	AnnotationKeyMinReplicas,
+	AnnotationKeyMaxReplicas,
+	AnnotationKeyThreshold,
+}
 
 type Controller struct {
 	client.Client
 	ScalerNamespace string
+	Recorder        record.EventRecorder
 }
 
-func NewAutoProvisionController(c client.Client, scalerNamespace string) *Controller {
+func NewAutoProvisionController(c client.Client, scalerNamespace string, recorder record.EventRecorder) *Controller {
 	return &Controller{
 		Client:          c,
 		ScalerNamespace: scalerNamespace,
+		Recorder:        recorder,
 	}
 }
 
@@ -71,125 +89,187 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 		return reconcile.Result{}, nil
 	}
 
-	var maxReplicas int
-	if is.Spec.NodeCountLimit != 0 {
-		workspaceList, err := inferenceset.ListWorkspaces(ctx, is, c.Client)
-		if err != nil {
-			return reconcile.Result{}, fmt.Errorf("failed to list workspaces for inference set %s/%s: %v", is.Namespace, is.Name, err)
-		}
-
-		var targetNodeCount int32
-		for i := range workspaceList.Items {
-			if workspaceList.Items[i].Status.TargetNodeCount != 0 {
-				targetNodeCount = workspaceList.Items[i].Status.TargetNodeCount
-				break
-			}
-		}
-
-		if targetNodeCount == 0 {
-			logger.Info("target node count from workspaces for inference set is zero, and requeue after 5 seconds", "namespace", is.Namespace, "name", is.Name)
-			return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-
-		maxReplicas = is.Spec.NodeCountLimit / int(targetNodeCount)
-		if maxReplicas < 1 {
-			maxReplicas = 1
-		}
-	} else if maxReplicasStr, ok := is.Annotations[AnnotationKeyMaxReplicas]; ok {
-		maxReplicas, _ = strconv.Atoi(maxReplicasStr)
-	} else {
-		maxReplicas = 1
+	maxReplicas, requeue, err := c.resolveMaxReplicas(ctx, is)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if requeue {
+		logger.Info("target node count from workspaces for inference set is zero, requeuing",
+			"namespace", is.Namespace, "name", is.Name, "requeueAfter", requeueInterval.String())
+		return reconcile.Result{RequeueAfter: requeueInterval}, nil
 	}
 
+	minReplicas := resolveMinReplicas(is.Annotations)
+	if maxReplicas < minReplicas {
+		logger.Info("skip reconciling inference set because max-replicas is less than min-replicas",
+			"namespace", is.Namespace, "name", is.Name,
+			"minReplicas", minReplicas, "maxReplicas", maxReplicas)
+		if c.Recorder != nil {
+			c.Recorder.Eventf(is, corev1.EventTypeWarning, "InvalidReplicaRange",
+				"Skip auto-provisioning ScaledObject: max-replicas (%d) is less than min-replicas (%d)",
+				maxReplicas, minReplicas)
+		}
+		return reconcile.Result{}, nil
+	}
 	threshold := is.Annotations[AnnotationKeyThreshold]
 
-	// list all scaled objects in the same namespace
-	var scaledObjectList v1alpha1.ScaledObjectList
-	if err := c.List(ctx, &scaledObjectList, client.InNamespace(is.Namespace)); err != nil {
+	managedScaledObjects, err := c.listManagedScaledObjects(ctx, is)
+	if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	// filter the scaled objects related to the workspace and auto provisioning
-	var filteredScaledObjects []v1alpha1.ScaledObject
-	for _, scaledObject := range scaledObjectList.Items {
-		if scaledObject.Spec.ScaleTargetRef.Name == is.Name && scaledObject.Spec.ScaleTargetRef.Kind == InferenceSet {
-			if scaledObject.Annotations[AnnotationKeyManagedBy] == scaler.ScalerName {
-				filteredScaledObjects = append(filteredScaledObjects, scaledObject)
+	return reconcile.Result{}, c.syncScaledObjects(ctx, is, managedScaledObjects, minReplicas, maxReplicas, threshold)
+}
+
+// resolveMaxReplicas computes the max replicas for the ScaledObject. When
+// NodeCountLimit is set, it derives the value from workspaces and may signal a
+// requeue if information is not yet available. Otherwise it falls back to the
+// max-replicas annotation or a default of 1.
+func (c *Controller) resolveMaxReplicas(ctx context.Context, is *kaitov1alpha1.InferenceSet) (int, bool, error) {
+	if is.Spec.NodeCountLimit == 0 {
+		if maxReplicasStr, ok := is.Annotations[AnnotationKeyMaxReplicas]; ok {
+			v, err := strconv.Atoi(maxReplicasStr)
+			if err != nil || v < 1 {
+				v = 1
+			} else if v > math.MaxInt32 {
+				v = math.MaxInt32
 			}
+			return v, false, nil
 		}
+		return 1, false, nil
 	}
 
-	// if no scaled object found, create one
-	if len(filteredScaledObjects) == 0 {
-		newScaledObject := &v1alpha1.ScaledObject{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      is.Name,
-				Namespace: is.Namespace,
-				Annotations: map[string]string{
-					AnnotationKeyManagedBy: scaler.ScalerName,
-				},
-				OwnerReferences: []metav1.OwnerReference{
-					{
-						APIVersion:         "kaito.sh/v1alpha1",
-						Kind:               InferenceSet,
-						Name:               is.Name,
-						UID:                is.UID,
-						Controller:         ptr.To(true),
-						BlockOwnerDeletion: ptr.To(true),
-					},
-				},
-			},
-			Spec: v1alpha1.ScaledObjectSpec{
-				Advanced: &v1alpha1.AdvancedConfig{
-					HorizontalPodAutoscalerConfig: getDefaultHorizontalPodAutoscalerConfig(),
-				},
-				ScaleTargetRef: &v1alpha1.ScaleTarget{
-					Name:       is.Name,
-					APIVersion: "kaito.sh/v1alpha1",
-					Kind:       InferenceSet,
-				},
-				MinReplicaCount: ptr.To(int32(1)),
-				MaxReplicaCount: ptr.To(int32(maxReplicas)),
-				Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold),
-			},
-		}
+	workspaceList, err := inferenceset.ListWorkspaces(ctx, is, c.Client)
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to list workspaces for inference set %s/%s: %v", is.Namespace, is.Name, err)
+	}
 
-		if err := c.Create(ctx, newScaledObject); err != nil {
-			return reconcile.Result{}, err
+	var targetNodeCount int32
+	for i := range workspaceList.Items {
+		if workspaceList.Items[i].Status.TargetNodeCount != 0 {
+			targetNodeCount = workspaceList.Items[i].Status.TargetNodeCount
+			break
 		}
-	} else if len(filteredScaledObjects) == 1 {
-		// update the existing scaled object if annotation values changed
-		existingScaledObject := filteredScaledObjects[0]
-		updated := false
+	}
+	if targetNodeCount == 0 {
+		return 0, true, nil
+	}
 
-		if *existingScaledObject.Spec.MaxReplicaCount != int32(maxReplicas) {
-			existingScaledObject.Spec.MaxReplicaCount = ptr.To(int32(maxReplicas))
-			updated = true
-		}
-		if existingScaledObject.Spec.Triggers[0].Metadata["threshold"] != threshold {
-			existingScaledObject.Spec.Triggers[0].Metadata["threshold"] = threshold
-			updated = true
-		}
+	maxReplicas := is.Spec.NodeCountLimit / int(targetNodeCount)
+	if maxReplicas < 1 {
+		maxReplicas = 1
+	} else if maxReplicas > math.MaxInt32 {
+		maxReplicas = math.MaxInt32
+	}
+	return maxReplicas, false, nil
+}
 
-		if updated {
-			if err := c.Update(ctx, &existingScaledObject); err != nil {
-				return reconcile.Result{}, err
-			}
+// listManagedScaledObjects returns ScaledObjects that target the given
+// InferenceSet and are managed by this scaler.
+func (c *Controller) listManagedScaledObjects(ctx context.Context, is *kaitov1alpha1.InferenceSet) ([]v1alpha1.ScaledObject, error) {
+	var scaledObjectList v1alpha1.ScaledObjectList
+	if err := c.List(ctx, &scaledObjectList, client.InNamespace(is.Namespace)); err != nil {
+		return nil, err
+	}
+
+	var managed []v1alpha1.ScaledObject
+	for _, so := range scaledObjectList.Items {
+		if so.Spec.ScaleTargetRef.Name == is.Name &&
+			so.Spec.ScaleTargetRef.Kind == InferenceSet &&
+			so.Annotations[AnnotationKeyManagedBy] == scaler.ScalerName {
+			managed = append(managed, so)
 		}
-	} else {
-		// sort by creation timestamp, and delete new ones.
-		sort.SliceStable(filteredScaledObjects, func(i, j int) bool {
-			return filteredScaledObjects[i].CreationTimestamp.Before(&filteredScaledObjects[j].CreationTimestamp)
+	}
+	return managed, nil
+}
+
+// syncScaledObjects creates, updates, or deduplicates managed ScaledObjects so
+// that exactly one matches the desired spec.
+func (c *Controller) syncScaledObjects(ctx context.Context, is *kaitov1alpha1.InferenceSet, existing []v1alpha1.ScaledObject, minReplicas, maxReplicas int, threshold string) error {
+	switch len(existing) {
+	case 0:
+		return c.Create(ctx, c.buildScaledObject(is, minReplicas, maxReplicas, threshold))
+	case 1:
+		return c.updateScaledObject(ctx, is, &existing[0], minReplicas, maxReplicas, threshold)
+	default:
+		// Keep the oldest one, delete the rest, then reconcile the kept one to
+		// the desired spec so it does not go stale after annotation changes.
+		sort.SliceStable(existing, func(i, j int) bool {
+			return existing[i].CreationTimestamp.Before(&existing[j].CreationTimestamp)
 		})
-
-		for i := 1; i < len(filteredScaledObjects); i++ {
-			if err := c.Delete(ctx, &filteredScaledObjects[i]); err != nil {
-				return reconcile.Result{}, err
+		for i := 1; i < len(existing); i++ {
+			if err := c.Delete(ctx, &existing[i]); err != nil {
+				return err
 			}
+		}
+		return c.updateScaledObject(ctx, is, &existing[0], minReplicas, maxReplicas, threshold)
+	}
+}
+
+func (c *Controller) buildScaledObject(is *kaitov1alpha1.InferenceSet, minReplicas, maxReplicas int, threshold string) *v1alpha1.ScaledObject {
+	return &v1alpha1.ScaledObject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      is.Name,
+			Namespace: is.Namespace,
+			Annotations: map[string]string{
+				AnnotationKeyManagedBy: scaler.ScalerName,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         inferenceSetAPIVersion,
+					Kind:               InferenceSet,
+					Name:               is.Name,
+					UID:                is.UID,
+					Controller:         ptr.To(true),
+					BlockOwnerDeletion: ptr.To(true),
+				},
+			},
+		},
+		Spec: v1alpha1.ScaledObjectSpec{
+			Advanced: &v1alpha1.AdvancedConfig{
+				HorizontalPodAutoscalerConfig: getDefaultHorizontalPodAutoscalerConfig(),
+			},
+			ScaleTargetRef: &v1alpha1.ScaleTarget{
+				Name:       is.Name,
+				APIVersion: inferenceSetAPIVersion,
+				Kind:       InferenceSet,
+			},
+			MinReplicaCount: ptr.To(int32(minReplicas)),
+			MaxReplicaCount: ptr.To(int32(maxReplicas)),
+			Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold),
+		},
+	}
+}
+
+func (c *Controller) updateScaledObject(ctx context.Context, is *kaitov1alpha1.InferenceSet, so *v1alpha1.ScaledObject, minReplicas, maxReplicas int, threshold string) error {
+	updated := false
+
+	if so.Spec.MinReplicaCount == nil || *so.Spec.MinReplicaCount != int32(minReplicas) {
+		so.Spec.MinReplicaCount = ptr.To(int32(minReplicas))
+		updated = true
+	}
+	if so.Spec.MaxReplicaCount == nil || *so.Spec.MaxReplicaCount != int32(maxReplicas) {
+		so.Spec.MaxReplicaCount = ptr.To(int32(maxReplicas))
+		updated = true
+	}
+	if len(so.Spec.Triggers) == 0 {
+		// Restore triggers if they were removed (e.g., manual edit drift).
+		so.Spec.Triggers = getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold)
+		updated = true
+	} else {
+		if so.Spec.Triggers[0].Metadata == nil {
+			so.Spec.Triggers[0].Metadata = make(map[string]string)
+		}
+		if so.Spec.Triggers[0].Metadata["threshold"] != threshold {
+			so.Spec.Triggers[0].Metadata["threshold"] = threshold
+			updated = true
 		}
 	}
 
-	return reconcile.Result{}, nil
+	if !updated {
+		return nil
+	}
+	return c.Update(ctx, so)
 }
 
 func generateInferenceSetPredicateFunc() predicate.Predicate {
@@ -212,11 +292,11 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 				return false
 			}
 
-			// check auto-provision, max-replicas, threshold annotation changes
-			if oldInferenceSet.Annotations[AnnotationKeyAutoProvision] != newInferenceSet.Annotations[AnnotationKeyAutoProvision] ||
-				oldInferenceSet.Annotations[AnnotationKeyMaxReplicas] != newInferenceSet.Annotations[AnnotationKeyMaxReplicas] ||
-				oldInferenceSet.Annotations[AnnotationKeyThreshold] != newInferenceSet.Annotations[AnnotationKeyThreshold] {
-				return enableAutoProvisioning(newInferenceSet)
+			// Reconcile when any watched annotation changes.
+			for _, key := range watchedAnnotations {
+				if oldInferenceSet.Annotations[key] != newInferenceSet.Annotations[key] {
+					return enableAutoProvisioning(newInferenceSet)
+				}
 			}
 			return false
 		},
@@ -224,6 +304,18 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			return false
 		},
 	}
+}
+
+func resolveMinReplicas(annotations map[string]string) int {
+	if minReplicasStr, ok := annotations[AnnotationKeyMinReplicas]; ok {
+		if v, err := strconv.Atoi(minReplicasStr); err == nil && v > 1 {
+			if v > math.MaxInt32 {
+				return math.MaxInt32
+			}
+			return v
+		}
+	}
+	return 1
 }
 
 func enableAutoProvisioning(inferenceSet *kaitov1alpha1.InferenceSet) bool {
@@ -328,10 +420,16 @@ func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, 
 				scaler.InferenceSetNamespaceInMetadata: inferenceSetNamespace,
 				scaler.ScalerAddressInMetadata:         fmt.Sprintf("keda-kaito-scaler-svc.%s.svc.cluster.local:%d", scalerNamespace, 10450),
 				scaler.MetricNameInMetadata:            "vllm:num_requests_waiting",
-				scaler.MetricProtocolInMetadata:        "http",
-				scaler.MetricPortInMetadata:            "80",
-				scaler.MetricPathInMetadata:            "/metrics",
-				scaler.ScrapeTimeoutInMetadata:         "5s",
+				// Kaito creates a ClusterIP Service per workspace that exposes the
+				// vLLM inference server on spec.ports[name="http"] with Port=80 and
+				// TargetPort=consts.PortInferenceServer (5000). The server currently
+				// speaks plain HTTP (no TLS), so the scaler scrapes /metrics over
+				// http://<svc>:80. The protocol is kept configurable here so that
+				// https can be used in the future if Kaito enables TLS.
+				scaler.MetricProtocolInMetadata: "http",
+				scaler.MetricPortInMetadata:     "80",
+				scaler.MetricPathInMetadata:     "/metrics",
+				scaler.ScrapeTimeoutInMetadata:  "5s",
 			},
 			AuthenticationRef: &v1alpha1.AuthenticationRef{
 				Name: "keda-kaito-scaler-creds",
