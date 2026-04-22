@@ -157,6 +157,8 @@ func (c *Controller) resolveMaxReplicas(ctx context.Context, is *kaitov1alpha1.I
 	maxReplicas := is.Spec.NodeCountLimit / int(targetNodeCount)
 	if maxReplicas < 1 {
 		maxReplicas = 1
+	} else if maxReplicas > math.MaxInt32 {
+		maxReplicas = math.MaxInt32
 	}
 	return maxReplicas, false, nil
 }
@@ -187,7 +189,7 @@ func (c *Controller) syncScaledObjects(ctx context.Context, is *kaitov1alpha1.In
 	case 0:
 		return c.Create(ctx, c.buildScaledObject(is, minReplicas, maxReplicas, threshold))
 	case 1:
-		return c.updateScaledObject(ctx, &existing[0], minReplicas, maxReplicas, threshold)
+		return c.updateScaledObject(ctx, is, &existing[0], minReplicas, maxReplicas, threshold)
 	default:
 		// Keep the oldest one, delete the rest, then reconcile the kept one to
 		// the desired spec so it does not go stale after annotation changes.
@@ -199,7 +201,7 @@ func (c *Controller) syncScaledObjects(ctx context.Context, is *kaitov1alpha1.In
 				return err
 			}
 		}
-		return c.updateScaledObject(ctx, &existing[0], minReplicas, maxReplicas, threshold)
+		return c.updateScaledObject(ctx, is, &existing[0], minReplicas, maxReplicas, threshold)
 	}
 }
 
@@ -238,7 +240,7 @@ func (c *Controller) buildScaledObject(is *kaitov1alpha1.InferenceSet, minReplic
 	}
 }
 
-func (c *Controller) updateScaledObject(ctx context.Context, so *v1alpha1.ScaledObject, minReplicas, maxReplicas int, threshold string) error {
+func (c *Controller) updateScaledObject(ctx context.Context, is *kaitov1alpha1.InferenceSet, so *v1alpha1.ScaledObject, minReplicas, maxReplicas int, threshold string) error {
 	updated := false
 
 	if so.Spec.MinReplicaCount == nil || *so.Spec.MinReplicaCount != int32(minReplicas) {
@@ -249,7 +251,11 @@ func (c *Controller) updateScaledObject(ctx context.Context, so *v1alpha1.Scaled
 		so.Spec.MaxReplicaCount = ptr.To(int32(maxReplicas))
 		updated = true
 	}
-	if len(so.Spec.Triggers) > 0 {
+	if len(so.Spec.Triggers) == 0 {
+		// Restore triggers if they were removed (e.g., manual edit drift).
+		so.Spec.Triggers = getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold)
+		updated = true
+	} else {
 		if so.Spec.Triggers[0].Metadata == nil {
 			so.Spec.Triggers[0].Metadata = make(map[string]string)
 		}
