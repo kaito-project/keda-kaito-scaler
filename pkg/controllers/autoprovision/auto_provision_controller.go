@@ -16,6 +16,7 @@ package autoprovision
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"time"
@@ -126,7 +127,12 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 func (c *Controller) resolveMaxReplicas(ctx context.Context, is *kaitov1alpha1.InferenceSet) (int, bool, error) {
 	if is.Spec.NodeCountLimit == 0 {
 		if maxReplicasStr, ok := is.Annotations[AnnotationKeyMaxReplicas]; ok {
-			v, _ := strconv.Atoi(maxReplicasStr)
+			v, err := strconv.Atoi(maxReplicasStr)
+			if err != nil || v < 1 {
+				v = 1
+			} else if v > math.MaxInt32 {
+				v = math.MaxInt32
+			}
 			return v, false, nil
 		}
 		return 1, false, nil
@@ -243,9 +249,14 @@ func (c *Controller) updateScaledObject(ctx context.Context, so *v1alpha1.Scaled
 		so.Spec.MaxReplicaCount = ptr.To(int32(maxReplicas))
 		updated = true
 	}
-	if len(so.Spec.Triggers) > 0 && so.Spec.Triggers[0].Metadata["threshold"] != threshold {
-		so.Spec.Triggers[0].Metadata["threshold"] = threshold
-		updated = true
+	if len(so.Spec.Triggers) > 0 {
+		if so.Spec.Triggers[0].Metadata == nil {
+			so.Spec.Triggers[0].Metadata = make(map[string]string)
+		}
+		if so.Spec.Triggers[0].Metadata["threshold"] != threshold {
+			so.Spec.Triggers[0].Metadata["threshold"] = threshold
+			updated = true
+		}
 	}
 
 	if !updated {
@@ -291,6 +302,9 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 func resolveMinReplicas(annotations map[string]string) int {
 	if minReplicasStr, ok := annotations[AnnotationKeyMinReplicas]; ok {
 		if v, err := strconv.Atoi(minReplicasStr); err == nil && v > 1 {
+			if v > math.MaxInt32 {
+				return math.MaxInt32
+			}
 			return v
 		}
 	}
