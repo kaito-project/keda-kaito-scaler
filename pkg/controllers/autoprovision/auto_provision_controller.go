@@ -25,9 +25,11 @@ import (
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"golang.org/x/time/rate"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/ptr"
 	controllerruntime "sigs.k8s.io/controller-runtime"
@@ -69,12 +71,14 @@ var watchedAnnotations = []string{
 type Controller struct {
 	client.Client
 	ScalerNamespace string
+	Recorder        record.EventRecorder
 }
 
-func NewAutoProvisionController(c client.Client, scalerNamespace string) *Controller {
+func NewAutoProvisionController(c client.Client, scalerNamespace string, recorder record.EventRecorder) *Controller {
 	return &Controller{
 		Client:          c,
 		ScalerNamespace: scalerNamespace,
+		Recorder:        recorder,
 	}
 }
 
@@ -94,6 +98,17 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 	}
 
 	minReplicas := resolveMinReplicas(is.Annotations)
+	if maxReplicas < minReplicas {
+		logger.Info("skip reconciling inference set because max-replicas is less than min-replicas",
+			"namespace", is.Namespace, "name", is.Name,
+			"minReplicas", minReplicas, "maxReplicas", maxReplicas)
+		if c.Recorder != nil {
+			c.Recorder.Eventf(is, corev1.EventTypeWarning, "InvalidReplicaRange",
+				"Skip auto-provisioning ScaledObject: max-replicas (%d) is less than min-replicas (%d)",
+				maxReplicas, minReplicas)
+		}
+		return reconcile.Result{}, nil
+	}
 	threshold := is.Annotations[AnnotationKeyThreshold]
 
 	managedScaledObjects, err := c.listManagedScaledObjects(ctx, is)
@@ -168,7 +183,8 @@ func (c *Controller) syncScaledObjects(ctx context.Context, is *kaitov1alpha1.In
 	case 1:
 		return c.updateScaledObject(ctx, &existing[0], minReplicas, maxReplicas, threshold)
 	default:
-		// Keep the oldest one, delete the rest.
+		// Keep the oldest one, delete the rest, then reconcile the kept one to
+		// the desired spec so it does not go stale after annotation changes.
 		sort.SliceStable(existing, func(i, j int) bool {
 			return existing[i].CreationTimestamp.Before(&existing[j].CreationTimestamp)
 		})
@@ -177,7 +193,7 @@ func (c *Controller) syncScaledObjects(ctx context.Context, is *kaitov1alpha1.In
 				return err
 			}
 		}
-		return nil
+		return c.updateScaledObject(ctx, &existing[0], minReplicas, maxReplicas, threshold)
 	}
 }
 
