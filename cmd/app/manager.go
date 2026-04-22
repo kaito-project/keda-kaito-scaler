@@ -56,6 +56,7 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/cmd/app/options"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/injections"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/metrics"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/profile"
 )
@@ -246,7 +247,9 @@ func startKaitoScalerServer(ctx context.Context, c client.Client, secretLister c
 
 	creds := credentials.NewTLS(tlsConfig)
 	grpcServer := grpc.NewServer(grpc.Creds(creds))
-	externalscaler.RegisterExternalScalerServer(grpcServer, scaler.NewKaitoScaler(c))
+	vllmScraper := metrics.NewVLLMScraper(c)
+	averageAggregator := metrics.NewAverageAggregator()
+	externalscaler.RegisterExternalScalerServer(grpcServer, scaler.NewKaitoScaler(c, vllmScraper, averageAggregator))
 
 	go func() {
 		<-ctx.Done()
