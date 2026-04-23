@@ -4,8 +4,9 @@ go 1.25.6
 
 require (
 	github.com/kaito-project/kaito v0.8.0-rc.0
-	github.com/kedacore/keda/v2 v2.18.3
+	github.com/kedacore/keda/v2 v2.19.0
 	github.com/open-policy-agent/cert-controller v0.15.0
+	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v1.20.99
 	github.com/samber/lo v1.52.0
@@ -17,11 +18,11 @@ require (
 	google.golang.org/grpc v1.79.3
 	k8s.io/api v0.35.3
 	k8s.io/apimachinery v0.35.3
-	k8s.io/client-go v0.35.3
+	k8s.io/client-go v1.5.2
 	k8s.io/component-base v0.35.3
 	k8s.io/klog/v2 v2.140.0
 	k8s.io/utils v0.0.0-20260108192941-914a6e750570
-	sigs.k8s.io/controller-runtime v0.22.4
+	sigs.k8s.io/controller-runtime v0.23.1
 )
 
 require (
@@ -70,7 +71,6 @@ require (
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
@@ -106,3 +106,11 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2-0.20260122202528-d9cc6641c482 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+// kedacore/keda/v2 v2.19.0 declares `require k8s.io/client-go v1.5.2` and
+// `require sigs.k8s.io/controller-runtime v0.23.1` with module-local replaces
+// back to v0.34.3 / v0.22.4. Module-local replaces don't propagate, so we
+// mirror them here to keep the versions keda was actually built against.
+replace k8s.io/client-go => k8s.io/client-go v0.35.3
+
+replace sigs.k8s.io/controller-runtime => sigs.k8s.io/controller-runtime v0.22.4

@@ -26,7 +26,7 @@ type KedaKaitoScalerOptions struct {
 	Version                bool
 	GrpcPort               int
 	MetricsPort            int
-	HealthProbePort        int
+	GrpcHealthPort         int
 	EnableProfiling        bool
 	LeaderElection         componentbaseconfig.LeaderElectionConfiguration
 	KubeClientQPS          int
@@ -43,7 +43,7 @@ func NewKedaKaitoScalerOptions() *KedaKaitoScalerOptions {
 		Version:         false,
 		GrpcPort:        10450,
 		MetricsPort:     10452,
-		HealthProbePort: 10453,
+		GrpcHealthPort:  10453,
 		EnableProfiling: true,
 		LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
 			LeaderElect:       true,
@@ -64,7 +64,7 @@ func (o *KedaKaitoScalerOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&o.Version, "version", o.Version, "print the version information, and then exit")
 	fs.IntVar(&o.GrpcPort, "grpc-port", o.GrpcPort, "the port the grpc endpoint binds to for serving grpc requests.")
 	fs.IntVar(&o.MetricsPort, "metrics-port", o.MetricsPort, "the port the metric endpoint binds to for serving metrics about keda-kaito-scaler.")
-	fs.IntVar(&o.HealthProbePort, "health-probe-port", o.HealthProbePort, "the port the health probe endpoint binds to for serving livness check.")
+	fs.IntVar(&o.GrpcHealthPort, "grpc-health-port", o.GrpcHealthPort, "the port the grpc.health.v1.Health endpoint binds to for serving kubelet/KEDA gRPC health probes.")
 	fs.BoolVar(&o.EnableProfiling, "enable-profiling", o.EnableProfiling, "enable the profiling on the metric endpoint.")
 	options.BindLeaderElectionFlags(&o.LeaderElection, fs)
 	fs.IntVar(&o.KubeClientQPS, "kube-client-qps", o.KubeClientQPS, "the rate of qps to kube-apiserver.")
