@@ -14,24 +14,20 @@
 package scaler
 
 import (
-	"bufio"
 	"context"
-	"crypto/tls"
 	"fmt"
-	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
-	"github.com/kaito-project/kaito/pkg/utils/inferenceset"
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
-	"go.uber.org/multierr"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/kaito-project/keda-kaito-scaler/pkg/metrics"
 )
 
 const (
@@ -50,6 +46,7 @@ const (
 	ScrapeTimeoutInMetadata         = "scrapeTimeout"
 )
 
+// Config is the parsed scaler metadata payload sent by KEDA for every request.
 type Config struct {
 	InferenceSetName      string
 	InferenceSetNamespace string
@@ -61,30 +58,33 @@ type Config struct {
 	Threshold             int64
 }
 
-// +kubebuilder:rbac:groups="kaito.sh",resources=inferencesets,verbs=get;list;watch
-// +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=list;watch
+// scrapeConfig projects the subset of Config needed by the metrics Scraper.
+func (c *Config) scrapeConfig() metrics.ScrapeConfig {
+	return metrics.ScrapeConfig{
+		Protocol: c.MetricProtocol,
+		Port:     c.MetricPort,
+		Path:     c.MetricPath,
+		Timeout:  c.ScrapeTimeout,
+	}
+}
 
+// KaitoScaler implements the KEDA external scaler gRPC contract on top of a
+// pluggable metrics.Scraper (which fetches raw per-service metrics) and a
+// metrics.Aggregator (which reduces them to the single value KEDA expects).
 type KaitoScaler struct {
-	kubeClient    client.Client
-	httpTransport *http.Transport
-	tlsTransport  *http.Transport
+	kubeClient client.Client
+	scraper    metrics.Scraper
+	aggregator metrics.Aggregator
 	externalscaler.UnimplementedExternalScalerServer
 }
 
-func NewKaitoScaler(kubeClient client.Client) *KaitoScaler {
+// NewKaitoScaler wires the Kubernetes client, the metrics scraper and the
+// aggregator that will be used to serve KEDA scaling requests.
+func NewKaitoScaler(kubeClient client.Client, scraper metrics.Scraper, aggregator metrics.Aggregator) *KaitoScaler {
 	return &KaitoScaler{
 		kubeClient: kubeClient,
-		httpTransport: &http.Transport{
-			MaxIdleConns:        20,
-			MaxIdleConnsPerHost: 5,
-			IdleConnTimeout:     30 * time.Second,
-		},
-		tlsTransport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:        20,
-			MaxIdleConnsPerHost: 5,
-			IdleConnTimeout:     30 * time.Second,
-		},
+		scraper:    scraper,
+		aggregator: aggregator,
 	}
 }
 
@@ -94,7 +94,6 @@ func (e *KaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledOb
 		return nil, err
 	}
 
-	// get the related workspace instance
 	inferenceSet := &kaitov1alpha1.InferenceSet{}
 	if err := e.kubeClient.Get(ctx, client.ObjectKey{
 		Namespace: scalerConfig.InferenceSetNamespace,
@@ -103,14 +102,11 @@ func (e *KaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledOb
 		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get InferenceSet(%s) in Namespace(%s): %v", scalerConfig.InferenceSetName, scalerConfig.InferenceSetNamespace, err))
 	}
 
-	// get InferenceSetConditionTypeInferenceStatus condition from inferenceSet.Status.Conditions
 	condition := metav1.Condition{}
-	if inferenceSet != nil {
-		for i := range inferenceSet.Status.Conditions {
-			if inferenceSet.Status.Conditions[i].Type == string(kaitov1alpha1.InferenceSetConditionTypeReady) {
-				condition = inferenceSet.Status.Conditions[i]
-				break
-			}
+	for i := range inferenceSet.Status.Conditions {
+		if inferenceSet.Status.Conditions[i].Type == string(kaitov1alpha1.InferenceSetConditionTypeReady) {
+			condition = inferenceSet.Status.Conditions[i]
+			break
 		}
 	}
 
@@ -152,54 +148,27 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get InferenceSet(%s) in Namespace(%s): %v", scalerConfig.InferenceSetName, scalerConfig.InferenceSetNamespace, err))
 	}
 
-	// get the related workspace instances
-	workspaceList, err := inferenceset.ListWorkspaces(ctx, inferenceSet, e.kubeClient)
+	// Take a per-call snapshot of metrics across every service belonging to this
+	// InferenceSet. The snapshot is produced by a pluggable metrics.Scraper so
+	// alternative sources (e.g. Pod direct-scraping, Prometheus queries) can be
+	// swapped in without touching the scaler protocol logic below.
+	snapshot, err := e.scraper.Scrape(ctx, inferenceSet, scalerConfig.scrapeConfig())
 	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to list workspaces: %v", err))
+		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to scrape metrics for InferenceSet %s/%s: %v", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, err))
 	}
-	wsNum := len(workspaceList.Items)
-	klog.V(6).Infof("total workspaces found: %d", wsNum)
+	klog.V(6).Infof("scraped snapshot for InferenceSet %s/%s with %d service(s)", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, len(snapshot.Services))
 
-	// get the metrics for the ready services and calculate the total metric value.
-	// at the same time, please count the number of services that metric can be collected.
-	var totalMetricValue float64
-	var serviceCount int
-	metricErrs := make([]error, wsNum)
-	for i := range workspaceList.Items {
-		workspace := &workspaceList.Items[i]
-		metricVal, err := e.getServiceMetric(workspace.Name, workspace.Namespace, scalerConfig)
-		if err != nil {
-			metricErrs[i] = err
-			klog.Errorf("failed to get metric from workspace %s/%s: %v", workspace.Namespace, workspace.Name, err)
-			continue
-		}
-		totalMetricValue += metricVal
-		serviceCount++
+	value, err := e.aggregator.Aggregate(snapshot, scalerConfig.MetricName, scalerConfig.Threshold)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
 	}
-
-	// if a metric cannot be resolved from a service, the average value will be calculated using the following rules to prevent flapping:
-	// in the scale-up direction: use 0 as the metric value for missing service.
-	// in the scale-down direction: use the metric threshold as the value for missing service.
-	if serviceCount == 0 {
-		if err := multierr.Combine(metricErrs...); err != nil {
-			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get service metrics: %v", err))
-		}
-		return nil, status.Error(codes.Internal, "no ready services found for the workspace")
-	} else if serviceCount != wsNum {
-		if totalMetricValue/float64(serviceCount) < float64(scalerConfig.Threshold) {
-			// scale-down direction
-			totalMetricValue += float64(scalerConfig.Threshold) * float64(wsNum-serviceCount)
-		}
-	}
-
-	averageMetricValue := totalMetricValue / float64(wsNum)
-	klog.V(4).Infof("calculated average metric value: %f, totalMetricValue: %f, wsNum: %d", averageMetricValue, totalMetricValue, wsNum)
+	klog.V(4).Infof("aggregated metric %q for InferenceSet %s/%s: %f", scalerConfig.MetricName, scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, value)
 
 	return &externalscaler.GetMetricsResponse{
 		MetricValues: []*externalscaler.MetricValue{
 			{
 				MetricName:       scalerConfig.MetricName,
-				MetricValueFloat: averageMetricValue,
+				MetricValueFloat: value,
 			},
 		},
 	}, nil
@@ -250,7 +219,6 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		return nil, status.Error(codes.InvalidArgument, "scrape timeout must be specified")
 	}
 
-	// convert scrapeTimeoutStr to time.Duration
 	scrapeTimeout, err := time.ParseDuration(scrapeTimeoutStr)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "scrape timeout must be a valid duration")
@@ -261,7 +229,6 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		return nil, status.Error(codes.InvalidArgument, "threshold must be specified")
 	}
 
-	// convert threshold to int64 number
 	threshold, err := strconv.ParseInt(thresholdStr, 10, 64)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "threshold must be a valid integer")
@@ -277,47 +244,4 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		ScrapeTimeout:         scrapeTimeout,
 		Threshold:             threshold,
 	}, nil
-}
-
-func (e *KaitoScaler) getServiceMetric(serviceName, serviceNamespace string, scalerConfig *Config) (float64, error) {
-	transport := e.httpTransport
-	if scalerConfig.MetricProtocol == "https" {
-		transport = e.tlsTransport
-	}
-
-	httpClient := &http.Client{
-		Transport: transport,
-		Timeout:   scalerConfig.ScrapeTimeout,
-	}
-
-	// NOTE: Kaito currently exposes the vLLM inference server (and its Prometheus
-	// /metrics endpoint) as plain HTTP on the workspace Service
-	// (spec.ports[name="http"], Port=80 -> TargetPort=PortInferenceServer=5000).
-	// The protocol is kept configurable via the ScaledObject metadata so that
-	// https can be used in the future if Kaito enables TLS on the inference server.
-	metricURL := fmt.Sprintf("%s://%s.%s.svc.cluster.local:%s%s", scalerConfig.MetricProtocol, serviceName, serviceNamespace, scalerConfig.MetricPort, scalerConfig.MetricPath)
-	klog.V(6).Infof("scraping metrics from service %s/%s: %s", serviceNamespace, serviceName, metricURL)
-	resp, err := httpClient.Get(metricURL)
-	if err != nil {
-		return 0, status.Error(codes.Internal, fmt.Sprintf("failed to get service metrics: %v", err))
-	}
-	defer resp.Body.Close()
-	klog.V(6).Infof("scraped metrics from service %s/%s: %s", serviceNamespace, serviceName, metricURL)
-
-	// scan the response line by line, and read the metricName
-	// format is `vllm:num_requests_waiting 50`
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, scalerConfig.MetricName) {
-			// extract the metric value
-			klog.V(2).Infof("found metric line from service %s/%s: %s", serviceNamespace, serviceName, line)
-			parts := strings.Split(line, " ")
-			if len(parts) == 2 {
-				return strconv.ParseFloat(parts[1], 64)
-			}
-		}
-	}
-
-	return 0, status.Error(codes.Internal, fmt.Sprintf("failed to resolve metric(%s) from service: %s/%s", scalerConfig.MetricName, serviceNamespace, serviceName))
 }
