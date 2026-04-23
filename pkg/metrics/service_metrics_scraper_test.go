@@ -68,7 +68,7 @@ func newTestServerURLBuilder(base string) func(protocol, name, namespace, port, 
 	}
 }
 
-func TestVLLMScraper_Scrape(t *testing.T) {
+func TestServiceMetricsScraper_Scrape(t *testing.T) {
 	// Test server returns valid prometheus text per workspace name. ws-fail returns 500.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/services/", func(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +121,7 @@ vllm:num_requests_waiting 5
 	// Unrelated workspace in same namespace to make sure label selector filters it out.
 	wsOther := newWorkspaceForIS("ws-other", ns, "some-other-is")
 
-	s := NewVLLMScraper(newScraperFakeClient(t, is, wsA, wsB, wsFail, wsOther))
+	s := NewServiceMetricsScraper(newScraperFakeClient(t, is, wsA, wsB, wsFail, wsOther))
 	s.urlBuilder = newTestServerURLBuilder(srv.URL)
 
 	cfg := ScrapeConfig{Protocol: "http", Port: "80", Path: "/metrics", Timeout: 2 * time.Second}
@@ -148,9 +148,9 @@ vllm:num_requests_waiting 5
 	assert.Nil(t, byName["ws-fail"].Metrics)
 }
 
-func TestVLLMScraper_Scrape_NoWorkspaces(t *testing.T) {
+func TestServiceMetricsScraper_Scrape_NoWorkspaces(t *testing.T) {
 	is := newInferenceSet("is1", "ns1")
-	s := NewVLLMScraper(newScraperFakeClient(t, is))
+	s := NewServiceMetricsScraper(newScraperFakeClient(t, is))
 	s.urlBuilder = newTestServerURLBuilder("http://unused")
 	snap, err := s.Scrape(context.Background(), is, ScrapeConfig{Protocol: "http", Port: "80", Path: "/metrics", Timeout: time.Second})
 	assert.NoError(t, err)

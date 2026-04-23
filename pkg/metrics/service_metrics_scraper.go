@@ -33,10 +33,10 @@ import (
 // +kubebuilder:rbac:groups="kaito.sh",resources=inferencesets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=list;watch
 
-// VLLMScraper scrapes the Prometheus /metrics endpoint exposed by the vLLM
-// inference server running behind each workspace Service. Services are
+// ServiceMetricsScraper scrapes the Prometheus /metrics endpoint exposed by
+// each workspace Service (e.g. the vLLM inference server). Services are
 // discovered via the Workspace objects owned by the InferenceSet.
-type VLLMScraper struct {
+type ServiceMetricsScraper struct {
 	kubeClient    client.Client
 	httpTransport *http.Transport
 	tlsTransport  *http.Transport
@@ -45,11 +45,11 @@ type VLLMScraper struct {
 	urlBuilder func(protocol, name, namespace, port, path string) string
 }
 
-// NewVLLMScraper constructs a VLLMScraper that reuses a small HTTP connection
-// pool for plain-text scraping and a separate one for https with
-// InsecureSkipVerify (matching the previous scaler behaviour).
-func NewVLLMScraper(kubeClient client.Client) *VLLMScraper {
-	return &VLLMScraper{
+// NewServiceMetricsScraper constructs a ServiceMetricsScraper that reuses a
+// small HTTP connection pool for plain-text scraping and a separate one for
+// https with InsecureSkipVerify (matching the previous scaler behaviour).
+func NewServiceMetricsScraper(kubeClient client.Client) *ServiceMetricsScraper {
+	return &ServiceMetricsScraper{
 		kubeClient: kubeClient,
 		httpTransport: &http.Transport{
 			MaxIdleConns:        20,
@@ -78,7 +78,7 @@ func defaultURLBuilder(protocol, name, namespace, port, path string) string {
 // its /metrics endpoint. A per-service error is recorded on the corresponding
 // ServiceMetrics entry; Scrape itself only returns an error when workspace
 // discovery fails.
-func (s *VLLMScraper) Scrape(ctx context.Context, is *kaitov1alpha1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error) {
+func (s *ServiceMetricsScraper) Scrape(ctx context.Context, is *kaitov1alpha1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error) {
 	workspaceList, err := inferenceset.ListWorkspaces(ctx, is, s.kubeClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list workspaces for InferenceSet %s/%s: %w", is.Namespace, is.Name, err)
@@ -108,7 +108,7 @@ func (s *VLLMScraper) Scrape(ctx context.Context, is *kaitov1alpha1.InferenceSet
 	return snap, nil
 }
 
-func (s *VLLMScraper) scrapeService(ctx context.Context, name, namespace string, cfg ScrapeConfig) (map[string]float64, error) {
+func (s *ServiceMetricsScraper) scrapeService(ctx context.Context, name, namespace string, cfg ScrapeConfig) (map[string]float64, error) {
 	transport := s.httpTransport
 	if cfg.Protocol == "https" {
 		transport = s.tlsTransport

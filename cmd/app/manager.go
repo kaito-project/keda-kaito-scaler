@@ -247,9 +247,9 @@ func startKaitoScalerServer(ctx context.Context, c client.Client, secretLister c
 
 	creds := credentials.NewTLS(tlsConfig)
 	grpcServer := grpc.NewServer(grpc.Creds(creds))
-	vllmScraper := metrics.NewVLLMScraper(c)
+	metricsScraper := metrics.NewServiceMetricsScraper(c)
 	averageAggregator := metrics.NewAverageAggregator()
-	externalscaler.RegisterExternalScalerServer(grpcServer, scaler.NewKaitoScaler(c, vllmScraper, averageAggregator))
+	externalscaler.RegisterExternalScalerServer(grpcServer, scaler.NewKaitoScaler(c, metricsScraper, averageAggregator))
 
 	go func() {
 		<-ctx.Done()
