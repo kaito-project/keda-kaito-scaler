@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -134,6 +135,9 @@ func (s *ServiceMetricsScraper) scrapeService(ctx context.Context, name, namespa
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Drain a bounded amount of the response body so that the underlying
+		// TCP/TLS connection can be reused by the transport keep-alive pool.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("unexpected status code %d from %s", resp.StatusCode, url)
 	}
 
