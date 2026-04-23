@@ -15,24 +15,18 @@ package app
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"time"
 
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
-	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 	"github.com/open-policy-agent/cert-controller/pkg/rotator"
 	"github.com/samber/lo"
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/informers"
@@ -41,14 +35,11 @@ import (
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/flowcontrol"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	runtimecache "sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -58,6 +49,7 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/injections"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/metrics"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/util/cert"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/profile"
 )
 
@@ -117,9 +109,12 @@ func NewKedaKaitoScalerCommand() *cobra.Command {
 func Run(opts *options.KedaKaitoScalerOptions) error {
 	ctx := ctrl.SetupSignalHandler()
 
-	//logging
-	logger := klog.NewKlogr()
-	log.SetLogger(logger)
+	// Unify logging: route controller-runtime logs through klog so every
+	// component (manager, runnables, cert rotator) shares the same pipeline.
+	// ctrl.NewManager picks up this global logger automatically when
+	// ctrl.Options.Logger is left unset.
+	log.SetLogger(klog.NewKlogr())
+	setupLog := ctrl.Log.WithName("setup")
 
 	// metrics server options
 	metricsServerOpts := metricsserver.Options{
@@ -135,44 +130,42 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 
 	// prepare rest config
 	cfg := ctrl.GetConfigOrDie()
-	cfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(float32(opts.KubeClientQPS), opts.KubeClientBurst)
+	// controller-runtime builds the default token-bucket rate limiter from
+	// rest.Config.QPS / Burst, replacing the now-deprecated
+	// flowcontrol.NewTokenBucketRateLimiter helper.
+	cfg.QPS = float32(opts.KubeClientQPS)
+	cfg.Burst = opts.KubeClientBurst
 	cfg.UserAgent = KedaKaitoScaler
 
 	// prepare webhook server secret lister
 	secretLister, err := prepareResourcesLister(ctx, cfg, opts.WorkingNamespace)
 	if err != nil {
+		setupLog.Error(err, "failed to prepare secret lister")
 		return err
 	}
 
 	// controller-runtime manager
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Metrics:                       metricsServerOpts,
-		HealthProbeBindAddress:        fmt.Sprintf(":%d", opts.HealthProbePort),
 		LeaderElection:                opts.LeaderElection.LeaderElect,
 		LeaderElectionID:              opts.LeaderElection.ResourceName,
 		LeaderElectionNamespace:       opts.WorkingNamespace,
 		LeaderElectionResourceLock:    opts.LeaderElection.ResourceLock,
 		LeaderElectionReleaseOnCancel: true,
-		Logger:                        logger,
 		Cache: runtimecache.Options{
 			DefaultTransform: runtimecache.TransformStripManagedFields(),
 		},
 	})
 	if err != nil {
-		logger.Error(err, "failed to new manager")
+		setupLog.Error(err, "failed to new manager")
 		return err
 	}
-
-	// endpoints for liveness and readiness
-	lo.Must0(mgr.AddHealthzCheck("healthz", healthz.Ping))
-	lo.Must0(mgr.AddReadyzCheck("readyz", healthz.Ping))
 
 	// add certificate controllers
 	serverCertReady := make(chan struct{})
 	clientCertReady := make(chan struct{})
-	err = addCertificateControllers(mgr, opts, serverCertReady, clientCertReady)
-	if err != nil {
-		logger.Error(err, "failed to add certificate controllers")
+	if err := addCertificateControllers(mgr, opts, serverCertReady, clientCertReady); err != nil {
+		setupLog.Error(err, "failed to add certificate controllers")
 		return err
 	}
 
@@ -182,13 +175,40 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		lo.Must0(c.Register(ctx, mgr))
 	}
 
-	// start the manager
-	go func() {
-		lo.Must0(mgr.Start(ctx))
-	}()
-	// start grpc server
-	lo.Must0(startKaitoScalerServer(ctx, mgr.GetClient(), secretLister, opts, serverCertReady, clientCertReady))
-	return nil
+	// register the KEDA external scaler gRPC server (mTLS) as a manager Runnable.
+	// The runnable waits for the mTLS certificates to be ready before it starts
+	// listening, so the manager alone drives the full lifecycle.
+	lo.Must0(mgr.Add(scaler.NewRunnable(scaler.ServerConfig{
+		Port:                 opts.GrpcPort,
+		Service:              scaler.NewKaitoScaler(mgr.GetClient(), metrics.NewServiceMetricsScraper(mgr.GetClient()), metrics.NewAverageAggregator()),
+		GetServerCertificate: cert.NewServerCertLoader(secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName, ServerCert, ServerKey),
+		LoadRootCAs:          cert.NewRootCAsLoader(secretLister, opts.WorkingNamespace, opts.ScalerClientSecretName, CACert),
+		ServerCertReady:      serverCertReady,
+		ClientCertReady:      clientCertReady,
+	})))
+
+	// Register a lightweight gRPC health server so kubelet / KEDA can probe
+	// liveness and readiness via grpc.health.v1.Health on a dedicated port.
+	// Readiness is gated on the mTLS material being available, so the Pod
+	// only enters the Service endpoints once KEDA can actually reach us.
+	health := scaler.NewHealthServer()
+	health.AddReadinessCheck("server-cert", scaler.ChannelReadinessCheck(serverCertReady))
+	health.AddReadinessCheck("client-cert", scaler.ChannelReadinessCheck(clientCertReady))
+	health.AddReadinessCheck("manager-cache", func(ctx context.Context) error {
+		// Bound the wait: kubelet gRPC probe has its own timeout, but we do
+		// not want Check() to hang on cold start either. 500ms is plenty once
+		// the cache has already synced — subsequent calls return immediately.
+		syncCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer cancel()
+		if mgr.GetCache().WaitForCacheSync(syncCtx) {
+			return nil
+		}
+		return errors.New("controller cache not synced")
+	})
+	lo.Must0(mgr.Add(scaler.HealthRunnable(opts.GrpcHealthPort, health)))
+
+	setupLog.Info("starting manager")
+	return mgr.Start(ctx)
 }
 
 func prepareResourcesLister(ctx context.Context, cfg *rest.Config, ns string) (corev1listers.SecretLister, error) {
@@ -209,59 +229,8 @@ func prepareResourcesLister(ctx context.Context, cfg *rest.Config, ns string) (c
 	return secretLister, nil
 }
 
-func startKaitoScalerServer(ctx context.Context, c client.Client, secretLister corev1listers.SecretLister, opts *options.KedaKaitoScalerOptions, serverCertReady, clientCertReady chan struct{}) error {
-	logger := log.FromContext(ctx).WithName("grpc-server")
-	addr := fmt.Sprintf("0.0.0.0:%d", opts.GrpcPort)
-
-	// Wait for server secret to be ready
-	logger.Info("waiting for server secret to be ready", "secret", opts.ScalerServerSecretName, "namespace", opts.WorkingNamespace)
-	<-serverCertReady
-
-	logger.Info("waiting for client secret to be ready", "secret", opts.ScalerClientSecretName, "namespace", opts.WorkingNamespace)
-	<-clientCertReady
-
-	logger.Info("secret is ready, starting TLS gRPC server", "address", addr)
-
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", addr, err)
-	}
-
-	// Create TLS credentials with dynamic certificate loading and root CAs
-	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return loadCertificateFromSecret(secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName)
-		},
-		ClientAuth: tls.RequireAndVerifyClientCert,
-	}
-
-	// Load root CAs from secret for client certificate verification
-	if rootCAs, err := loadRootCAsFromSecret(secretLister, opts.WorkingNamespace, opts.ScalerClientSecretName); err != nil {
-		logger.Info("failed to load root CAs, using system default", "error", err)
-		return err
-	} else if rootCAs != nil {
-		tlsConfig.ClientCAs = rootCAs
-		logger.Info("loaded root CAs from secret for TLS configuration")
-	}
-
-	creds := credentials.NewTLS(tlsConfig)
-	grpcServer := grpc.NewServer(grpc.Creds(creds))
-	metricsScraper := metrics.NewServiceMetricsScraper(c)
-	averageAggregator := metrics.NewAverageAggregator()
-	externalscaler.RegisterExternalScalerServer(grpcServer, scaler.NewKaitoScaler(c, metricsScraper, averageAggregator))
-
-	go func() {
-		<-ctx.Done()
-		logger.Info("shutting down gRPC server gracefully")
-		grpcServer.GracefulStop()
-	}()
-
-	logger.Info("TLS gRPC server is serving", "address", addr)
-	return grpcServer.Serve(lis)
-}
-
 func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScalerOptions, serverCertReady, clientCertReady chan struct{}) error {
+	log := mgr.GetLogger().WithName("cert-controllers")
 	dnsNames := []string{
 		fmt.Sprintf("%s.%s", opts.ScalerServiceName, opts.WorkingNamespace),
 		fmt.Sprintf("%s.%s.svc", opts.ScalerServiceName, opts.WorkingNamespace),
@@ -286,7 +255,7 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 		CertDir:               ClientCertDir,
 		IsReady:               clientCertReady,
 	}); err != nil {
-		klog.Errorf("failed to add cert controller for scaler client certificates, %v", err)
+		log.Error(err, "failed to add cert controller for scaler client certificates")
 		return err
 	}
 
@@ -309,64 +278,9 @@ func addCertificateControllers(mgr manager.Manager, opts *options.KedaKaitoScale
 		CertDir:               ServerCertDir,
 		IsReady:               serverCertReady,
 	}); err != nil {
-		klog.Errorf("failed to add cert controller for scaler server certificates, %v", err)
+		log.Error(err, "failed to add cert controller for scaler server certificates")
 		return err
 	}
 
 	return nil
-}
-
-// loadCertificateFromSecret loads the TLS certificate from the secret
-// If we return (nil, error), the client sees - 'tls: internal error'
-// If we return (nil, nil) the client sees - 'tls: no certificates configured'
-func loadCertificateFromSecret(secretLister corev1listers.SecretLister, namespace, secretName string) (*tls.Certificate, error) {
-	secret, err := secretLister.Secrets(namespace).Get(secretName)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, nil //nolint:nilerr
-		}
-		return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretName, err)
-	}
-
-	serverCert, ok := secret.Data[ServerCert]
-	if !ok {
-		return nil, fmt.Errorf("server certificate not found in secret %s/%s", namespace, secretName)
-	}
-
-	serverKey, ok := secret.Data[ServerKey]
-	if !ok {
-		return nil, fmt.Errorf("server key not found in secret %s/%s", namespace, secretName)
-	}
-
-	cert, err := tls.X509KeyPair(serverCert, serverKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create X509 key pair: %w", err)
-	}
-
-	return &cert, nil
-}
-
-// loadRootCAsFromSecret loads the root CA certificates from the secret
-func loadRootCAsFromSecret(secretLister corev1listers.SecretLister, namespace, secretName string) (*x509.CertPool, error) {
-	secret, err := secretLister.Secrets(namespace).Get(secretName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretName, err)
-	}
-
-	caCertData, ok := secret.Data[CACert]
-	if !ok {
-		return nil, fmt.Errorf("CA certificate not found in secret %s/%s", namespace, secretName)
-	}
-
-	if len(caCertData) == 0 {
-		return nil, fmt.Errorf("CA certificate is empty in secret %s/%s", namespace, secretName)
-	}
-
-	// Create a new certificate pool and add the CA certificate
-	caCertPool := x509.NewCertPool()
-	if !caCertPool.AppendCertsFromPEM(caCertData) {
-		return nil, fmt.Errorf("failed to parse CA certificate from secret %s/%s", namespace, secretName)
-	}
-
-	return caCertPool, nil
 }

@@ -14,7 +14,7 @@ image:
 ports:
   grpc: 10450
   metrics: 10451
-  healthProbe: 10453
+  grpcHealth: 10453
 
 resources:
   limits:

@@ -78,7 +78,7 @@ spec:
         - args:
             - --v={{ .Values.log.level }}
             - --metrics-port={{ .Values.ports.metrics }}
-            - --health-probe-port={{ .Values.ports.healthProbe }}
+            - --grpc-health-port={{ .Values.ports.grpcHealth }}
             - --working-namespace={{ .Release.Namespace }}
             {{- if .Values.certDuration }}
             - --cert-duration={{ .Values.certDuration }}
@@ -95,21 +95,21 @@ spec:
             - containerPort: {{ .Values.ports.metrics }}
               name: metrics
               protocol: TCP
-            - containerPort: {{ .Values.ports.healthProbe }}
-              name: health
+            - containerPort: {{ .Values.ports.grpcHealth }}
+              name: grpc-health
               protocol: TCP
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: {{ .Values.ports.healthProbe }}
+            grpc:
+              port: {{ .Values.ports.grpcHealth }}
+              service: liveness
             initialDelaySeconds: 30
             timeoutSeconds: 2
             periodSeconds: 10
             failureThreshold: 3
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: {{ .Values.ports.healthProbe }}
+            grpc:
+              port: {{ .Values.ports.grpcHealth }}
+              service: readiness
             initialDelaySeconds: 30
             timeoutSeconds: 2
             periodSeconds: 10
