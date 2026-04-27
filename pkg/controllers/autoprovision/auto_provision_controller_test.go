@@ -89,7 +89,7 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			triggers := getDefaultKedaKaitoScalerTriggers(tt.inferenceSetName, tt.inferenceSetNamespace, tt.scalerNamespace, tt.threshold)
+			triggers := getDefaultKedaKaitoScalerTriggers(tt.inferenceSetName, tt.inferenceSetNamespace, tt.scalerNamespace, tt.threshold, defaultMetricName)
 
 			// Check trigger count
 			assert.Equal(t, tt.expectedTriggerCount, len(triggers))
@@ -109,16 +109,17 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 
 				// Check metadata
 				assert.NotNil(t, trigger.Metadata)
-				assert.Equal(t, "keda-kaito-scaler", trigger.Metadata["scalerName"])
 				assert.Equal(t, tt.threshold, trigger.Metadata["threshold"])
 				assert.Equal(t, tt.inferenceSetName, trigger.Metadata[scaler.InferenceSetNameInMetadata])
 				assert.Equal(t, tt.inferenceSetNamespace, trigger.Metadata[scaler.InferenceSetNamespaceInMetadata])
 				assert.Equal(t, fmt.Sprintf("keda-kaito-scaler-svc.%s.svc.cluster.local:%d", tt.scalerNamespace, 10450), trigger.Metadata[scaler.ScalerAddressInMetadata])
 				assert.Equal(t, "vllm:num_requests_waiting", trigger.Metadata[scaler.MetricNameInMetadata])
-				assert.Equal(t, "http", trigger.Metadata[scaler.MetricProtocolInMetadata])
-				assert.Equal(t, "80", trigger.Metadata[scaler.MetricPortInMetadata])
-				assert.Equal(t, "/metrics", trigger.Metadata[scaler.MetricPathInMetadata])
-				assert.Equal(t, "5s", trigger.Metadata[scaler.ScrapeTimeoutInMetadata])
+				// Optional scrape settings (protocol/port/path/timeout) are intentionally
+				// omitted from the trigger metadata so the scaler can apply its defaults.
+				assert.NotContains(t, trigger.Metadata, scaler.MetricProtocolInMetadata)
+				assert.NotContains(t, trigger.Metadata, scaler.MetricPortInMetadata)
+				assert.NotContains(t, trigger.Metadata, scaler.MetricPathInMetadata)
+				assert.NotContains(t, trigger.Metadata, scaler.ScrapeTimeoutInMetadata)
 			}
 		})
 	}
@@ -130,23 +131,18 @@ func TestGetDefaultKedaKaitoScalerTriggers_MetadataKeys(t *testing.T) {
 	scalerNamespace := "kaito-workspace"
 	threshold := "10"
 
-	triggers := getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, threshold)
+	triggers := getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, threshold, defaultMetricName)
 
 	assert.Equal(t, 1, len(triggers))
 	trigger := triggers[0]
 
 	// Verify all expected metadata keys are present
 	expectedKeys := []string{
-		"scalerName",
 		"threshold",
 		scaler.InferenceSetNameInMetadata,
 		scaler.InferenceSetNamespaceInMetadata,
 		scaler.ScalerAddressInMetadata,
 		scaler.MetricNameInMetadata,
-		scaler.MetricProtocolInMetadata,
-		scaler.MetricPortInMetadata,
-		scaler.MetricPathInMetadata,
-		scaler.ScrapeTimeoutInMetadata,
 	}
 
 	for _, key := range expectedKeys {

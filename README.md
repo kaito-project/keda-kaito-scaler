@@ -66,23 +66,50 @@ keda-kaito-scaler/keda-kaito-scaler     0.0.1           v0.0.1        A Helm cha
 ```
 
 ```bash
-helm upgrade --install keda-kaito-scaler -n kaito-workspace keda-kaito-scaler/keda-kaito-scaler --create-namespace
+helm upgrade --install keda-kaito-scaler -n keda keda-kaito-scaler/keda-kaito-scaler
 ```
 
+> **keda-kaito-scaler must be installed in the same namespace as KEDA**
+> (`keda` in the command above). The chart's `ClusterTriggerAuthentication`
+> references TLS secrets created in the scaler's namespace, and KEDA only
+> resolves those secrets when it can read them from its own namespace.
+
 ### Create a Kaito InferenceSet for running inference workloads
- - The following example creates an InferenceSet for the phi-4-mini model, using annotations with the prefix `scaledobject.kaito.sh/` to supply parameter inputs for the KEDA Kaito Scaler:
-   - `scaledobject.kaito.sh/auto-provision`
-     - required, specifies whether KEDA Kaito Scaler will automatically provision a ScaledObject based on the `InferenceSet` object
-   - `scaledobject.kaito.sh/metricName`
-     - optional, specifies the metric name collected from the vLLM pod, which is used for monitoring and triggering the scaling operation, default is `vllm:num_requests_waiting`
-   - `scaledobject.kaito.sh/threshold`
-     - required, specifies the threshold for the monitored metric that triggers the scaling operation
-   - `scaledobject.kaito.sh/min-replicas`
-     - optional, specifies the minimum number of replicas for the ScaledObject. If not set or less than 1, it will be set to 1.
-   - `scaledobject.kaito.sh/max-replicas`
-     - optional, specifies the maximum number of replicas for the ScaledObject. When this annotation is not set, the value is computed from `spec.nodeCountLimit` when available.
-     - this annotation takes precedence when present: if set, it must have a value greater than `1`, otherwise the controller will not auto-provision a ScaledObject even when `spec.nodeCountLimit` is set. If the annotation is absent, auto-provisioning requires `spec.nodeCountLimit` to be set.
-     - when set, `max-replicas` must be greater than or equal to `min-replicas`; otherwise the controller will skip reconciling the InferenceSet and emit an `InvalidReplicaRange` warning event.
+
+You can drive autoscaling in two ways:
+
+1. **Auto-provision mode (recommended)** — annotate the `InferenceSet` and let
+   keda-kaito-scaler create and reconcile the `ScaledObject` for you.
+2. **Manual mode** — author the `ScaledObject` yourself and point its `external`
+   trigger at the keda-kaito-scaler service.
+
+Both modes share the same scaling semantics:
+
+- The trigger uses HPA `metricType: AverageValue`. The scaler returns the
+  **sum** of the metric across all `Workspace` services owned by the
+  `InferenceSet`, and `threshold` is the **per-replica** target (HPA computes
+  `desiredReplicas = ceil(sum / threshold)`).
+- Per-service scrape failures are compensated only on the scale-down path
+  (missing samples are treated as `threshold`), preventing flapping when a
+  single replica is briefly unreachable.
+- The default scraped metric is `vllm:num_requests_waiting`. Any Prometheus
+  metric exposed on the workspace `Service` works (use a metric family name
+  identical to what `/metrics` exposes).
+
+#### Option 1: Auto-provision via InferenceSet annotations
+
+Annotations under the `scaledobject.kaito.sh/` prefix configure the auto-provision
+controller. When `auto-provision=true` and the configuration is valid, the
+controller creates a `ScaledObject` named after the `InferenceSet` (and keeps
+it in sync on annotation updates).
+
+| Annotation | Required | Default | Description |
+|---|---|---|---|
+| `scaledobject.kaito.sh/auto-provision` | yes | – | Must be `"true"` to enable auto-provisioning. |
+| `scaledobject.kaito.sh/threshold` | yes | – | Per-replica target value passed to the trigger. Non-negative integer. |
+| `scaledobject.kaito.sh/metricName` | no | `vllm:num_requests_waiting` | Prometheus metric family name to scrape from each pod. |
+| `scaledobject.kaito.sh/min-replicas` | no | `1` | Minimum replica count. Values `<= 1` collapse to `1`. |
+| `scaledobject.kaito.sh/max-replicas` | no | derived from `spec.nodeCountLimit` | Maximum replica count. When set, must be `> 1` and `>= min-replicas`; otherwise the controller skips reconciling and emits an `InvalidReplicaRange` warning event. If absent, auto-provisioning requires `spec.nodeCountLimit` to be set. |
 
 ```bash
 cat <<EOF | kubectl apply -f -
@@ -111,19 +138,85 @@ spec:
 EOF
 ```
 
- - In just a few seconds, the KEDA Kaito Scaler will automatically create the `scaledobject` and `hpa` objects. After a few minutes, once the inference pod is running, the KEDA Kaito Scaler will begin scraping metric values from the inference pod, and the status of the `scaledobject` and `hpa` objects will be marked as ready.
+In a few seconds the auto-provision controller creates a managed `ScaledObject`,
+and KEDA in turn creates the HPA. Once the inference pods are up and serving
+metrics, both objects flip to `READY=True`:
 
 ```bash
 # kubectl get scaledobject
-NAME           SCALETARGETKIND                  SCALETARGETNAME   MIN   MAX   READY   ACTIVE    FALLBACK   PAUSED   TRIGGERS   AUTHENTICATIONS           AGE
-phi-4          kaito.sh/v1alpha1.InferenceSet   phi-4             1     5     True    True     False      False    external   keda-kaito-scaler-creds   10m
+NAME    SCALETARGETKIND                  SCALETARGETNAME   MIN   MAX   READY   ACTIVE   FALLBACK   PAUSED   TRIGGERS   AUTHENTICATIONS           AGE
+phi-4   kaito.sh/v1alpha1.InferenceSet   phi-4             1     5     True    True     False      False    external   keda-kaito-scaler-creds   10m
 
 # kubectl get hpa
-NAME                    REFERENCE                   TARGETS      MINPODS   MAXPODS   REPLICAS   AGE
-keda-hpa-phi-4          InferenceSet/phi-4          0/10 (avg)   1         5         1          11m
+NAME             REFERENCE            TARGETS      MINPODS   MAXPODS   REPLICAS   AGE
+keda-hpa-phi-4   InferenceSet/phi-4   0/10 (avg)   1         5         1          11m
 ```
 
-That's it! Your KAITO workloads will now automatically scale based on the number of waiting inference requests (`vllm:num_requests_waiting`).
+#### Option 2: Manage the ScaledObject yourself
+
+If you prefer to author the `ScaledObject` directly (e.g. to plug in custom
+scaling policies or additional triggers), point an `external` trigger at the
+keda-kaito-scaler service and reuse the chart-installed
+`ClusterTriggerAuthentication` for mTLS.
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: phi-4
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: kaito.sh/v1alpha1
+    kind: InferenceSet
+    name: phi-4
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  triggers:
+    - type: external
+      name: keda-kaito-scaler
+      metricType: AverageValue
+      authenticationRef:
+        kind: ClusterTriggerAuthentication
+        name: keda-kaito-scaler-creds
+      metadata:
+        # Required
+        scalerAddress: "keda-kaito-scaler-svc.keda.svc.cluster.local:10450"
+        inferenceSetName: phi-4
+        inferenceSetNamespace: default
+        metricName: "vllm:num_requests_waiting"
+        threshold: "10"
+
+        # Optional — defaults shown below match Kaito's current vLLM exposure
+        # (Workspace ClusterIP Service on port 80, plain HTTP). Override only
+        # if you have customized the inference server.
+        # metricProtocol: "http"     # http | https
+        # metricPort: "80"
+        # metricPath: "/metrics"
+        # scrapeTimeout: "3s"
+```
+
+The trigger metadata fields map 1:1 to the scaler's gRPC payload:
+
+| Field | Required | Default | Notes |
+|---|---|---|---|
+| `scalerAddress` | yes | – | Used by KEDA to dial the scaler. Format: `keda-kaito-scaler-svc.<scaler-namespace>.svc.cluster.local:10450`. |
+| `inferenceSetName` | yes | – | Target `InferenceSet` name. |
+| `inferenceSetNamespace` | yes | – | Target `InferenceSet` namespace. May differ from the `ScaledObject` namespace; a single keda-kaito-scaler instance serves all namespaces in the cluster. |
+| `metricName` | yes | – | Prometheus metric family name exposed by each workspace pod. |
+| `threshold` | yes | – | Per-replica target (float). HPA: `desired = ceil(sum / threshold)`. |
+| `metricProtocol` | no | `http` | `http` or `https`. |
+| `metricPort` | no | `80` | Workspace `Service` port. |
+| `metricPath` | no | `/metrics` | HTTP path of the Prometheus endpoint. |
+| `scrapeTimeout` | no | `3s` | Per-service scrape timeout (Go duration). |
+
+> **metricType must be `AverageValue`.** The scaler returns the cluster-wide
+> sum of the metric, so HPA divides by `threshold` (per-replica target) to get
+> the desired replica count. Using `Value` would couple desired replicas to the
+> current replica count and break scale-from/to-1 transitions.
+
+That's it! Your KAITO workloads will now automatically scale based on the
+configured metric (default: `vllm:num_requests_waiting`).
 
 ## Release Process
 

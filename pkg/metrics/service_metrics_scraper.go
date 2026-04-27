@@ -22,13 +22,14 @@ import (
 	"time"
 
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
-	"github.com/kaito-project/kaito/pkg/utils/inferenceset"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/kaito-project/keda-kaito-scaler/pkg/util/inferenceset"
 )
 
 // +kubebuilder:rbac:groups="kaito.sh",resources=inferencesets,verbs=get;list;watch
