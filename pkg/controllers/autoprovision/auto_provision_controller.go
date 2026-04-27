@@ -22,7 +22,6 @@ import (
 	"time"
 
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
-	"github.com/kaito-project/kaito/pkg/utils/inferenceset"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"golang.org/x/time/rate"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -45,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/util/inferenceset"
 )
 
 const (
@@ -52,12 +52,17 @@ const (
 	AnnotationKeyMinReplicas   = "scaledobject.kaito.sh/min-replicas"
 	AnnotationKeyMaxReplicas   = "scaledobject.kaito.sh/max-replicas"
 	AnnotationKeyThreshold     = "scaledobject.kaito.sh/threshold"
+	AnnotationKeyMetricName    = "scaledobject.kaito.sh/metricName"
 
 	AnnotationKeyManagedBy = "scaledobject.kaito.sh/managed-by"
 	InferenceSet           = "InferenceSet"
 
 	inferenceSetAPIVersion = "kaito.sh/v1alpha1"
 	requeueInterval        = 5 * time.Second
+
+	// defaultMetricName is the metric scraped from each vLLM inference pod when
+	// the user does not override it via the metricName annotation.
+	defaultMetricName = "vllm:num_requests_waiting"
 )
 
 // watchedAnnotations are the annotations whose changes should trigger a
@@ -67,6 +72,7 @@ var watchedAnnotations = []string{
 	AnnotationKeyMinReplicas,
 	AnnotationKeyMaxReplicas,
 	AnnotationKeyThreshold,
+	AnnotationKeyMetricName,
 }
 
 type Controller struct {
@@ -112,13 +118,14 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 		return reconcile.Result{}, nil
 	}
 	threshold := is.Annotations[AnnotationKeyThreshold]
+	metricName := resolveMetricName(is.Annotations)
 
 	managedScaledObjects, err := c.listManagedScaledObjects(ctx, is)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	return reconcile.Result{}, c.syncScaledObjects(ctx, is, managedScaledObjects, minReplicas, maxReplicas, threshold)
+	return reconcile.Result{}, c.syncScaledObjects(ctx, is, managedScaledObjects, minReplicas, maxReplicas, threshold, metricName)
 }
 
 // resolveMaxReplicas computes the max replicas for the ScaledObject. When
@@ -185,12 +192,12 @@ func (c *Controller) listManagedScaledObjects(ctx context.Context, is *kaitov1al
 
 // syncScaledObjects creates, updates, or deduplicates managed ScaledObjects so
 // that exactly one matches the desired spec.
-func (c *Controller) syncScaledObjects(ctx context.Context, is *kaitov1alpha1.InferenceSet, existing []v1alpha1.ScaledObject, minReplicas, maxReplicas int, threshold string) error {
+func (c *Controller) syncScaledObjects(ctx context.Context, is *kaitov1alpha1.InferenceSet, existing []v1alpha1.ScaledObject, minReplicas, maxReplicas int, threshold, metricName string) error {
 	switch len(existing) {
 	case 0:
-		return c.Create(ctx, c.buildScaledObject(is, minReplicas, maxReplicas, threshold))
+		return c.Create(ctx, c.buildScaledObject(is, minReplicas, maxReplicas, threshold, metricName))
 	case 1:
-		return c.updateScaledObject(ctx, is, &existing[0], minReplicas, maxReplicas, threshold)
+		return c.updateScaledObject(ctx, is, &existing[0], minReplicas, maxReplicas, threshold, metricName)
 	default:
 		// Keep the oldest one, delete the rest, then reconcile the kept one to
 		// the desired spec so it does not go stale after annotation changes.
@@ -202,11 +209,11 @@ func (c *Controller) syncScaledObjects(ctx context.Context, is *kaitov1alpha1.In
 				return err
 			}
 		}
-		return c.updateScaledObject(ctx, is, &existing[0], minReplicas, maxReplicas, threshold)
+		return c.updateScaledObject(ctx, is, &existing[0], minReplicas, maxReplicas, threshold, metricName)
 	}
 }
 
-func (c *Controller) buildScaledObject(is *kaitov1alpha1.InferenceSet, minReplicas, maxReplicas int, threshold string) *v1alpha1.ScaledObject {
+func (c *Controller) buildScaledObject(is *kaitov1alpha1.InferenceSet, minReplicas, maxReplicas int, threshold, metricName string) *v1alpha1.ScaledObject {
 	return &v1alpha1.ScaledObject{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      is.Name,
@@ -236,12 +243,12 @@ func (c *Controller) buildScaledObject(is *kaitov1alpha1.InferenceSet, minReplic
 			},
 			MinReplicaCount: ptr.To(int32(minReplicas)),
 			MaxReplicaCount: ptr.To(int32(maxReplicas)),
-			Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold),
+			Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold, metricName),
 		},
 	}
 }
 
-func (c *Controller) updateScaledObject(ctx context.Context, is *kaitov1alpha1.InferenceSet, so *v1alpha1.ScaledObject, minReplicas, maxReplicas int, threshold string) error {
+func (c *Controller) updateScaledObject(ctx context.Context, is *kaitov1alpha1.InferenceSet, so *v1alpha1.ScaledObject, minReplicas, maxReplicas int, threshold, metricName string) error {
 	updated := false
 
 	if so.Spec.MinReplicaCount == nil || *so.Spec.MinReplicaCount != int32(minReplicas) {
@@ -254,7 +261,7 @@ func (c *Controller) updateScaledObject(ctx context.Context, is *kaitov1alpha1.I
 	}
 	if len(so.Spec.Triggers) == 0 {
 		// Restore triggers if they were removed (e.g., manual edit drift).
-		so.Spec.Triggers = getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold)
+		so.Spec.Triggers = getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold, metricName)
 		updated = true
 	} else {
 		if so.Spec.Triggers[0].Metadata == nil {
@@ -262,6 +269,10 @@ func (c *Controller) updateScaledObject(ctx context.Context, is *kaitov1alpha1.I
 		}
 		if so.Spec.Triggers[0].Metadata["threshold"] != threshold {
 			so.Spec.Triggers[0].Metadata["threshold"] = threshold
+			updated = true
+		}
+		if so.Spec.Triggers[0].Metadata[scaler.MetricNameInMetadata] != metricName {
+			so.Spec.Triggers[0].Metadata[scaler.MetricNameInMetadata] = metricName
 			updated = true
 		}
 	}
@@ -316,6 +327,16 @@ func resolveMinReplicas(annotations map[string]string) int {
 		}
 	}
 	return 1
+}
+
+// resolveMetricName returns the metric name configured via the metricName
+// annotation on the InferenceSet, falling back to defaultMetricName when
+// the annotation is absent or empty.
+func resolveMetricName(annotations map[string]string) string {
+	if name, ok := annotations[AnnotationKeyMetricName]; ok && name != "" {
+		return name
+	}
+	return defaultMetricName
 }
 
 func enableAutoProvisioning(inferenceSet *kaitov1alpha1.InferenceSet) bool {
@@ -408,28 +429,21 @@ func getDefaultHorizontalPodAutoscalerConfig() *v1alpha1.HorizontalPodAutoscaler
 	}
 }
 
-func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, threshold string) []v1alpha1.ScaleTriggers {
+func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, threshold, metricName string) []v1alpha1.ScaleTriggers {
+	// metricProtocol/metricPort/metricPath/scrapeTimeout are intentionally
+	// omitted: the scaler-side parseScalerMetadata fills them with defaults
+	// matching Kaito's vLLM exposure (http on Service port 80, /metrics, 3s),
+	// so we only keep keys that the scaler cannot infer on its own.
 	return []v1alpha1.ScaleTriggers{
 		{
 			Type: "external",
 			Name: scaler.ScalerName,
 			Metadata: map[string]string{
-				"scalerName":                           scaler.ScalerName,
 				"threshold":                            threshold,
 				scaler.InferenceSetNameInMetadata:      inferenceSetName,
 				scaler.InferenceSetNamespaceInMetadata: inferenceSetNamespace,
 				scaler.ScalerAddressInMetadata:         fmt.Sprintf("keda-kaito-scaler-svc.%s.svc.cluster.local:%d", scalerNamespace, 10450),
-				scaler.MetricNameInMetadata:            "vllm:num_requests_waiting",
-				// Kaito creates a ClusterIP Service per workspace that exposes the
-				// vLLM inference server on spec.ports[name="http"] with Port=80 and
-				// TargetPort=consts.PortInferenceServer (5000). The server currently
-				// speaks plain HTTP (no TLS), so the scaler scrapes /metrics over
-				// http://<svc>:80. The protocol is kept configurable here so that
-				// https can be used in the future if Kaito enables TLS.
-				scaler.MetricProtocolInMetadata: "http",
-				scaler.MetricPortInMetadata:     "80",
-				scaler.MetricPathInMetadata:     "/metrics",
-				scaler.ScrapeTimeoutInMetadata:  "5s",
+				scaler.MetricNameInMetadata:            metricName,
 			},
 			AuthenticationRef: &v1alpha1.AuthenticationRef{
 				Name: "keda-kaito-scaler-creds",

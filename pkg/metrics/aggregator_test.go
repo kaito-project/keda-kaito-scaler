@@ -21,14 +21,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-func TestAverageAggregator_Aggregate(t *testing.T) {
-	agg := NewAverageAggregator()
+func TestSumAggregator_Aggregate(t *testing.T) {
+	agg := NewSumAggregator()
 
 	tests := []struct {
 		name       string
 		snapshot   *MetricSnapshot
 		metricName string
-		threshold  int64
+		threshold  float64
 		wantValue  float64
 		wantErr    bool
 	}{
@@ -46,7 +46,7 @@ func TestAverageAggregator_Aggregate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "average over all successful services",
+			name: "sum over all successful services",
 			snapshot: &MetricSnapshot{
 				Services: []ServiceMetrics{
 					{Name: "a", Metrics: map[string]float64{"m": 10}},
@@ -55,7 +55,7 @@ func TestAverageAggregator_Aggregate(t *testing.T) {
 			},
 			metricName: "m",
 			threshold:  5,
-			wantValue:  20,
+			wantValue:  40,
 		},
 		{
 			name: "scale-down missing service compensated with threshold",
@@ -67,8 +67,8 @@ func TestAverageAggregator_Aggregate(t *testing.T) {
 			},
 			metricName: "m",
 			threshold:  10,
-			// success avg=2 (< threshold 10 => scale-down). sum becomes 2+10=12, total=2 => 6
-			wantValue: 6,
+			// success avg=2 (< threshold 10 => scale-down). sum becomes 2+10=12.
+			wantValue: 12,
 		},
 		{
 			name: "scale-up missing service not compensated",
@@ -80,8 +80,8 @@ func TestAverageAggregator_Aggregate(t *testing.T) {
 			},
 			metricName: "m",
 			threshold:  10,
-			// success avg=20 (>= threshold 10 => scale-up). sum stays 20, total=2 => 10
-			wantValue: 10,
+			// success avg=20 (>= threshold 10 => scale-up). sum stays 20.
+			wantValue: 20,
 		},
 		{
 			name: "metric name missing on a service is treated as scrape failure",
@@ -93,8 +93,20 @@ func TestAverageAggregator_Aggregate(t *testing.T) {
 			},
 			metricName: "m",
 			threshold:  10,
-			// success count=1 avg=4 < threshold. sum=4+10=14, total=2 => 7
-			wantValue: 7,
+			// success count=1 avg=4 < threshold. sum=4+10=14.
+			wantValue: 14,
+		},
+		{
+			name: "negative aggregated value is clamped to zero",
+			snapshot: &MetricSnapshot{
+				Services: []ServiceMetrics{
+					{Name: "a", Metrics: map[string]float64{"m": -5}},
+					{Name: "b", Metrics: map[string]float64{"m": -3}},
+				},
+			},
+			metricName: "m",
+			threshold:  10,
+			wantValue:  0,
 		},
 		{
 			name: "all services failed returns error",
