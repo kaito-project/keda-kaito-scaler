@@ -34,7 +34,6 @@ const (
 	ScalerName = "keda-kaito-scaler"
 
 	// Metadata keys
-	ScalerNameKeyInMetadata         = "scalerName"
 	InferenceSetNameInMetadata      = "inferenceSetName"
 	InferenceSetNamespaceInMetadata = "inferenceSetNamespace"
 	ScalerAddressInMetadata         = "scalerAddress"
@@ -44,6 +43,15 @@ const (
 	MetricPortInMetadata            = "metricPort"
 	MetricPathInMetadata            = "metricPath"
 	ScrapeTimeoutInMetadata         = "scrapeTimeout"
+
+	// Defaults applied when the corresponding metadata key is omitted. Only
+	// inferenceSetName/inferenceSetNamespace/metricName/threshold remain
+	// mandatory; everything else falls back to a sensible value matching
+	// Kaito's current vLLM exposure conventions.
+	defaultMetricProtocol = "http"
+	defaultMetricPort     = "80"
+	defaultMetricPath     = "/metrics"
+	defaultScrapeTimeout  = 3 * time.Second
 )
 
 // Config is the parsed scaler metadata payload sent by KEDA for every request.
@@ -55,7 +63,7 @@ type Config struct {
 	MetricPort            string
 	MetricPath            string
 	ScrapeTimeout         time.Duration
-	Threshold             int64
+	Threshold             float64
 }
 
 // scrapeConfig projects the subset of Config needed by the metrics Scraper.
@@ -116,8 +124,12 @@ func (e *KaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledOb
 }
 
 func (e *KaitoScaler) StreamIsActive(sor *externalscaler.ScaledObjectRef, server externalscaler.ExternalScaler_StreamIsActiveServer) error {
-	// do nothing for stream mode
-	return nil
+	// keda-kaito-scaler does not support KEDA's external-push trigger. Returning
+	// Unimplemented immediately surfaces a misconfiguration to the user, instead
+	// of letting the KEDA push client get stuck in an infinite reconnect loop
+	// (which is what would happen if we returned nil – the client treats nil as
+	// io.EOF and keeps re-establishing the stream).
+	return status.Error(codes.Unimplemented, "keda-kaito-scaler does not support push mode; use the regular external trigger")
 }
 
 func (e *KaitoScaler) GetMetricSpec(_ context.Context, sor *externalscaler.ScaledObjectRef) (*externalscaler.GetMetricSpecResponse, error) {
@@ -129,7 +141,10 @@ func (e *KaitoScaler) GetMetricSpec(_ context.Context, sor *externalscaler.Scale
 	return &externalscaler.GetMetricSpecResponse{
 		MetricSpecs: []*externalscaler.MetricSpec{{
 			MetricName: scalerConfig.MetricName,
-			TargetSize: scalerConfig.Threshold,
+			// TargetSize (int64) is deprecated in the externalscaler proto in favor
+			// of TargetSizeFloat. Using the float field also lets users express
+			// sub-integer per-replica thresholds (e.g. 0.5 QPS).
+			TargetSizeFloat: scalerConfig.Threshold,
 		}},
 	}, nil
 }
@@ -175,63 +190,65 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 }
 
 func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string) (*Config, error) {
-	if scalerName, ok := sor.ScalerMetadata[ScalerNameKeyInMetadata]; !ok || scalerName != ScalerName {
-		return nil, status.Error(codes.InvalidArgument, "scaler name must be keda-kaito-scaler")
-	}
+	md := sor.ScalerMetadata
 
-	inferenceSetName, ok := sor.ScalerMetadata[InferenceSetNameInMetadata]
-	if !ok || inferenceSetName == "" {
+	// Mandatory: identifies the workload to scrape.
+	inferenceSetName := md[InferenceSetNameInMetadata]
+	if inferenceSetName == "" {
 		return nil, status.Error(codes.InvalidArgument, "inference set name must be specified")
 	}
-
-	inferenceSetNamespace, ok := sor.ScalerMetadata[InferenceSetNamespaceInMetadata]
-	if !ok || inferenceSetNamespace == "" {
+	inferenceSetNamespace := md[InferenceSetNamespaceInMetadata]
+	if inferenceSetNamespace == "" {
 		return nil, status.Error(codes.InvalidArgument, "inference set namespace must be specified")
 	}
 
+	// metricName: GetMetrics receives it via the gRPC request (after KEDA strips
+	// the sX- prefix); GetMetricSpec/IsActive pass "" and we fall back to
+	// metadata. Either way it must end up non-empty.
 	if metricName == "" {
-		name, ok := sor.ScalerMetadata[MetricNameInMetadata]
-		if !ok || name == "" {
-			return nil, status.Error(codes.InvalidArgument, "metric name must be specified")
-		}
-		metricName = name
+		metricName = md[MetricNameInMetadata]
+	}
+	if metricName == "" {
+		return nil, status.Error(codes.InvalidArgument, "metric name must be specified")
 	}
 
-	metricProtocol, ok := sor.ScalerMetadata[MetricProtocolInMetadata]
-	if !ok || metricProtocol == "" {
-		return nil, status.Error(codes.InvalidArgument, "metric protocol must be specified")
+	// Threshold is the per-replica target; required so users always make an
+	// explicit scaling decision.
+	thresholdStr := md[ThresholdInMetadata]
+	if thresholdStr == "" {
+		return nil, status.Error(codes.InvalidArgument, "threshold must be specified")
+	}
+	threshold, err := strconv.ParseFloat(thresholdStr, 64)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "threshold must be a valid number")
+	}
+
+	// Optional scrape settings: default to Kaito's current vLLM exposure
+	// (http on workspace Service port 80, /metrics, 3s timeout).
+	metricProtocol := md[MetricProtocolInMetadata]
+	if metricProtocol == "" {
+		metricProtocol = defaultMetricProtocol
 	} else if metricProtocol != "http" && metricProtocol != "https" {
 		return nil, status.Error(codes.InvalidArgument, "metric protocol must be either http or https")
 	}
 
-	metricPort, ok := sor.ScalerMetadata[MetricPortInMetadata]
-	if !ok || metricPort == "" {
-		return nil, status.Error(codes.InvalidArgument, "metric port must be specified")
+	metricPort := md[MetricPortInMetadata]
+	if metricPort == "" {
+		metricPort = defaultMetricPort
 	}
 
-	metricPath, ok := sor.ScalerMetadata[MetricPathInMetadata]
-	if !ok || metricPath == "" {
-		return nil, status.Error(codes.InvalidArgument, "metric path must be specified")
+	metricPath := md[MetricPathInMetadata]
+	if metricPath == "" {
+		metricPath = defaultMetricPath
 	}
 
-	scrapeTimeoutStr, ok := sor.ScalerMetadata[ScrapeTimeoutInMetadata]
-	if !ok || scrapeTimeoutStr == "" {
-		return nil, status.Error(codes.InvalidArgument, "scrape timeout must be specified")
-	}
-
-	scrapeTimeout, err := time.ParseDuration(scrapeTimeoutStr)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "scrape timeout must be a valid duration")
-	}
-
-	thresholdStr, ok := sor.ScalerMetadata[ThresholdInMetadata]
-	if !ok || thresholdStr == "" {
-		return nil, status.Error(codes.InvalidArgument, "threshold must be specified")
-	}
-
-	threshold, err := strconv.ParseInt(thresholdStr, 10, 64)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "threshold must be a valid integer")
+	scrapeTimeout := defaultScrapeTimeout
+	if s := md[ScrapeTimeoutInMetadata]; s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "scrape timeout must be a valid duration")
+		}
+		scrapeTimeout = d
 	}
 
 	return &Config{

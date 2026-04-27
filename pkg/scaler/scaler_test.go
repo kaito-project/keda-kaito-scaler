@@ -54,11 +54,11 @@ type stubAggregator struct {
 	err       error
 	gotMetric string
 	gotSnap   *metrics.MetricSnapshot
-	threshold int64
+	threshold float64
 	callCount int
 }
 
-func (a *stubAggregator) Aggregate(snap *metrics.MetricSnapshot, metricName string, threshold int64) (float64, error) {
+func (a *stubAggregator) Aggregate(snap *metrics.MetricSnapshot, metricName string, threshold float64) (float64, error) {
 	a.callCount++
 	a.gotSnap = snap
 	a.gotMetric = metricName
@@ -75,7 +75,6 @@ func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 
 func newValidScalerMetadata() map[string]string {
 	return map[string]string{
-		ScalerNameKeyInMetadata:         ScalerName,
 		InferenceSetNameInMetadata:      "is1",
 		InferenceSetNamespaceInMetadata: "ns1",
 		MetricNameInMetadata:            "vllm:num_requests_waiting",
@@ -124,8 +123,6 @@ func TestParseScalerMetadata(t *testing.T) {
 		wantErr    bool
 	}{
 		{name: "valid"},
-		{name: "missing scaler name", mutate: func(m map[string]string) { delete(m, ScalerNameKeyInMetadata) }, wantErr: true},
-		{name: "wrong scaler name", mutate: func(m map[string]string) { m[ScalerNameKeyInMetadata] = "other" }, wantErr: true},
 		{name: "missing inference set name", mutate: func(m map[string]string) { delete(m, InferenceSetNameInMetadata) }, wantErr: true},
 		{name: "missing inference set namespace", mutate: func(m map[string]string) { delete(m, InferenceSetNamespaceInMetadata) }, wantErr: true},
 		{name: "missing metric name", mutate: func(m map[string]string) { delete(m, MetricNameInMetadata) }, wantErr: true},
@@ -133,6 +130,12 @@ func TestParseScalerMetadata(t *testing.T) {
 		{name: "invalid timeout", mutate: func(m map[string]string) { m[ScrapeTimeoutInMetadata] = "abc" }, wantErr: true},
 		{name: "invalid threshold", mutate: func(m map[string]string) { m[ThresholdInMetadata] = "abc" }, wantErr: true},
 		{name: "metric name override", mutate: func(m map[string]string) { delete(m, MetricNameInMetadata) }, metricName: "override:metric"},
+		{name: "optional fields default when omitted", mutate: func(m map[string]string) {
+			delete(m, MetricProtocolInMetadata)
+			delete(m, MetricPortInMetadata)
+			delete(m, MetricPathInMetadata)
+			delete(m, ScrapeTimeoutInMetadata)
+		}},
 	}
 
 	for _, tt := range tests {
@@ -150,7 +153,7 @@ func TestParseScalerMetadata(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, "is1", cfg.InferenceSetName)
 			assert.Equal(t, "ns1", cfg.InferenceSetNamespace)
-			assert.Equal(t, int64(10), cfg.Threshold)
+			assert.Equal(t, float64(10), cfg.Threshold)
 			assert.Equal(t, 3*time.Second, cfg.ScrapeTimeout)
 			if tt.metricName != "" {
 				assert.Equal(t, tt.metricName, cfg.MetricName)
@@ -213,7 +216,7 @@ func TestKaitoScaler_GetMetricSpec(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, resp.MetricSpecs, 1)
 	assert.Equal(t, "vllm:num_requests_waiting", resp.MetricSpecs[0].MetricName)
-	assert.Equal(t, int64(10), resp.MetricSpecs[0].TargetSize)
+	assert.Equal(t, float64(10), resp.MetricSpecs[0].TargetSizeFloat)
 }
 
 func TestKaitoScaler_GetMetrics(t *testing.T) {
@@ -244,7 +247,7 @@ func TestKaitoScaler_GetMetrics(t *testing.T) {
 		assert.Equal(t, 3*time.Second, sc.gotCfg.Timeout)
 		assert.Equal(t, types.NamespacedName{Namespace: "ns1", Name: "is1"}, sc.gotIS)
 		assert.Equal(t, "vllm:num_requests_waiting", ag.gotMetric)
-		assert.Equal(t, int64(10), ag.threshold)
+		assert.Equal(t, float64(10), ag.threshold)
 		assert.Same(t, snap, ag.gotSnap)
 		assert.Equal(t, 1, ag.callCount)
 	})

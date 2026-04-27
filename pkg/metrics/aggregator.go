@@ -22,31 +22,44 @@ import (
 
 // Aggregator reduces the per-service values inside a MetricSnapshot to the
 // single metric value that KEDA consumes.
+//
+// The returned value is meant to be paired with HPA's "AverageValue" target
+// type, where the threshold passed by KEDA represents the per-replica desired
+// load. HPA then computes desiredReplicas = ceil(value / threshold), so the
+// aggregator must return the *total* (sum) load across all services.
 type Aggregator interface {
-	Aggregate(snapshot *MetricSnapshot, metricName string, threshold int64) (float64, error)
+	Aggregate(snapshot *MetricSnapshot, metricName string, threshold float64) (float64, error)
 }
 
-// AverageAggregator averages a metric across every service that belongs to an
+// SumAggregator sums a metric across every service that belongs to an
 // InferenceSet, compensating for services that could not be scraped in order
-// to avoid flapping:
+// to avoid flapping.
 //
-//   - scale-up direction (average of successful samples >= threshold): missing
+// Compensation strategy (mirrors how K8s HPA's ReplicaCalculator handles
+// missing pods for Pods/Resource metrics, which it does NOT do for External
+// metrics – so we do it ourselves):
+//
+//   - scale-up direction (avg of successful samples >= threshold): missing
 //     services contribute 0 (their absence must not prevent scale-up).
-//   - scale-down direction (average of successful samples < threshold): missing
+//   - scale-down direction (avg of successful samples <  threshold): missing
 //     services contribute the threshold value (their absence must not trigger
 //     further scale-down).
 //
 // If no service could be scraped successfully, the combined per-service errors
 // are returned.
-type AverageAggregator struct{}
+//
+// Negative aggregated values are clamped to 0; KEDA's external_scaler client
+// otherwise silently treats negative MetricValueFloat as 0 by falling back to
+// the deprecated int64 MetricValue, which would mask bugs in the scraper.
+type SumAggregator struct{}
 
-// NewAverageAggregator returns a ready-to-use AverageAggregator.
-func NewAverageAggregator() *AverageAggregator {
-	return &AverageAggregator{}
+// NewSumAggregator returns a ready-to-use SumAggregator.
+func NewSumAggregator() *SumAggregator {
+	return &SumAggregator{}
 }
 
 // Aggregate implements Aggregator.
-func (a *AverageAggregator) Aggregate(snapshot *MetricSnapshot, metricName string, threshold int64) (float64, error) {
+func (a *SumAggregator) Aggregate(snapshot *MetricSnapshot, metricName string, threshold float64) (float64, error) {
 	if snapshot == nil {
 		return 0, fmt.Errorf("metric snapshot is nil")
 	}
@@ -84,13 +97,17 @@ func (a *AverageAggregator) Aggregate(snapshot *MetricSnapshot, metricName strin
 	// Compensate for missing services only in the scale-down direction.
 	if successCount != total {
 		avgSuccess := sum / float64(successCount)
-		if avgSuccess < float64(threshold) {
-			sum += float64(threshold) * float64(total-successCount)
+		if avgSuccess < threshold {
+			sum += threshold * float64(total-successCount)
 		}
 	}
 
-	avg := sum / float64(total)
-	klog.V(4).Infof("aggregated metric %q for inferenceset %s: avg=%f sum=%f success=%d total=%d threshold=%d",
-		metricName, snapshot.InferenceSet, avg, sum, successCount, total, threshold)
-	return avg, nil
+	if sum < 0 {
+		klog.Warningf("aggregated metric %q for inferenceset %s is negative (%f); clamping to 0", metricName, snapshot.InferenceSet, sum)
+		sum = 0
+	}
+
+	klog.V(4).Infof("aggregated metric %q for inferenceset %s: sum=%f success=%d total=%d threshold=%f",
+		metricName, snapshot.InferenceSet, sum, successCount, total, threshold)
+	return sum, nil
 }
