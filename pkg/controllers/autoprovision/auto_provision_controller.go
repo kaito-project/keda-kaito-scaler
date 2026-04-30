@@ -63,6 +63,12 @@ const (
 	// defaultMetricName is the metric scraped from each vLLM inference pod when
 	// the user does not override it via the metricName annotation.
 	defaultMetricName = "vllm:num_requests_waiting"
+
+	// defaultPollingInterval is the interval (in seconds) at which KEDA polls
+	// the external scaler for metrics. Overrides KEDA's built-in default of 30s
+	// to give the autoscaler fresher signals for latency-sensitive inference
+	// workloads.
+	defaultPollingInterval = 15
 )
 
 // watchedAnnotations are the annotations whose changes should trigger a
@@ -241,6 +247,7 @@ func (c *Controller) buildScaledObject(is *kaitov1alpha1.InferenceSet, minReplic
 				APIVersion: inferenceSetAPIVersion,
 				Kind:       InferenceSet,
 			},
+			PollingInterval: ptr.To(int32(defaultPollingInterval)),
 			MinReplicaCount: ptr.To(int32(minReplicas)),
 			MaxReplicaCount: ptr.To(int32(maxReplicas)),
 			Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold, metricName),

@@ -396,3 +396,57 @@ func TestResolveMaxReplicas(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildScaledObject(t *testing.T) {
+	const (
+		inferenceSetName      = "test-is"
+		inferenceSetNamespace = "default"
+		scalerNamespace       = "kaito-workspace"
+		threshold             = "10"
+		minReplicas           = 2
+		maxReplicas           = 5
+	)
+
+	is := &kaitov1alpha1.InferenceSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      inferenceSetName,
+			Namespace: inferenceSetNamespace,
+			UID:       "test-uid",
+		},
+	}
+
+	ctrl := &Controller{ScalerNamespace: scalerNamespace}
+	so := ctrl.buildScaledObject(is, minReplicas, maxReplicas, threshold, defaultMetricName)
+
+	// Object meta
+	assert.Equal(t, inferenceSetName, so.Name)
+	assert.Equal(t, inferenceSetNamespace, so.Namespace)
+	assert.Equal(t, scaler.ScalerName, so.Annotations[AnnotationKeyManagedBy])
+	assert.Len(t, so.OwnerReferences, 1)
+	assert.Equal(t, InferenceSet, so.OwnerReferences[0].Kind)
+	assert.Equal(t, inferenceSetName, so.OwnerReferences[0].Name)
+
+	// PollingInterval defaults to 15s so KEDA polls the external scaler more
+	// frequently than its built-in 30s default.
+	assert.NotNil(t, so.Spec.PollingInterval)
+	assert.Equal(t, int32(defaultPollingInterval), *so.Spec.PollingInterval)
+	assert.Equal(t, int32(15), *so.Spec.PollingInterval)
+
+	// Replica bounds
+	assert.NotNil(t, so.Spec.MinReplicaCount)
+	assert.Equal(t, int32(minReplicas), *so.Spec.MinReplicaCount)
+	assert.NotNil(t, so.Spec.MaxReplicaCount)
+	assert.Equal(t, int32(maxReplicas), *so.Spec.MaxReplicaCount)
+
+	// Scale target
+	assert.NotNil(t, so.Spec.ScaleTargetRef)
+	assert.Equal(t, inferenceSetName, so.Spec.ScaleTargetRef.Name)
+	assert.Equal(t, InferenceSet, so.Spec.ScaleTargetRef.Kind)
+	assert.Equal(t, inferenceSetAPIVersion, so.Spec.ScaleTargetRef.APIVersion)
+
+	// Advanced HPA config and triggers wired in
+	assert.NotNil(t, so.Spec.Advanced)
+	assert.NotNil(t, so.Spec.Advanced.HorizontalPodAutoscalerConfig)
+	assert.Len(t, so.Spec.Triggers, 1)
+	assert.Equal(t, threshold, so.Spec.Triggers[0].Metadata["threshold"])
+}
