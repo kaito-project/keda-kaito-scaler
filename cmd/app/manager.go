@@ -27,8 +27,11 @@ import (
 	"github.com/open-policy-agent/cert-controller/pkg/rotator"
 	"github.com/samber/lo"
 	"github.com/spf13/cobra"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -137,6 +140,15 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	cfg.Burst = opts.KubeClientBurst
 	cfg.UserAgent = KedaKaitoScaler
 
+	// Verify required CRDs (ScaledObject, InferenceSet) are installed in the
+	// cluster before proceeding. Failing fast here avoids running with a
+	// partially-functional control plane and surfaces the misconfiguration
+	// clearly in the operator's logs.
+	if err := checkRequiredCRDs(cfg); err != nil {
+		setupLog.Error(err, "required CRDs are not installed")
+		return err
+	}
+
 	// prepare webhook server secret lister
 	secretLister, err := prepareResourcesLister(ctx, cfg, opts.WorkingNamespace)
 	if err != nil {
@@ -209,6 +221,45 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 
 	setupLog.Info("starting manager")
 	return mgr.Start(ctx)
+}
+
+// checkRequiredCRDs verifies that the CustomResourceDefinitions this scaler
+// depends on are installed in the cluster. It returns an error if any of the
+// required GroupVersionKinds cannot be discovered, so the process can fail
+// fast at startup instead of erroring out later at reconcile time.
+func checkRequiredCRDs(cfg *rest.Config) error {
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create discovery client: %w", err)
+	}
+
+	required := []schema.GroupVersionKind{
+		v1alpha1.GroupVersion.WithKind("ScaledObject"),
+		kaitov1alpha1.GroupVersion.WithKind("InferenceSet"),
+	}
+
+	for _, gvk := range required {
+		resources, err := discoveryClient.ServerResourcesForGroupVersion(gvk.GroupVersion().String())
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("required CRD %s is not installed in the cluster", gvk.String())
+			}
+			return fmt.Errorf("failed to discover resources for %s: %w", gvk.GroupVersion().String(), err)
+		}
+
+		found := false
+		for _, r := range resources.APIResources {
+			if r.Kind == gvk.Kind {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("required CRD %s is not installed in the cluster", gvk.String())
+		}
+	}
+
+	return nil
 }
 
 func prepareResourcesLister(ctx context.Context, cfg *rest.Config, ns string) (corev1listers.SecretLister, error) {

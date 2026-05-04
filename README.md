@@ -74,6 +74,12 @@ helm upgrade --install keda-kaito-scaler -n keda keda-kaito-scaler/keda-kaito-sc
 > references TLS secrets created in the scaler's namespace, and KEDA only
 > resolves those secrets when it can read them from its own namespace.
 
+> **Required CRDs.** keda-kaito-scaler verifies that the `ScaledObject`
+> (`keda.sh/v1alpha1`) and `InferenceSet` (`kaito.sh/v1alpha1`) CRDs are
+> installed in the cluster at startup and exits with an error if either is
+> missing. Make sure both KEDA and the KAITO `InferenceSet` controller (see
+> [Prerequisites](#prerequisites)) are installed before deploying the scaler.
+
 ### Create a Kaito InferenceSet for running inference workloads
 
 You can drive autoscaling in two ways:
