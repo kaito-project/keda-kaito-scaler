@@ -83,15 +83,19 @@ var watchedAnnotations = []string{
 
 type Controller struct {
 	client.Client
-	ScalerNamespace string
-	Recorder        record.EventRecorder
+	ScalerNamespace   string
+	ScalerServiceName string
+	ScalerGRPCPort    int
+	Recorder          record.EventRecorder
 }
 
-func NewAutoProvisionController(c client.Client, scalerNamespace string, recorder record.EventRecorder) *Controller {
+func NewAutoProvisionController(c client.Client, scalerNamespace, scalerServiceName string, scalerGRPCPort int, recorder record.EventRecorder) *Controller {
 	return &Controller{
-		Client:          c,
-		ScalerNamespace: scalerNamespace,
-		Recorder:        recorder,
+		Client:            c,
+		ScalerNamespace:   scalerNamespace,
+		ScalerServiceName: scalerServiceName,
+		ScalerGRPCPort:    scalerGRPCPort,
+		Recorder:          recorder,
 	}
 }
 
@@ -250,7 +254,7 @@ func (c *Controller) buildScaledObject(is *kaitov1alpha1.InferenceSet, minReplic
 			PollingInterval: ptr.To(int32(defaultPollingInterval)),
 			MinReplicaCount: ptr.To(int32(minReplicas)),
 			MaxReplicaCount: ptr.To(int32(maxReplicas)),
-			Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold, metricName),
+			Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, c.ScalerServiceName, c.ScalerGRPCPort, threshold, metricName),
 		},
 	}
 }
@@ -268,7 +272,7 @@ func (c *Controller) updateScaledObject(ctx context.Context, is *kaitov1alpha1.I
 	}
 	if len(so.Spec.Triggers) == 0 {
 		// Restore triggers if they were removed (e.g., manual edit drift).
-		so.Spec.Triggers = getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, threshold, metricName)
+		so.Spec.Triggers = getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, c.ScalerServiceName, c.ScalerGRPCPort, threshold, metricName)
 		updated = true
 	} else {
 		if so.Spec.Triggers[0].Metadata == nil {
@@ -436,7 +440,7 @@ func getDefaultHorizontalPodAutoscalerConfig() *v1alpha1.HorizontalPodAutoscaler
 	}
 }
 
-func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, threshold, metricName string) []v1alpha1.ScaleTriggers {
+func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, scalerServiceName string, scalerGRPCPort int, threshold, metricName string) []v1alpha1.ScaleTriggers {
 	// metricProtocol/metricPort/metricPath/scrapeTimeout are intentionally
 	// omitted: the scaler-side parseScalerMetadata fills them with defaults
 	// matching Kaito's vLLM exposure (http on Service port 80, /metrics, 3s),
@@ -449,12 +453,12 @@ func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, 
 				"threshold":                            threshold,
 				scaler.InferenceSetNameInMetadata:      inferenceSetName,
 				scaler.InferenceSetNamespaceInMetadata: inferenceSetNamespace,
-				scaler.ScalerAddressInMetadata:         fmt.Sprintf("keda-kaito-scaler-svc.%s.svc.cluster.local:%d", scalerNamespace, 10450),
+				scaler.ScalerAddressInMetadata:         fmt.Sprintf("%s.%s.svc.cluster.local:%d", scalerServiceName, scalerNamespace, scalerGRPCPort),
 				scaler.MetricNameInMetadata:            metricName,
 			},
 			AuthenticationRef: &v1alpha1.AuthenticationRef{
-				Name: "keda-kaito-scaler-creds",
-				Kind: "ClusterTriggerAuthentication",
+				Name: scaler.ClusterTriggerAuthName,
+				Kind: scaler.ClusterTriggerAuthKind,
 			},
 			MetricType: autoscalingv2.AverageValueMetricType,
 		},

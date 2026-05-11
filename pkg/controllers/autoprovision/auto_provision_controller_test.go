@@ -33,6 +33,10 @@ import (
 )
 
 func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
+	const (
+		testScalerServiceName = "keda-kaito-scaler-svc"
+		testScalerGRPCPort    = 10450
+	)
 	tests := []struct {
 		name                  string
 		inferenceSetName      string
@@ -56,8 +60,8 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 			expectedType:          "external",
 			expectedName:          "keda-kaito-scaler",
 			expectedMetricType:    autoscalingv2.AverageValueMetricType,
-			expectedAuthRefName:   "keda-kaito-scaler-creds",
-			expectedAuthRefKind:   "ClusterTriggerAuthentication",
+			expectedAuthRefName:   scaler.ClusterTriggerAuthName,
+			expectedAuthRefKind:   scaler.ClusterTriggerAuthKind,
 		},
 		{
 			name:                  "different threshold value",
@@ -69,8 +73,8 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 			expectedType:          "external",
 			expectedName:          "keda-kaito-scaler",
 			expectedMetricType:    autoscalingv2.AverageValueMetricType,
-			expectedAuthRefName:   "keda-kaito-scaler-creds",
-			expectedAuthRefKind:   "ClusterTriggerAuthentication",
+			expectedAuthRefName:   scaler.ClusterTriggerAuthName,
+			expectedAuthRefKind:   scaler.ClusterTriggerAuthKind,
 		},
 		{
 			name:                  "empty threshold",
@@ -82,14 +86,14 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 			expectedType:          "external",
 			expectedName:          "keda-kaito-scaler",
 			expectedMetricType:    autoscalingv2.AverageValueMetricType,
-			expectedAuthRefName:   "keda-kaito-scaler-creds",
-			expectedAuthRefKind:   "ClusterTriggerAuthentication",
+			expectedAuthRefName:   scaler.ClusterTriggerAuthName,
+			expectedAuthRefKind:   scaler.ClusterTriggerAuthKind,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			triggers := getDefaultKedaKaitoScalerTriggers(tt.inferenceSetName, tt.inferenceSetNamespace, tt.scalerNamespace, tt.threshold, defaultMetricName)
+			triggers := getDefaultKedaKaitoScalerTriggers(tt.inferenceSetName, tt.inferenceSetNamespace, tt.scalerNamespace, testScalerServiceName, testScalerGRPCPort, tt.threshold, defaultMetricName)
 
 			// Check trigger count
 			assert.Equal(t, tt.expectedTriggerCount, len(triggers))
@@ -112,7 +116,7 @@ func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
 				assert.Equal(t, tt.threshold, trigger.Metadata["threshold"])
 				assert.Equal(t, tt.inferenceSetName, trigger.Metadata[scaler.InferenceSetNameInMetadata])
 				assert.Equal(t, tt.inferenceSetNamespace, trigger.Metadata[scaler.InferenceSetNamespaceInMetadata])
-				assert.Equal(t, fmt.Sprintf("keda-kaito-scaler-svc.%s.svc.cluster.local:%d", tt.scalerNamespace, 10450), trigger.Metadata[scaler.ScalerAddressInMetadata])
+				assert.Equal(t, fmt.Sprintf("%s.%s.svc.cluster.local:%d", testScalerServiceName, tt.scalerNamespace, testScalerGRPCPort), trigger.Metadata[scaler.ScalerAddressInMetadata])
 				assert.Equal(t, "vllm:num_requests_waiting", trigger.Metadata[scaler.MetricNameInMetadata])
 				// Optional scrape settings (protocol/port/path/timeout) are intentionally
 				// omitted from the trigger metadata so the scaler can apply its defaults.
@@ -131,7 +135,7 @@ func TestGetDefaultKedaKaitoScalerTriggers_MetadataKeys(t *testing.T) {
 	scalerNamespace := "kaito-workspace"
 	threshold := "10"
 
-	triggers := getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, threshold, defaultMetricName)
+	triggers := getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, "keda-kaito-scaler-svc", 10450, threshold, defaultMetricName)
 
 	assert.Equal(t, 1, len(triggers))
 	trigger := triggers[0]

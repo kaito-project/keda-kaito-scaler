@@ -33,6 +33,17 @@ import (
 const (
 	ScalerName = "keda-kaito-scaler"
 
+	// ClusterTriggerAuthName is the name of the cluster-scoped
+	// ClusterTriggerAuthentication created/managed by keda-kaito-scaler so
+	// KEDA can load the mTLS credentials of the external scaler. It is
+	// referenced by both the bootstrap code that creates the resource and
+	// by the autoprovision controller when wiring up ScaledObject triggers.
+	ClusterTriggerAuthName = "keda-kaito-scaler-creds"
+
+	// ClusterTriggerAuthKind is the KEDA kind name used in
+	// ScaledObject.spec.triggers[*].authenticationRef.kind.
+	ClusterTriggerAuthKind = "ClusterTriggerAuthentication"
+
 	// Metadata keys
 	InferenceSetNameInMetadata      = "inferenceSetName"
 	InferenceSetNamespaceInMetadata = "inferenceSetNamespace"

@@ -23,10 +23,11 @@ import (
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;patch;update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=list;watch;get;update
+// +kubebuilder:rbac:groups="keda.sh",resources=clustertriggerauthentications,verbs=get;create;update;patch
 
-func NewControllers(mgr manager.Manager, scalerNamespace string) []controller.Controller {
+func NewControllers(mgr manager.Manager, scalerNamespace, scalerServiceName string, scalerGRPCPort int) []controller.Controller {
 	return []controller.Controller{
-		autoprovision.NewAutoProvisionController(mgr.GetClient(), scalerNamespace, mgr.GetEventRecorderFor("keda-kaito-scaler")),
+		autoprovision.NewAutoProvisionController(mgr.GetClient(), scalerNamespace, scalerServiceName, scalerGRPCPort, mgr.GetEventRecorderFor("keda-kaito-scaler")),
 		// add controllers here
 	}
 }
