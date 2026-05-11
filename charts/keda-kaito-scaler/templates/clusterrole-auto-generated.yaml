@@ -51,6 +51,15 @@ rules:
 - apiGroups:
   - keda.sh
   resources:
+  - clustertriggerauthentications
+  verbs:
+  - create
+  - get
+  - patch
+  - update
+- apiGroups:
+  - keda.sh
+  resources:
   - scaledobjects
   verbs:
   - create

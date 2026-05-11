@@ -42,11 +42,11 @@ func NewKedaKaitoScalerOptions() *KedaKaitoScalerOptions {
 	return &KedaKaitoScalerOptions{
 		Version:         false,
 		GrpcPort:        10450,
-		MetricsPort:     10452,
-		GrpcHealthPort:  10453,
+		MetricsPort:     10451,
+		GrpcHealthPort:  10452,
 		EnableProfiling: true,
 		LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
-			LeaderElect:       true,
+			LeaderElect:       false,
 			ResourceLock:      resourcelock.LeasesResourceLock,
 			ResourceName:      "keda-kaito-scaler",
 			ResourceNamespace: "kaito-workspace",

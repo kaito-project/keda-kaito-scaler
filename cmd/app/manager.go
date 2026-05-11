@@ -28,9 +28,11 @@ import (
 	"github.com/samber/lo"
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -43,6 +45,8 @@ import (
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	runtimecache "sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -140,12 +144,20 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	cfg.Burst = opts.KubeClientBurst
 	cfg.UserAgent = KedaKaitoScaler
 
-	// Verify required CRDs (ScaledObject, InferenceSet) are installed in the
-	// cluster before proceeding. Failing fast here avoids running with a
-	// partially-functional control plane and surfaces the misconfiguration
-	// clearly in the operator's logs.
-	if err := checkRequiredCRDs(cfg); err != nil {
-		setupLog.Error(err, "required CRDs are not installed")
+	// Wait for all required CRDs (Kaito InferenceSet + KEDA ScaledObject and
+	// ClusterTriggerAuthentication) to be installed in the cluster. This
+	// decouples the install order from KEDA / Kaito: keda-kaito-scaler can
+	// be deployed before or after either of them.
+	if err := waitForRequiredCRDs(ctx, cfg); err != nil {
+		setupLog.Error(err, "failed waiting for required CRDs")
+		return err
+	}
+
+	// Create / update the ClusterTriggerAuthentication resource the scaler
+	// relies on for mTLS credentials. Owning it in code (instead of in the
+	// Helm chart) removes the chart-level ordering constraint with KEDA.
+	if err := ensureClusterTriggerAuthentication(ctx, cfg, opts); err != nil {
+		setupLog.Error(err, "failed to ensure ClusterTriggerAuthentication")
 		return err
 	}
 
@@ -182,7 +194,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	}
 
 	// initialize controllers
-	controllers := controllers.NewControllers(mgr, opts.WorkingNamespace)
+	controllers := controllers.NewControllers(mgr, opts.WorkingNamespace, opts.ScalerServiceName, opts.GrpcPort)
 	for _, c := range controllers {
 		lo.Must0(c.Register(ctx, mgr))
 	}
@@ -223,42 +235,88 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	return mgr.Start(ctx)
 }
 
-// checkRequiredCRDs verifies that the CustomResourceDefinitions this scaler
-// depends on are installed in the cluster. It returns an error if any of the
-// required GroupVersionKinds cannot be discovered, so the process can fail
-// fast at startup instead of erroring out later at reconcile time.
-func checkRequiredCRDs(cfg *rest.Config) error {
+// waitForRequiredCRDs polls the API server until all CustomResourceDefinitions
+// this scaler relies on (Kaito InferenceSet, KEDA ScaledObject and
+// ClusterTriggerAuthentication) are installed. Polling — instead of failing
+// fast — lets keda-kaito-scaler be deployed in any order relative to KEDA
+// and the Kaito CRDs.
+func waitForRequiredCRDs(ctx context.Context, cfg *rest.Config) error {
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create discovery client: %w", err)
 	}
 
 	required := []schema.GroupVersionKind{
-		v1alpha1.GroupVersion.WithKind("ScaledObject"),
 		kaitov1alpha1.GroupVersion.WithKind("InferenceSet"),
+		v1alpha1.GroupVersion.WithKind("ScaledObject"),
+		v1alpha1.GroupVersion.WithKind("ClusterTriggerAuthentication"),
 	}
 
-	for _, gvk := range required {
-		resources, err := discoveryClient.ServerResourcesForGroupVersion(gvk.GroupVersion().String())
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return fmt.Errorf("required CRD %s is not installed in the cluster", gvk.String())
+	logger := ctrl.Log.WithName("crd-wait")
+	return wait.PollUntilContextCancel(ctx, 5*time.Second, true, func(_ context.Context) (bool, error) {
+		missing := make([]string, 0, len(required))
+		for _, gvk := range required {
+			found, err := crdRegistered(discoveryClient, gvk)
+			if err != nil {
+				logger.V(2).Info("failed to query CRD; will retry", "gvk", gvk.String(), "err", err.Error())
+				return false, nil
 			}
-			return fmt.Errorf("failed to discover resources for %s: %w", gvk.GroupVersion().String(), err)
+			if !found {
+				missing = append(missing, gvk.String())
+			}
 		}
+		if len(missing) == 0 {
+			return true, nil
+		}
+		logger.Info("waiting for required CRDs to be installed", "missing", missing)
+		return false, nil
+	})
+}
 
-		found := false
-		for _, r := range resources.APIResources {
-			if r.Kind == gvk.Kind {
-				found = true
-				break
-			}
+// crdRegistered returns true when the given GroupVersionKind is discoverable
+// in the cluster (i.e. its CRD has been installed).
+func crdRegistered(dc discovery.DiscoveryInterface, gvk schema.GroupVersionKind) (bool, error) {
+	resources, err := dc.ServerResourcesForGroupVersion(gvk.GroupVersion().String())
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
 		}
-		if !found {
-			return fmt.Errorf("required CRD %s is not installed in the cluster", gvk.String())
+		return false, err
+	}
+	for _, r := range resources.APIResources {
+		if r.Kind == gvk.Kind {
+			return true, nil
 		}
 	}
+	return false, nil
+}
 
+// ensureClusterTriggerAuthentication creates or updates the cluster-scoped
+// ClusterTriggerAuthentication resource that KEDA uses to load the mTLS
+// credentials when querying the external scaler.
+func ensureClusterTriggerAuthentication(ctx context.Context, cfg *rest.Config, opts *options.KedaKaitoScalerOptions) error {
+	c, err := client.New(cfg, client.Options{Scheme: scheme.Scheme})
+	if err != nil {
+		return fmt.Errorf("failed to create client for ClusterTriggerAuthentication: %w", err)
+	}
+
+	cta := &v1alpha1.ClusterTriggerAuthentication{
+		ObjectMeta: metav1.ObjectMeta{Name: scaler.ClusterTriggerAuthName},
+	}
+	op, err := controllerutil.CreateOrUpdate(ctx, c, cta, func() error {
+		cta.Spec = v1alpha1.TriggerAuthenticationSpec{
+			SecretTargetRef: []v1alpha1.AuthSecretTargetRef{
+				{Parameter: "caCert", Name: opts.ScalerServerSecretName, Key: CACert},
+				{Parameter: "tlsClientCert", Name: opts.ScalerClientSecretName, Key: ClientCert},
+				{Parameter: "tlsClientKey", Name: opts.ScalerClientSecretName, Key: ClientKey},
+			},
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create/update ClusterTriggerAuthentication %q: %w", scaler.ClusterTriggerAuthName, err)
+	}
+	ctrl.Log.WithName("cluster-trigger-auth").Info("ensured ClusterTriggerAuthentication", "name", scaler.ClusterTriggerAuthName, "operation", op)
 	return nil
 }
 
