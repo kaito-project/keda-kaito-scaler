@@ -57,6 +57,10 @@ func NewKedaKaitoScalerOptions() *KedaKaitoScalerOptions {
 		ScalerClientSecretName: "keda-kaito-scaler-client-certs",
 		ScalerServerSecretName: "keda-kaito-scaler-server-certs",
 		ScalerServiceName:      "keda-kaito-scaler-svc",
+		// ExpirationDuration controls the validity period of the server / client
+		// leaf certificates managed by cert-controller. Default to 5 years; the
+		// rotator renews 90 days before expiry.
+		ExpirationDuration: 5 * 365 * 24 * time.Hour,
 	}
 }
 

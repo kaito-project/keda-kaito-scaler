@@ -2,7 +2,7 @@ log:
   level: 5
 
 replicaCount: 1
-certDuration: 26280h
+certDuration: 43800h
 nameOverrider: ""
 
 image:
