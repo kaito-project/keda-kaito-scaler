@@ -20,9 +20,13 @@ import (
 	"testing"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/stretchr/testify/assert"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -82,7 +86,6 @@ func TestResolveMinReplicas(t *testing.T) {
 func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
-	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
 	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 }
@@ -204,26 +207,26 @@ func compositeAnnotations() map[string]string {
 	return map[string]string{
 		AnnotationKeyAutoProvision:              "true",
 		AnnotationKeyMaxReplicas:                "5",
-		"scaledobject.kaito.sh/metricName/0":    "inference_pool_per_pod_queue_size",
+		"scaledobject.kaito.sh/metricName/0":    "vllm:num_requests_waiting",
 		"scaledobject.kaito.sh/upthreshold/0":   "10",
 		"scaledobject.kaito.sh/downthreshold/0": "2",
-		"scaledobject.kaito.sh/metricName/1":    "inference_objective_request_duration_seconds",
+		"scaledobject.kaito.sh/metricName/1":    "vllm:request_queue_time_seconds",
 		"scaledobject.kaito.sh/upthreshold/1":   "1.5",
 		"scaledobject.kaito.sh/downthreshold/1": "0.5",
 	}
 }
 
-func TestEnableAutoProvisioning_Composite(t *testing.T) {
+func TestAutoscalingConfigValid_Composite(t *testing.T) {
 	t.Run("valid composite enabled", func(t *testing.T) {
 		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: compositeAnnotations()}}
-		assert.True(t, enableAutoProvisioning(is))
+		assert.True(t, autoscalingConfigValid(is))
 	})
 
 	t.Run("invalid composite disabled", func(t *testing.T) {
 		ann := compositeAnnotations()
 		ann["scaledobject.kaito.sh/metricName/0"] = "bogus"
 		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}
-		assert.False(t, enableAutoProvisioning(is))
+		assert.False(t, autoscalingConfigValid(is))
 	})
 
 	t.Run("single metric mode still uses scaledobject schema", func(t *testing.T) {
@@ -233,7 +236,7 @@ func TestEnableAutoProvisioning_Composite(t *testing.T) {
 			scaledobject.AnnotationKeyThreshold:  "10",
 			scaledobject.AnnotationKeyMetricName: "vllm:num_requests_waiting",
 		}}}
-		assert.True(t, enableAutoProvisioning(is))
+		assert.True(t, autoscalingConfigValid(is))
 	})
 }
 
@@ -251,4 +254,104 @@ func TestAnnotationsWithPrefixChanged(t *testing.T) {
 	// Changing a non-prefixed key is ignored.
 	unrelated := map[string]string{"scaledobject.kaito.sh/metricName/0": "queue", "other": "y"}
 	assert.False(t, annotationsWithPrefixChanged(old, unrelated, annotationPrefix))
+}
+
+func newReconcileFakeClient(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
+	assert.NoError(t, v1alpha1.AddToScheme(scheme))
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+}
+
+func newManagedScaledObject(name string, is *kaitov1beta1.InferenceSet) *v1alpha1.ScaledObject {
+	return &v1alpha1.ScaledObject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: is.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "kaito.sh/v1beta1",
+					Kind:       scaledobject.InferenceSet,
+					Name:       is.Name,
+					UID:        is.UID,
+					Controller: ptr.To(true),
+				},
+			},
+		},
+		Spec: v1alpha1.ScaledObjectSpec{
+			ScaleTargetRef: &v1alpha1.ScaleTarget{Name: is.Name, Kind: scaledobject.InferenceSet},
+		},
+	}
+}
+
+// TestReconcile_CleanupWhenAutoProvisionDisabled verifies that toggling the
+// auto-provision annotation to a non-"true" value deletes the ScaledObject the
+// controller previously provisioned, while leaving user-managed ScaledObjects
+// untouched.
+func TestReconcile_CleanupWhenAutoProvisionDisabled(t *testing.T) {
+	const (
+		isName = "test-is"
+		ns     = "default"
+	)
+
+	newDisabledIS := func() *kaitov1beta1.InferenceSet {
+		return &kaitov1beta1.InferenceSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        isName,
+				Namespace:   ns,
+				UID:         types.UID("is-uid"),
+				Annotations: map[string]string{AnnotationKeyAutoProvision: "false"},
+			},
+		}
+	}
+
+	t.Run("deletes managed ScaledObject when auto-provision is false", func(t *testing.T) {
+		is := newDisabledIS()
+		so := newManagedScaledObject("test-is-so", is)
+		c := newReconcileFakeClient(t, is, so)
+		ctrl := &Controller{Client: c}
+
+		_, err := ctrl.Reconcile(context.Background(), is)
+		assert.NoError(t, err)
+
+		var got v1alpha1.ScaledObject
+		err = c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "test-is-so"}, &got)
+		assert.True(t, apierrors.IsNotFound(err), "managed ScaledObject should be deleted")
+	})
+
+	t.Run("deletes managed ScaledObject when annotation is absent", func(t *testing.T) {
+		is := newDisabledIS()
+		is.Annotations = nil
+		so := newManagedScaledObject("test-is-so", is)
+		c := newReconcileFakeClient(t, is, so)
+		ctrl := &Controller{Client: c}
+
+		_, err := ctrl.Reconcile(context.Background(), is)
+		assert.NoError(t, err)
+
+		var got v1alpha1.ScaledObject
+		err = c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "test-is-so"}, &got)
+		assert.True(t, apierrors.IsNotFound(err), "managed ScaledObject should be deleted")
+	})
+
+	t.Run("preserves ScaledObject not owned by the InferenceSet", func(t *testing.T) {
+		is := newDisabledIS()
+		// Hand-created ScaledObject with no controller owner reference: not managed.
+		so := &v1alpha1.ScaledObject{
+			ObjectMeta: metav1.ObjectMeta{Name: "user-so", Namespace: ns},
+			Spec: v1alpha1.ScaledObjectSpec{
+				ScaleTargetRef: &v1alpha1.ScaleTarget{Name: isName, Kind: scaledobject.InferenceSet},
+			},
+		}
+		c := newReconcileFakeClient(t, is, so)
+		ctrl := &Controller{Client: c}
+
+		_, err := ctrl.Reconcile(context.Background(), is)
+		assert.NoError(t, err)
+
+		var got v1alpha1.ScaledObject
+		err = c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "user-so"}, &got)
+		assert.NoError(t, err, "user-managed ScaledObject should be preserved")
+	})
 }

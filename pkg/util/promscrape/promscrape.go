@@ -12,9 +12,9 @@
 // limitations under the License.
 
 // Package promscrape holds the HTTP scraping and Prometheus text-format parsing
-// helpers shared by the concrete scrapers (service metrics and EPP). Keeping the
-// transport pooling, request/parse boilerplate, URL construction and scalar
-// extraction here avoids duplicating them across scraper implementations.
+// helpers shared by the concrete scrapers. Keeping the transport pooling,
+// request/parse boilerplate, URL construction and scalar extraction here avoids
+// duplicating them across scraper implementations.
 package promscrape
 
 import (

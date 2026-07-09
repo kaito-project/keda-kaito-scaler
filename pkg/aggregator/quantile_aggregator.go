@@ -14,8 +14,11 @@
 package aggregator
 
 import (
+	"fmt"
 	"math"
 	"sort"
+
+	"go.uber.org/multierr"
 
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scraper"
 )
@@ -42,8 +45,11 @@ func NewQuantileAggregator(quantile float64) *QuantileAggregator {
 
 // Aggregate merges metricName's histogram buckets across all services and
 // returns the interpolated quantile. The threshold argument is unused (kept to
-// satisfy the Aggregator interface). Returns 0 when no histogram data or no
-// observations are available.
+// satisfy the Aggregator interface). Returns 0 when at least one service was
+// scraped successfully but exposes no histogram observations (e.g. cold start /
+// no traffic). Returns an error when services exist but every one of them failed
+// to scrape, so a total outage is reported as unknown rather than as "no
+// latency pressure" (which could otherwise trigger a spurious scale-down).
 func (a *QuantileAggregator) Aggregate(snapshot *scraper.MetricSnapshot, metricName string, _ float64) (float64, error) {
 	if snapshot == nil {
 		return 0, nil
@@ -52,10 +58,19 @@ func (a *QuantileAggregator) Aggregate(snapshot *scraper.MetricSnapshot, metricN
 	// Merge cumulative bucket counts across services by upper bound.
 	bucketCounts := make(map[float64]uint64)
 	var totalCount uint64
-	found := false
+	var (
+		found        bool
+		successCount int
+		errs         []error
+	)
 	for i := range snapshot.Services {
 		svc := &snapshot.Services[i]
-		if svc.Err != nil || svc.Histograms == nil {
+		if svc.Err != nil {
+			errs = append(errs, fmt.Errorf("service %s/%s: %w", svc.Namespace, svc.Name, svc.Err))
+			continue
+		}
+		successCount++
+		if svc.Histograms == nil {
 			continue
 		}
 		h, ok := svc.Histograms[metricName]
@@ -66,6 +81,14 @@ func (a *QuantileAggregator) Aggregate(snapshot *scraper.MetricSnapshot, metricN
 		for _, b := range h.Buckets {
 			bucketCounts[b.Le] += b.CumulativeCount
 		}
+	}
+
+	// Every service that exists failed to scrape: this is unknown, not zero.
+	if len(snapshot.Services) > 0 && successCount == 0 {
+		if combined := multierr.Combine(errs...); combined != nil {
+			return 0, fmt.Errorf("failed to resolve metric %q for inferenceset %s: %w", metricName, snapshot.InferenceSet, combined)
+		}
+		return 0, fmt.Errorf("failed to resolve metric %q for inferenceset %s", metricName, snapshot.InferenceSet)
 	}
 
 	if !found || len(bucketCounts) == 0 {

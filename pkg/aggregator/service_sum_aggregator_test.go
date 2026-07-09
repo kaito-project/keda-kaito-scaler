@@ -86,7 +86,7 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 			wantValue: 20,
 		},
 		{
-			name: "metric name missing on a service is treated as scrape failure",
+			name: "metric name missing on a scraped service counts as zero",
 			snapshot: &scraper.MetricSnapshot{
 				Services: []scraper.ServiceMetrics{
 					{Name: "a", Metrics: map[string]float64{"m": 4}},
@@ -95,8 +95,9 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 			},
 			metricName: "m",
 			threshold:  10,
-			// success count=1 avg=4 < threshold. sum=4+10=14.
-			wantValue: 14,
+			// Both services scraped OK; "b" lacks "m" so it contributes 0 and still
+			// counts as a real replica. successCount=2=total => no compensation.
+			wantValue: 4,
 		},
 		{
 			name: "negative aggregated value is clamped to zero",

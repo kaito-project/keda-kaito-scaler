@@ -37,7 +37,6 @@ func newScraperFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
-	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 }
 

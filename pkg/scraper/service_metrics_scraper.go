@@ -71,22 +71,24 @@ func (s *ServiceMetricsScraper) Scrape(ctx context.Context, is *kaitov1beta1.Inf
 	klog.V(6).Infof("scraping %d workspace service(s) for InferenceSet %s/%s", len(workspaceList.Items), is.Namespace, is.Name)
 	for i := range workspaceList.Items {
 		ws := &workspaceList.Items[i]
-		m, scrapeErr := s.scrapeService(ctx, ws.Name, ws.Namespace, cfg)
+		sm := ServiceMetrics{Name: ws.Name, Namespace: ws.Namespace}
+		metricsMap, histograms, scrapeErr := s.scrapeService(ctx, ws.Name, ws.Namespace, cfg)
 		if scrapeErr != nil {
 			klog.Errorf("failed to scrape metrics from service %s/%s: %v", ws.Namespace, ws.Name, scrapeErr)
+			sm.Err = scrapeErr
+		} else {
+			sm.Metrics = metricsMap
+			sm.Histograms = histograms
 		}
-		snap.Services = append(snap.Services, ServiceMetrics{
-			Name:      ws.Name,
-			Namespace: ws.Namespace,
-			Metrics:   m,
-			Err:       scrapeErr,
-		})
+		snap.Services = append(snap.Services, sm)
 	}
 
 	return snap, nil
 }
 
-func (s *ServiceMetricsScraper) scrapeService(ctx context.Context, name, namespace string, cfg ScrapeConfig) (map[string]float64, error) {
+// scrapeService fetches and parses the /metrics endpoint of a single workspace
+// Service, returning summed scalars and merged histograms.
+func (s *ServiceMetricsScraper) scrapeService(ctx context.Context, name, namespace string, cfg ScrapeConfig) (map[string]float64, map[string]Histogram, error) {
 	httpClient := s.transports.ClientFor(cfg.Protocol, cfg.Timeout)
 
 	url := s.urlBuilder(cfg.Protocol, name, namespace, cfg.Port, cfg.Path)
@@ -94,24 +96,9 @@ func (s *ServiceMetricsScraper) scrapeService(ctx context.Context, name, namespa
 
 	families, err := promscrape.FetchMetricFamilies(ctx, httpClient, url)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	result := make(map[string]float64, len(families))
-	for familyName, mf := range families {
-		var sum float64
-		var found bool
-		for _, m := range mf.GetMetric() {
-			v, ok := promscrape.ExtractScalarValue(m)
-			if !ok {
-				continue
-			}
-			sum += v
-			found = true
-		}
-		if found {
-			result[familyName] = sum
-		}
-	}
-	return result, nil
+	metricsMap, histograms := parseFamilies(families)
+	return metricsMap, histograms, nil
 }

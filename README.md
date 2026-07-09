@@ -94,7 +94,7 @@ helm upgrade --install keda-kaito-scaler -n keda keda-kaito-scaler/keda-kaito-sc
 You can drive autoscaling in three ways:
 
 1. **Composite multi-metric auto-provision (recommended)** — annotate the
-   `InferenceSet` with several signals (queue length, latency, waiting requests)
+   `InferenceSet` with several signals (waiting-queue length and queue latency)
    and let keda-kaito-scaler combine them under a conservative AND policy. See
    [Composite multi-metric auto-provision](#option-1-composite-multi-metric-auto-provision-recommended).
 2. **Single-metric auto-provision** — annotate the `InferenceSet` with one
@@ -119,7 +119,7 @@ The single-metric and manual approaches share the same scaling semantics:
 #### Option 1: Composite multi-metric auto-provision (recommended)
 
 For production inference workloads we **recommend combining several signals**
-(queue length, latency, waiting requests) so the autoscaler only reacts when
+(waiting-queue length and queue latency) so the autoscaler only reacts when
 multiple indicators agree. Adding the indexed `metricName/0` annotation switches
 the `InferenceSet` into **composite mode**: keda-kaito-scaler builds a
 `ScaledObject` whose KEDA `scalingModifiers` formula applies a conservative
@@ -132,9 +132,25 @@ Composite metrics are drawn from a fixed catalog:
 
 | `metricName/{i}` | Source | Aggregation | Meaning |
 | --- | --- | --- | --- |
-| `inference_pool_per_pod_queue_size` | EPP | per-pod average (float) | Average in-flight queue length per serving pod. |
-| `inference_objective_request_duration_seconds` | EPP | histogram quantile | End-to-end request latency at the configured quantile (default p95). |
-| `vllm:num_requests_waiting` | workspace `Service` | sum | vLLM waiting-queue length summed across pods. |
+| `vllm:num_requests_waiting` | workspace `Service` | per-replica average | vLLM waiting-queue length averaged across pods (replica-count independent). |
+| `vllm:request_queue_time_seconds` | workspace `Service` | histogram quantile | Time requests spend in the WAITING (queue) phase at the configured quantile (default p95), computed across pods (replica-count independent). |
+
+> **Why these aggregations?** Composite triggers use HPA `metricType: Value`:
+> the scaler feeds each metric's raw value into the KEDA `scalingModifiers`
+> formula, and the formula output drives the ±1-replica decision. Because the
+> formula compares every metric against a *fixed* threshold, each composite
+> metric must be **replica-count independent** — `vllm:num_requests_waiting`
+> is therefore averaged per replica and `vllm:request_queue_time_seconds` is a
+> per-pod quantile. This differs from single-metric mode, which uses
+> `AverageValue` (a cluster-wide **sum** that HPA divides by the replica count).
+>
+> **Cold-start / missing metrics.** A pod that is scraped successfully but has
+> not yet produced a gauge metric (e.g. no traffic during warm-up) contributes
+> `0` rather than an error, so a fresh fleet reads as "no pressure" instead of
+> blocking the whole formula. A pod that cannot be scraped at all is treated as
+> *unknown* and skipped; only when **every** pod fails to scrape does the metric
+> surface an error, which makes HPA hold the current replica count rather than
+> scale on stale data.
 
 Each metric is configured by a group of `/{i}`-indexed annotations; global
 behaviour is tuned by the un-indexed composite annotations:
@@ -144,7 +160,7 @@ behaviour is tuned by the un-indexed composite annotations:
 | `scaledobject.kaito.sh/metricName/{i}` | yes | – | Catalog metric for slot `i`. Presence of `metricName/0` enables composite mode. |
 | `scaledobject.kaito.sh/upthreshold/{i}` | yes | – | Scale-up threshold for metric `i` (float). |
 | `scaledobject.kaito.sh/downthreshold/{i}` | yes | – | Scale-down threshold for metric `i` (float). Must be `<= upthreshold/{i}`. |
-| `scaledobject.kaito.sh/quantile/{i}` | no | `0.95` | Target quantile for `inference_objective_request_duration_seconds`; must be in `(0, 1]`. Ignored by other metrics. |
+| `scaledobject.kaito.sh/quantile/{i}` | no | `0.95` | Target quantile for `vllm:request_queue_time_seconds`; must be in `(0, 1]`. Ignored by other metrics. |
 | `scaledobject.kaito.sh/combinepolicy` | no | `AND` | How per-metric conditions are combined. Only `AND` is currently supported. |
 | `scaledobject.kaito.sh/evaluationwindow` | no | `60` | Scale-up stabilization window (seconds). |
 | `scaledobject.kaito.sh/scaleupcooldown` | no | `300` | Minimum seconds between scale-up steps. |
@@ -162,13 +178,13 @@ metadata:
   annotations:
     scaledobject.kaito.sh/auto-provision: "true"
 
-    # Metric 0: per-pod queue length (EPP, float average)
-    scaledobject.kaito.sh/metricName/0: "inference_pool_per_pod_queue_size"
+    # Metric 0: vLLM waiting-queue length (workspace Service, per-replica average)
+    scaledobject.kaito.sh/metricName/0: "vllm:num_requests_waiting"
     scaledobject.kaito.sh/upthreshold/0: "5"
     scaledobject.kaito.sh/downthreshold/0: "1"
 
-    # Metric 1: p95 end-to-end request latency (EPP, histogram quantile)
-    scaledobject.kaito.sh/metricName/1: "inference_objective_request_duration_seconds"
+    # Metric 1: p95 request queue time (workspace Service, histogram quantile)
+    scaledobject.kaito.sh/metricName/1: "vllm:request_queue_time_seconds"
     scaledobject.kaito.sh/upthreshold/1: "2.0"
     scaledobject.kaito.sh/downthreshold/1: "0.5"
     scaledobject.kaito.sh/quantile/1: "0.95"
@@ -197,10 +213,10 @@ EOF
 ```
 
 With this configuration the `InferenceSet` scales up by one replica only when the
-per-pod queue **and** p95 latency **and** vLLM waiting queue are all above their
-up-thresholds, and scales down by one replica only when all three are below their
-down-thresholds — a deliberately conservative policy well suited to expensive GPU
-capacity.
+**per-replica waiting-queue length** *and* the **p95 request queue time** are both
+above their up-thresholds (and newly added pods are ready), and scales down by one
+replica only when both are below their down-thresholds — a deliberately
+conservative policy well suited to expensive GPU capacity.
 
 #### Option 2: Single-metric auto-provision
 

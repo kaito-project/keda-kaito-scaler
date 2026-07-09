@@ -199,7 +199,7 @@ func TestGetDefaultHorizontalPodAutoscalerConfig(t *testing.T) {
 	scaleDownPolicy := scaleDown.Policies[0]
 	assert.Equal(t, autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy), scaleDownPolicy.Type)
 	assert.Equal(t, int32(1), scaleDownPolicy.Value)
-	assert.Equal(t, int32(600), scaleDownPolicy.PeriodSeconds)
+	assert.Equal(t, int32(300), scaleDownPolicy.PeriodSeconds)
 
 	// Check ScaleDown tolerance
 	assert.NotNil(t, scaleDown.Tolerance)
@@ -283,10 +283,10 @@ func TestBuildScaledObject(t *testing.T) {
 
 func compositeAnnotations() map[string]string {
 	return map[string]string{
-		compositeIndexedKey(AnnotationKeyMetricName, 0): "inference_pool_per_pod_queue_size",
+		compositeIndexedKey(AnnotationKeyMetricName, 0): "vllm:num_requests_waiting",
 		"scaledobject.kaito.sh/upthreshold/0":           "10",
 		"scaledobject.kaito.sh/downthreshold/0":         "2",
-		compositeIndexedKey(AnnotationKeyMetricName, 1): "inference_objective_request_duration_seconds",
+		compositeIndexedKey(AnnotationKeyMetricName, 1): "vllm:request_queue_time_seconds",
 		"scaledobject.kaito.sh/upthreshold/1":           "1.5",
 		"scaledobject.kaito.sh/downthreshold/1":         "0.5",
 	}
@@ -303,12 +303,12 @@ func TestParseCompositeConfig(t *testing.T) {
 		cfg, err := parseCompositeConfig(compositeAnnotations())
 		assert.NoError(t, err)
 		assert.Len(t, cfg.metrics, 2)
-		assert.Equal(t, "inference_pool_per_pod_queue_size", cfg.metrics[0].key)
-		assert.Equal(t, "epp", cfg.metrics[0].entry.source)
-		assert.Equal(t, "perpod-avg", cfg.metrics[0].entry.aggregation)
+		assert.Equal(t, "vllm:num_requests_waiting", cfg.metrics[0].key)
+		assert.Equal(t, "service", cfg.metrics[0].entry.source)
+		assert.Equal(t, "service-avg", cfg.metrics[0].entry.aggregation)
 		assert.Equal(t, "10", cfg.metrics[0].upThreshold)
 		assert.Equal(t, "2", cfg.metrics[0].downThreshold)
-		assert.Equal(t, "inference_objective_request_duration_seconds", cfg.metrics[1].key)
+		assert.Equal(t, "vllm:request_queue_time_seconds", cfg.metrics[1].key)
 		assert.Equal(t, "quantile", cfg.metrics[1].entry.aggregation)
 		// Quantile defaults to p95 for quantile-aggregated metrics.
 		assert.Equal(t, "0.95", cfg.metrics[1].quantile)
@@ -375,7 +375,7 @@ func TestBuildCompositeFormula(t *testing.T) {
 	cfg, err := parseCompositeConfig(compositeAnnotations())
 	assert.NoError(t, err)
 	got := buildCompositeFormula(cfg)
-	want := "(readiness_gate == 0 && inference_pool_per_pod_queue_size > 10 && inference_objective_request_duration_seconds > 1.5) ? 2.0 : ((inference_pool_per_pod_queue_size < 2 && inference_objective_request_duration_seconds < 0.5) ? 0.5 : 1.0)"
+	want := "(readiness_gate == 0 && vllm_num_requests_waiting > 10 && vllm_request_queue_time_seconds > 1.5) ? 2.0 : ((vllm_num_requests_waiting < 2 && vllm_request_queue_time_seconds < 0.5) ? 0.5 : 1.0)"
 	assert.Equal(t, want, got)
 }
 
@@ -396,18 +396,18 @@ func TestBuildCompositeScaledObject(t *testing.T) {
 
 	// One trigger per metric plus the readiness gate.
 	assert.Len(t, so.Spec.Triggers, 3)
-	assert.Equal(t, "inference_pool_per_pod_queue_size", so.Spec.Triggers[0].Name)
-	assert.Equal(t, "inference_objective_request_duration_seconds", so.Spec.Triggers[1].Name)
+	assert.Equal(t, "vllm_num_requests_waiting", so.Spec.Triggers[0].Name)
+	assert.Equal(t, "vllm_request_queue_time_seconds", so.Spec.Triggers[1].Name)
 	assert.Equal(t, "readiness_gate", so.Spec.Triggers[2].Name)
 
-	// metric_0 -> queue via EPP + perpod-avg.
+	// metric_0 -> vllm:num_requests_waiting via service + service-avg.
 	m0 := so.Spec.Triggers[0].Metadata
-	assert.Equal(t, "epp", m0[scaler.MetricSourceInMetadata])
-	assert.Equal(t, "perpod-avg", m0[scaler.AggregationInMetadata])
-	assert.Equal(t, "inference_pool_per_pod_queue_size", m0[scaler.MetricNameInMetadata])
+	assert.Equal(t, "service", m0[scaler.MetricSourceInMetadata])
+	assert.Equal(t, "service-avg", m0[scaler.AggregationInMetadata])
+	assert.Equal(t, "vllm:num_requests_waiting", m0[scaler.MetricNameInMetadata])
 	assert.Equal(t, "1", m0["threshold"])
 
-	// metric_1 -> latency via EPP + quantile, carrying the default p95 quantile.
+	// metric_1 -> vllm:request_queue_time_seconds via service + quantile, carrying the default p95 quantile.
 	m1 := so.Spec.Triggers[1].Metadata
 	assert.Equal(t, "quantile", m1[scaler.AggregationInMetadata])
 	assert.Equal(t, "0.95", m1[scaler.QuantileInMetadata])

@@ -25,13 +25,6 @@ rules:
   - update
   - watch
 - apiGroups:
-  - ""
-  resources:
-  - services
-  verbs:
-  - list
-  - watch
-- apiGroups:
   - coordination.k8s.io
   resources:
   - leases

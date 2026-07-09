@@ -14,6 +14,7 @@
 package aggregator
 
 import (
+	"errors"
 	"math"
 	"testing"
 
@@ -82,6 +83,18 @@ func TestQuantileAggregator(t *testing.T) {
 		got, err := agg.Aggregate(snap, metric, 0)
 		assert.NoError(t, err)
 		assert.Equal(t, 0.0, got)
+	})
+
+	t.Run("all services errored returns error", func(t *testing.T) {
+		// A total scrape outage must be reported as unknown (error), not as 0,
+		// so it cannot masquerade as "no latency pressure" and trigger a
+		// spurious scale-down.
+		snap := &scraper.MetricSnapshot{Services: []scraper.ServiceMetrics{
+			{Name: "a", Err: errors.New("scrape failed")},
+			{Name: "b", Err: errors.New("scrape failed")},
+		}}
+		_, err := agg.Aggregate(snap, metric, 0)
+		assert.Error(t, err)
 	})
 
 	t.Run("nil snapshot returns zero", func(t *testing.T) {

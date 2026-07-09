@@ -57,10 +57,10 @@ const (
 	MetricPathInMetadata            = "metricPath"
 	ScrapeTimeoutInMetadata         = "scrapeTimeout"
 	// MetricSourceInMetadata selects which registered scraper produces the
-	// metrics snapshot (e.g. "service" for workspace vLLM Services, "epp" for the
-	// EndpointPicker). AggregationInMetadata selects which registered aggregator
-	// reduces that snapshot to a single value (e.g. "sum", "perpod-avg",
-	// "quantile"), or the special "gate" aggregation which needs no scrape.
+	// metrics snapshot (e.g. "service" for workspace vLLM Services).
+	// AggregationInMetadata selects which registered aggregator reduces that
+	// snapshot to a single value (e.g. "sum", "service-avg", "quantile"), or the
+	// special "gate" aggregation which needs no scrape.
 	MetricSourceInMetadata = "metricSource"
 	AggregationInMetadata  = "aggregation"
 	// QuantileInMetadata sets the target quantile in (0, 1] for the "quantile"

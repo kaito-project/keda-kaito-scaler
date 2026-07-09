@@ -22,17 +22,6 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scraper"
 )
 
-// Aggregator reduces the per-service values inside a scraper.MetricSnapshot to the
-// single metric value that KEDA consumes.
-//
-// The returned value is meant to be paired with HPA's "AverageValue" target
-// type, where the threshold passed by KEDA represents the per-replica desired
-// load. HPA then computes desiredReplicas = ceil(value / threshold), so the
-// aggregator must return the *total* (sum) load across all services.
-type Aggregator interface {
-	Aggregate(snapshot *scraper.MetricSnapshot, metricName string, threshold float64) (float64, error)
-}
-
 // SumAggregator sums a metric across every service that belongs to an
 // InferenceSet, compensating for services that could not be scraped in order
 // to avoid flapping.
@@ -80,10 +69,14 @@ func (a *SumAggregator) Aggregate(snapshot *scraper.MetricSnapshot, metricName s
 			errs = append(errs, fmt.Errorf("service %s/%s: %w", sm.Namespace, sm.Name, sm.Err))
 			continue
 		}
+		// The service was scraped successfully. A missing metric key means this
+		// replica currently reports no such activity (e.g. no requests queued),
+		// so it contributes 0 and still counts as a real replica instead of being
+		// treated as a scrape failure. This keeps cold-start / no-traffic windows
+		// from erroring (which would otherwise block composite formulas).
 		val, ok := sm.Metrics[metricName]
 		if !ok {
-			errs = append(errs, fmt.Errorf("service %s/%s: metric %q not found", sm.Namespace, sm.Name, metricName))
-			continue
+			klog.V(4).Infof("metric %q absent on scraped service %s/%s; treating as 0", metricName, sm.Namespace, sm.Name)
 		}
 		sum += val
 		successCount++

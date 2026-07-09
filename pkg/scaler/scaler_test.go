@@ -289,16 +289,16 @@ func TestKaitoScaler_GetMetrics_Routing(t *testing.T) {
 	serviceScraper := &stubScraper{snapshot: &scraper.MetricSnapshot{}}
 	eppScraper := &stubScraper{snapshot: &scraper.MetricSnapshot{}}
 	sumAgg := &stubAggregator{value: 1}
-	perPodAgg := &stubAggregator{value: 2}
+	serviceAvgAgg := &stubAggregator{value: 2}
 
 	s := NewKaitoScaler(newFakeClient(t, is),
 		map[string]scraper.Scraper{"service": serviceScraper, "epp": eppScraper},
-		map[string]aggregator.Aggregator{"sum": sumAgg, "perpod-avg": perPodAgg},
+		map[string]aggregator.Aggregator{"sum": sumAgg, "service-avg": serviceAvgAgg},
 	)
 
 	meta := newValidScalerMetadata()
 	meta[MetricSourceInMetadata] = "epp"
-	meta[AggregationInMetadata] = "perpod-avg"
+	meta[AggregationInMetadata] = "service-avg"
 	meta[MetricNameInMetadata] = "inference_pool_per_pod_queue_size"
 
 	resp, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
@@ -307,10 +307,10 @@ func TestKaitoScaler_GetMetrics_Routing(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	assert.Equal(t, float64(2), resp.MetricValues[0].MetricValueFloat)
-	// Only the EPP scraper and per-pod aggregator should have been used.
+	// Only the EPP scraper and service-average aggregator should have been used.
 	assert.Equal(t, types.NamespacedName{Namespace: "ns1", Name: "is1"}, eppScraper.gotIS)
 	assert.Equal(t, types.NamespacedName{}, serviceScraper.gotIS)
-	assert.Equal(t, 1, perPodAgg.callCount)
+	assert.Equal(t, 1, serviceAvgAgg.callCount)
 	assert.Equal(t, 0, sumAgg.callCount)
 }
 

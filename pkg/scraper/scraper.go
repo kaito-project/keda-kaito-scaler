@@ -66,13 +66,6 @@ type ServiceMetrics struct {
 	// aggregated scalar value. When a metric family contains multiple label sets
 	// (for example one per model), the values are summed. Empty when Err != nil.
 	Metrics map[string]float64
-	// Series maps a scalar metric family name to the list of its individual
-	// per-series values (one entry per label set). Unlike Metrics (which sums
-	// label sets), Series preserves each series so aggregators can compute a
-	// precise per-series average (e.g. inference_pool_per_pod_queue_size where
-	// each series is one backend pod). Populated by scrapers that need per-series
-	// fidelity; nil for scrapers that only expose summed scalars.
-	Series map[string][]float64
 	// Histograms maps a histogram metric family name to its parsed buckets/count/
 	// sum, enabling quantile aggregation (e.g. p95 latency). nil when the service
 	// exposes no histograms or the scraper does not parse them.

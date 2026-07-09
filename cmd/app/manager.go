@@ -87,7 +87,6 @@ const (
 func init() {
 	// controller-runtime manager use scheme.Scheme by default
 	utilruntime.Must(kaitov1beta1.AddToScheme(scheme.Scheme))
-	utilruntime.Must(kaitov1beta1.AddToScheme(scheme.Scheme))
 	utilruntime.Must(v1alpha1.AddToScheme(scheme.Scheme))
 }
 
@@ -207,15 +206,17 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		Service: scaler.NewKaitoScaler(
 			mgr.GetClient(),
 			map[string]scraper.Scraper{
-				"service": scraper.NewServiceMetricsScraper(mgr.GetClient()),
-				"epp":     scraper.NewEPPScraper(mgr.GetClient()),
+				// Wrap the service scraper in a short-lived cache so the several
+				// triggers of a composite ScaledObject share a single per-cycle
+				// scrape instead of each re-scraping every pod.
+				"service": scraper.NewCachingScraper(scraper.NewServiceMetricsScraper(mgr.GetClient())),
 			},
 			// The "quantile" aggregation is parametric (its target quantile comes
 			// from trigger metadata) so the scaler builds it per request instead of
 			// registering it here.
 			map[string]aggregator.Aggregator{
-				"sum":        aggregator.NewSumAggregator(),
-				"perpod-avg": aggregator.NewPerPodAverageAggregator(),
+				"sum":         aggregator.NewSumAggregator(),
+				"service-avg": aggregator.NewServiceAverageAggregator(),
 			},
 		),
 		GetServerCertificate: cert.NewServerCertLoader(secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName, ServerCert, ServerKey),

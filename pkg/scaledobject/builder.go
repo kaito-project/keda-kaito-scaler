@@ -150,20 +150,18 @@ type metricCatalogEntry struct {
 // understands. The map key is the metric name users reference via the
 // metricName/{i} annotations, so no extra naming indirection is introduced.
 var compositeMetricCatalog = map[string]metricCatalogEntry{
-	// EPP-derived per-pod queue length, averaged with float precision.
-	"inference_pool_per_pod_queue_size": {
-		source:      "epp",
-		aggregation: "perpod-avg",
-	},
-	// EPP-derived end-to-end request latency via configurable histogram quantile.
-	"inference_objective_request_duration_seconds": {
-		source:      "epp",
-		aggregation: "quantile",
-	},
-	// vLLM waiting-queue length scraped directly from workspace Services, summed.
+	// vLLM waiting-queue length scraped directly from workspace Services and
+	// averaged per replica (per-service scalar averaged across pods) so the
+	// fixed-threshold composite comparison stays replica-count independent.
 	"vllm:num_requests_waiting": {
 		source:      "service",
-		aggregation: "sum",
+		aggregation: "service-avg",
+	},
+	// vLLM time spent in the WAITING (queue) phase, scraped from workspace
+	// Services and reduced via a configurable histogram quantile (default p95).
+	"vllm:request_queue_time_seconds": {
+		source:      "service",
+		aggregation: "quantile",
 	},
 }
 
@@ -339,20 +337,35 @@ func parseCompositeConfig(annotations map[string]string) (compositeConfig, error
 		return cfg, fmt.Errorf("composite mode requires at least one metricName/0 annotation")
 	}
 
-	cfg.evaluationWindow = parseSecondsAnnotation(annotations, AnnotationKeyEvaluationWindow, defaultEvaluationWindow)
-	cfg.scaleUpCooldown = parseSecondsAnnotation(annotations, AnnotationKeyScaleUpCooldown, defaultScaleUpCooldown)
-	cfg.scaleDownCooldown = parseSecondsAnnotation(annotations, AnnotationKeyScaleDownCooldown, defaultScaleDownCooldown)
+	var err error
+	if cfg.evaluationWindow, err = parseSecondsAnnotation(annotations, AnnotationKeyEvaluationWindow, defaultEvaluationWindow); err != nil {
+		return cfg, err
+	}
+	if cfg.scaleUpCooldown, err = parseSecondsAnnotation(annotations, AnnotationKeyScaleUpCooldown, defaultScaleUpCooldown); err != nil {
+		return cfg, err
+	}
+	if cfg.scaleDownCooldown, err = parseSecondsAnnotation(annotations, AnnotationKeyScaleDownCooldown, defaultScaleDownCooldown); err != nil {
+		return cfg, err
+	}
 
 	return cfg, nil
 }
 
-func parseSecondsAnnotation(annotations map[string]string, key string, def int32) int32 {
-	if v, ok := annotations[key]; ok && v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= math.MaxInt32 {
-			return int32(n)
-		}
+// parseSecondsAnnotation parses a non-negative seconds value from the given
+// annotation. It returns the default when the annotation is absent or empty, but
+// returns an error when the annotation is present with an invalid value
+// (non-integer, negative, or out of int32 range) so misconfiguration is surfaced
+// instead of being silently ignored.
+func parseSecondsAnnotation(annotations map[string]string, key string, def int32) (int32, error) {
+	v, ok := annotations[key]
+	if !ok || v == "" {
+		return def, nil
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > math.MaxInt32 {
+		return 0, fmt.Errorf("%s must be a non-negative integer within int32 range, got %q", key, v)
+	}
+	return int32(n), nil
 }
 
 // formulaVarName converts a metric name into a valid expr-lang identifier so it

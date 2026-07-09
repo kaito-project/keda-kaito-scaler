@@ -28,6 +28,7 @@ import (
 	"golang.org/x/time/rate"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -81,7 +82,16 @@ func NewAutoProvisionController(c client.Client, scalerNamespace, scalerServiceN
 
 func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSet) (reconcile.Result, error) {
 	logger := log.FromContext(ctx).WithName("auto-provision-controller")
-	if !enableAutoProvisioning(is) {
+
+	// When auto-provisioning is not requested (annotation missing or set to a
+	// value other than "true"), tear down any ScaledObject we previously
+	// provisioned for this InferenceSet. This handles the case where the
+	// auto-provision annotation is toggled off after a ScaledObject was created.
+	if !autoProvisionRequested(is) {
+		return reconcile.Result{}, c.cleanupManagedScaledObjects(ctx, is)
+	}
+
+	if !autoscalingConfigValid(is) {
 		return reconcile.Result{}, nil
 	}
 
@@ -200,6 +210,30 @@ func (c *Controller) listManagedScaledObjects(ctx context.Context, is *kaitov1be
 		}
 	}
 	return managed, nil
+}
+
+// cleanupManagedScaledObjects deletes every ScaledObject this controller
+// provisioned for the InferenceSet. It is invoked when auto-provisioning is
+// disabled so scaling is fully torn down. Missing objects are treated as
+// already cleaned up.
+func (c *Controller) cleanupManagedScaledObjects(ctx context.Context, is *kaitov1beta1.InferenceSet) error {
+	managed, err := c.listManagedScaledObjects(ctx, is)
+	if err != nil {
+		return err
+	}
+	for i := range managed {
+		if managed[i].DeletionTimestamp != nil {
+			continue
+		}
+		if err := c.Delete(ctx, &managed[i]); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		if c.Recorder != nil {
+			c.Recorder.Eventf(is, corev1.EventTypeNormal, "ScaledObjectCleanedUp",
+				"Deleted auto-provisioned ScaledObject %s because auto-provisioning of InferenceSet(%s/%s) is disabled", managed[i].Name, is.Namespace, is.Name)
+		}
+	}
+	return nil
 }
 
 // syncDesired creates, updates, or deduplicates managed ScaledObjects so that
@@ -332,7 +366,7 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			if !ok {
 				return false
 			}
-			return enableAutoProvisioning(inferenceSet)
+			return autoProvisionRequested(inferenceSet) && autoscalingConfigValid(inferenceSet)
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldInferenceSet, ok := e.ObjectOld.(*kaitov1beta1.InferenceSet)
@@ -349,7 +383,10 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			// prefix covers the fixed single-metric keys as well as the indexed
 			// composite keys (metricName/0, upthreshold/0, ...).
 			if annotationsWithPrefixChanged(oldInferenceSet.Annotations, newInferenceSet.Annotations, annotationPrefix) {
-				return enableAutoProvisioning(newInferenceSet)
+				// Fire when the new state is validly enabled (provision/update) or
+				// the old state requested auto-provisioning (so toggling the
+				// annotation off still triggers cleanup of the ScaledObject).
+				return (autoProvisionRequested(newInferenceSet) && autoscalingConfigValid(newInferenceSet)) || autoProvisionRequested(oldInferenceSet)
 			}
 			return false
 		},
@@ -371,11 +408,12 @@ func resolveMinReplicas(annotations map[string]string) int {
 	return 1
 }
 
-func enableAutoProvisioning(inferenceSet *kaitov1beta1.InferenceSet) bool {
-	if inferenceSet.Annotations[AnnotationKeyAutoProvision] != "true" {
-		return false
-	}
-
+// autoscalingConfigValid reports whether the InferenceSet's autoscaling
+// configuration is valid enough to provision a ScaledObject. It assumes the
+// caller has already confirmed auto-provisioning was requested (see
+// autoProvisionRequested) and only validates the replica bounds and the
+// metric threshold configuration (single-metric or composite).
+func autoscalingConfigValid(inferenceSet *kaitov1beta1.InferenceSet) bool {
 	// if max-replicas annotation exists, max replicas should be more than 1
 	// if not exists, NodeCountLimit should be more than 1, we will use it to calculate max replicas
 	if maxReplicasStr, ok := inferenceSet.Annotations[AnnotationKeyMaxReplicas]; ok {
@@ -398,6 +436,12 @@ func enableAutoProvisioning(inferenceSet *kaitov1beta1.InferenceSet) bool {
 	}
 
 	return true
+}
+
+// autoProvisionRequested reports whether the InferenceSet opts into
+// auto-provisioning via the scaledobject.kaito.sh/auto-provision annotation.
+func autoProvisionRequested(inferenceSet *kaitov1beta1.InferenceSet) bool {
+	return inferenceSet.Annotations[AnnotationKeyAutoProvision] == "true"
 }
 
 // annotationsWithPrefixChanged reports whether any annotation key starting with
