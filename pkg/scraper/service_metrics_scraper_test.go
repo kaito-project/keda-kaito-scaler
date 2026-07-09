@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package metrics
+package scraper
 
 import (
 	"context"
@@ -23,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,13 +36,13 @@ const workspaceCreatedByLabel = "inferenceset.kaito.sh/created-by"
 func newScraperFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
-	assert.NoError(t, kaitov1alpha1.AddToScheme(scheme))
+	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
 	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 }
 
-func newInferenceSet(name, namespace string) *kaitov1alpha1.InferenceSet {
-	return &kaitov1alpha1.InferenceSet{
+func newInferenceSet(name, namespace string) *kaitov1beta1.InferenceSet {
+	return &kaitov1beta1.InferenceSet{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 	}
 }
@@ -156,9 +155,4 @@ func TestServiceMetricsScraper_Scrape_NoWorkspaces(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, snap)
 	assert.Empty(t, snap.Services)
-}
-
-func TestDefaultURLBuilder(t *testing.T) {
-	got := defaultURLBuilder("http", "svc", "ns", "80", "/metrics")
-	assert.Equal(t, "http://svc.ns.svc.cluster.local:80/metrics", got)
 }

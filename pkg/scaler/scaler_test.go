@@ -19,27 +19,29 @@ import (
 	"testing"
 	"time"
 
-	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
+	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"github.com/kaito-project/keda-kaito-scaler/pkg/metrics"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/aggregator"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scraper"
 )
 
-// stubScraper is a test double for metrics.Scraper.
+// stubScraper is a test double for scraper.Scraper.
 type stubScraper struct {
-	snapshot *metrics.MetricSnapshot
+	snapshot *scraper.MetricSnapshot
 	err      error
-	gotCfg   metrics.ScrapeConfig
+	gotCfg   scraper.ScrapeConfig
 	gotIS    types.NamespacedName
 }
 
-func (s *stubScraper) Scrape(_ context.Context, is *kaitov1alpha1.InferenceSet, cfg metrics.ScrapeConfig) (*metrics.MetricSnapshot, error) {
+func (s *stubScraper) Scrape(_ context.Context, is *kaitov1beta1.InferenceSet, cfg scraper.ScrapeConfig) (*scraper.MetricSnapshot, error) {
 	s.gotCfg = cfg
 	s.gotIS = types.NamespacedName{Namespace: is.Namespace, Name: is.Name}
 	if s.err != nil {
@@ -48,17 +50,17 @@ func (s *stubScraper) Scrape(_ context.Context, is *kaitov1alpha1.InferenceSet, 
 	return s.snapshot, nil
 }
 
-// stubAggregator is a test double for metrics.Aggregator.
+// stubAggregator is a test double for aggregator.Aggregator.
 type stubAggregator struct {
 	value     float64
 	err       error
 	gotMetric string
-	gotSnap   *metrics.MetricSnapshot
+	gotSnap   *scraper.MetricSnapshot
 	threshold float64
 	callCount int
 }
 
-func (a *stubAggregator) Aggregate(snap *metrics.MetricSnapshot, metricName string, threshold float64) (float64, error) {
+func (a *stubAggregator) Aggregate(snap *scraper.MetricSnapshot, metricName string, threshold float64) (float64, error) {
 	a.callCount++
 	a.gotSnap = snap
 	a.gotMetric = metricName
@@ -69,8 +71,17 @@ func (a *stubAggregator) Aggregate(snap *metrics.MetricSnapshot, metricName stri
 func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
-	assert.NoError(t, kaitov1alpha1.AddToScheme(scheme))
+	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+}
+
+// newTestScaler wraps a single scraper/aggregator into the default "service"/
+// "sum" routing maps so existing single-metric tests keep working unchanged.
+func newTestScaler(c client.Client, sc scraper.Scraper, ag aggregator.Aggregator) *KaitoScaler {
+	return NewKaitoScaler(c,
+		map[string]scraper.Scraper{defaultMetricSource: sc},
+		map[string]aggregator.Aggregator{defaultAggregation: ag},
+	)
 }
 
 func newValidScalerMetadata() map[string]string {
@@ -86,16 +97,16 @@ func newValidScalerMetadata() map[string]string {
 	}
 }
 
-func newReadyInferenceSet(name, namespace string, ready bool) *kaitov1alpha1.InferenceSet {
+func newReadyInferenceSet(name, namespace string, ready bool) *kaitov1beta1.InferenceSet {
 	status := metav1.ConditionFalse
 	if ready {
 		status = metav1.ConditionTrue
 	}
-	return &kaitov1alpha1.InferenceSet{
+	return &kaitov1beta1.InferenceSet{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-		Status: kaitov1alpha1.InferenceSetStatus{
+		Status: kaitov1beta1.InferenceSetStatus{
 			Conditions: []metav1.Condition{{
-				Type:   string(kaitov1alpha1.InferenceSetConditionTypeReady),
+				Type:   string(kaitov1beta1.InferenceSetConditionTypeReady),
 				Status: status,
 			}},
 		},
@@ -107,12 +118,15 @@ func TestNewKaitoScaler(t *testing.T) {
 	sc := &stubScraper{}
 	ag := &stubAggregator{}
 
-	s := NewKaitoScaler(c, sc, ag)
+	s := NewKaitoScaler(c,
+		map[string]scraper.Scraper{"service": sc},
+		map[string]aggregator.Aggregator{"sum": ag},
+	)
 
 	assert.NotNil(t, s)
 	assert.Equal(t, c, s.kubeClient)
-	assert.Equal(t, metrics.Scraper(sc), s.scraper)
-	assert.Equal(t, metrics.Aggregator(ag), s.aggregator)
+	assert.Equal(t, scraper.Scraper(sc), s.scrapers["service"])
+	assert.Equal(t, aggregator.Aggregator(ag), s.aggregators["sum"])
 }
 
 func TestParseScalerMetadata(t *testing.T) {
@@ -129,6 +143,9 @@ func TestParseScalerMetadata(t *testing.T) {
 		{name: "invalid protocol", mutate: func(m map[string]string) { m[MetricProtocolInMetadata] = "ftp" }, wantErr: true},
 		{name: "invalid timeout", mutate: func(m map[string]string) { m[ScrapeTimeoutInMetadata] = "abc" }, wantErr: true},
 		{name: "invalid threshold", mutate: func(m map[string]string) { m[ThresholdInMetadata] = "abc" }, wantErr: true},
+		{name: "invalid quantile", mutate: func(m map[string]string) { m[QuantileInMetadata] = "abc" }, wantErr: true},
+		{name: "quantile out of range high", mutate: func(m map[string]string) { m[QuantileInMetadata] = "1.5" }, wantErr: true},
+		{name: "quantile out of range low", mutate: func(m map[string]string) { m[QuantileInMetadata] = "0" }, wantErr: true},
 		{name: "metric name override", mutate: func(m map[string]string) { delete(m, MetricNameInMetadata) }, metricName: "override:metric"},
 		{name: "optional fields default when omitted", mutate: func(m map[string]string) {
 			delete(m, MetricProtocolInMetadata)
@@ -155,6 +172,7 @@ func TestParseScalerMetadata(t *testing.T) {
 			assert.Equal(t, "ns1", cfg.InferenceSetNamespace)
 			assert.Equal(t, float64(10), cfg.Threshold)
 			assert.Equal(t, 3*time.Second, cfg.ScrapeTimeout)
+			assert.Equal(t, defaultQuantile, cfg.Quantile)
 			if tt.metricName != "" {
 				assert.Equal(t, tt.metricName, cfg.MetricName)
 			}
@@ -195,7 +213,7 @@ func TestKaitoScaler_IsActive(t *testing.T) {
 			if !tt.missing {
 				objs = append(objs, newReadyInferenceSet("is1", "ns1", tt.ready))
 			}
-			s := NewKaitoScaler(newFakeClient(t, objs...), &stubScraper{}, &stubAggregator{})
+			s := newTestScaler(newFakeClient(t, objs...), &stubScraper{}, &stubAggregator{})
 
 			sor := &externalscaler.ScaledObjectRef{ScalerMetadata: newValidScalerMetadata()}
 			resp, err := s.IsActive(context.Background(), sor)
@@ -210,7 +228,7 @@ func TestKaitoScaler_IsActive(t *testing.T) {
 }
 
 func TestKaitoScaler_GetMetricSpec(t *testing.T) {
-	s := NewKaitoScaler(newFakeClient(t), &stubScraper{}, &stubAggregator{})
+	s := newTestScaler(newFakeClient(t), &stubScraper{}, &stubAggregator{})
 	sor := &externalscaler.ScaledObjectRef{ScalerMetadata: newValidScalerMetadata()}
 	resp, err := s.GetMetricSpec(context.Background(), sor)
 	assert.NoError(t, err)
@@ -223,15 +241,15 @@ func TestKaitoScaler_GetMetrics(t *testing.T) {
 	is := newReadyInferenceSet("is1", "ns1", true)
 
 	t.Run("delegates to scraper and aggregator", func(t *testing.T) {
-		snap := &metrics.MetricSnapshot{
+		snap := &scraper.MetricSnapshot{
 			InferenceSet: types.NamespacedName{Namespace: "ns1", Name: "is1"},
-			Services: []metrics.ServiceMetrics{
+			Services: []scraper.ServiceMetrics{
 				{Name: "ws0", Namespace: "ns1", Metrics: map[string]float64{"vllm:num_requests_waiting": 7}},
 			},
 		}
 		sc := &stubScraper{snapshot: snap}
 		ag := &stubAggregator{value: 7}
-		s := NewKaitoScaler(newFakeClient(t, is), sc, ag)
+		s := newTestScaler(newFakeClient(t, is), sc, ag)
 
 		resp, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
 			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: newValidScalerMetadata()},
@@ -255,7 +273,7 @@ func TestKaitoScaler_GetMetrics(t *testing.T) {
 	t.Run("scraper failure bubbles up", func(t *testing.T) {
 		sc := &stubScraper{err: errors.New("boom")}
 		ag := &stubAggregator{}
-		s := NewKaitoScaler(newFakeClient(t, is), sc, ag)
+		s := newTestScaler(newFakeClient(t, is), sc, ag)
 		_, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
 			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: newValidScalerMetadata()},
 			MetricName:      "vllm:num_requests_waiting",
@@ -263,4 +281,167 @@ func TestKaitoScaler_GetMetrics(t *testing.T) {
 		assert.Error(t, err)
 		assert.Equal(t, 0, ag.callCount)
 	})
+}
+
+func TestKaitoScaler_GetMetrics_Routing(t *testing.T) {
+	is := newReadyInferenceSet("is1", "ns1", true)
+
+	serviceScraper := &stubScraper{snapshot: &scraper.MetricSnapshot{}}
+	eppScraper := &stubScraper{snapshot: &scraper.MetricSnapshot{}}
+	sumAgg := &stubAggregator{value: 1}
+	perPodAgg := &stubAggregator{value: 2}
+
+	s := NewKaitoScaler(newFakeClient(t, is),
+		map[string]scraper.Scraper{"service": serviceScraper, "epp": eppScraper},
+		map[string]aggregator.Aggregator{"sum": sumAgg, "perpod-avg": perPodAgg},
+	)
+
+	meta := newValidScalerMetadata()
+	meta[MetricSourceInMetadata] = "epp"
+	meta[AggregationInMetadata] = "perpod-avg"
+	meta[MetricNameInMetadata] = "inference_pool_per_pod_queue_size"
+
+	resp, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+		ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: meta},
+		MetricName:      "inference_pool_per_pod_queue_size",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, float64(2), resp.MetricValues[0].MetricValueFloat)
+	// Only the EPP scraper and per-pod aggregator should have been used.
+	assert.Equal(t, types.NamespacedName{Namespace: "ns1", Name: "is1"}, eppScraper.gotIS)
+	assert.Equal(t, types.NamespacedName{}, serviceScraper.gotIS)
+	assert.Equal(t, 1, perPodAgg.callCount)
+	assert.Equal(t, 0, sumAgg.callCount)
+}
+
+func TestKaitoScaler_GetMetrics_Quantile(t *testing.T) {
+	is := newReadyInferenceSet("is1", "ns1", true)
+
+	// A histogram with all 100 observations in the (1, 2] bucket, so any quantile
+	// falls in that bucket and is interpolated between 1 and 2.
+	snap := &scraper.MetricSnapshot{
+		Services: []scraper.ServiceMetrics{{
+			Name:      "epp0",
+			Namespace: "ns1",
+			Histograms: map[string]scraper.Histogram{
+				"inference_objective_request_duration_seconds": {
+					Buckets: []scraper.Bucket{
+						{Le: 1, CumulativeCount: 0},
+						{Le: 2, CumulativeCount: 100},
+					},
+					Count: 100,
+				},
+			},
+		}},
+	}
+
+	newMeta := func(quantile string) map[string]string {
+		meta := newValidScalerMetadata()
+		meta[MetricSourceInMetadata] = "epp"
+		meta[AggregationInMetadata] = AggregationQuantile
+		meta[MetricNameInMetadata] = "inference_objective_request_duration_seconds"
+		if quantile != "" {
+			meta[QuantileInMetadata] = quantile
+		}
+		return meta
+	}
+
+	newScaler := func() *KaitoScaler {
+		return NewKaitoScaler(newFakeClient(t, is),
+			map[string]scraper.Scraper{"epp": &stubScraper{snapshot: snap}},
+			// Note: no "quantile" aggregator registered; it is built per request
+			// from the quantile metadata.
+			map[string]aggregator.Aggregator{},
+		)
+	}
+
+	t.Run("default p95", func(t *testing.T) {
+		resp, err := newScaler().GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: newMeta("")},
+			MetricName:      "inference_objective_request_duration_seconds",
+		})
+		assert.NoError(t, err)
+		assert.InDelta(t, 1.95, resp.MetricValues[0].MetricValueFloat, 1e-9)
+	})
+
+	t.Run("custom p50", func(t *testing.T) {
+		resp, err := newScaler().GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: newMeta("0.5")},
+			MetricName:      "inference_objective_request_duration_seconds",
+		})
+		assert.NoError(t, err)
+		assert.InDelta(t, 1.5, resp.MetricValues[0].MetricValueFloat, 1e-9)
+	})
+}
+
+func TestKaitoScaler_GetMetrics_UnknownSourceOrAggregation(t *testing.T) {
+	is := newReadyInferenceSet("is1", "ns1", true)
+	s := newTestScaler(newFakeClient(t, is), &stubScraper{snapshot: &scraper.MetricSnapshot{}}, &stubAggregator{})
+
+	t.Run("unknown source", func(t *testing.T) {
+		meta := newValidScalerMetadata()
+		meta[MetricSourceInMetadata] = "nope"
+		_, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: meta},
+			MetricName:      "vllm:num_requests_waiting",
+		})
+		assert.Error(t, err)
+	})
+
+	t.Run("unknown aggregation", func(t *testing.T) {
+		meta := newValidScalerMetadata()
+		meta[AggregationInMetadata] = "nope"
+		_, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: meta},
+			MetricName:      "vllm:num_requests_waiting",
+		})
+		assert.Error(t, err)
+	})
+}
+
+func TestKaitoScaler_GetMetrics_Gate(t *testing.T) {
+	tests := []struct {
+		name          string
+		replicas      int
+		readyReplicas int
+		want          float64
+	}{
+		{name: "not all ready -> gate active", replicas: 3, readyReplicas: 2, want: 1},
+		{name: "all ready -> gate clear", replicas: 3, readyReplicas: 3, want: 0},
+		{name: "no replicas -> gate clear", replicas: 0, readyReplicas: 0, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			is := &kaitov1beta1.InferenceSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "is1", Namespace: "ns1"},
+				Spec: kaitov1beta1.InferenceSetSpec{
+					Replicas: ptr.To(int32(tt.replicas)),
+				},
+				Status: kaitov1beta1.InferenceSetStatus{
+					ReadyReplicas: tt.readyReplicas,
+				},
+			}
+			// A scraper that would fail if called, to prove the gate path never scrapes.
+			sc := &stubScraper{err: errors.New("should not scrape")}
+			ag := &stubAggregator{}
+			s := NewKaitoScaler(newFakeClient(t, is),
+				map[string]scraper.Scraper{"service": sc},
+				map[string]aggregator.Aggregator{"sum": ag},
+			)
+
+			meta := newValidScalerMetadata()
+			meta[AggregationInMetadata] = AggregationGate
+			meta[MetricNameInMetadata] = "kaito_gate"
+
+			resp, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+				ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: meta},
+				MetricName:      "kaito_gate",
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, resp.MetricValues[0].MetricValueFloat)
+			assert.Equal(t, 0, ag.callCount)
+			assert.Equal(t, types.NamespacedName{}, sc.gotIS)
+		})
+	}
 }

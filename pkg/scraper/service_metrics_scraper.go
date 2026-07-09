@@ -11,25 +11,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package metrics
+package scraper
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
-	"io"
-	"net/http"
 	"time"
 
-	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
-	dto "github.com/prometheus/client_model/go"
-	"github.com/prometheus/common/expfmt"
-	"github.com/prometheus/common/model"
+	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/inferenceset"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/util/promscrape"
 )
 
 // +kubebuilder:rbac:groups="kaito.sh",resources=inferencesets,verbs=get;list;watch
@@ -39,9 +34,8 @@ import (
 // each workspace Service (e.g. the vLLM inference server). Services are
 // discovered via the Workspace objects owned by the InferenceSet.
 type ServiceMetricsScraper struct {
-	kubeClient    client.Client
-	httpTransport *http.Transport
-	tlsTransport  *http.Transport
+	kubeClient client.Client
+	transports *promscrape.Transports
 	// urlBuilder produces the scrape URL for a given service. Overridable in
 	// tests; defaults to the in-cluster FQDN.
 	urlBuilder func(protocol, name, namespace, port, path string) string
@@ -53,34 +47,16 @@ type ServiceMetricsScraper struct {
 func NewServiceMetricsScraper(kubeClient client.Client) *ServiceMetricsScraper {
 	return &ServiceMetricsScraper{
 		kubeClient: kubeClient,
-		httpTransport: &http.Transport{
-			MaxIdleConns:        20,
-			MaxIdleConnsPerHost: 5,
-			IdleConnTimeout:     30 * time.Second,
-		},
-		tlsTransport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:        20,
-			MaxIdleConnsPerHost: 5,
-			IdleConnTimeout:     30 * time.Second,
-		},
-		urlBuilder: defaultURLBuilder,
+		transports: promscrape.NewTransports(),
+		urlBuilder: promscrape.DefaultURLBuilder,
 	}
-}
-
-func defaultURLBuilder(protocol, name, namespace, port, path string) string {
-	// NOTE: Kaito currently exposes the vLLM inference server (and its Prometheus
-	// /metrics endpoint) as plain HTTP on the workspace Service. The protocol is
-	// kept configurable so that https can be used if Kaito enables TLS on the
-	// inference server in the future.
-	return fmt.Sprintf("%s://%s.%s.svc.cluster.local:%s%s", protocol, name, namespace, port, path)
 }
 
 // Scrape iterates over every Workspace owned by the InferenceSet and scrapes
 // its /metrics endpoint. A per-service error is recorded on the corresponding
 // ServiceMetrics entry; Scrape itself only returns an error when workspace
 // discovery fails.
-func (s *ServiceMetricsScraper) Scrape(ctx context.Context, is *kaitov1alpha1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error) {
+func (s *ServiceMetricsScraper) Scrape(ctx context.Context, is *kaitov1beta1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error) {
 	workspaceList, err := inferenceset.ListWorkspaces(ctx, is, s.kubeClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list workspaces for InferenceSet %s/%s: %w", is.Namespace, is.Name, err)
@@ -111,41 +87,14 @@ func (s *ServiceMetricsScraper) Scrape(ctx context.Context, is *kaitov1alpha1.In
 }
 
 func (s *ServiceMetricsScraper) scrapeService(ctx context.Context, name, namespace string, cfg ScrapeConfig) (map[string]float64, error) {
-	transport := s.httpTransport
-	if cfg.Protocol == "https" {
-		transport = s.tlsTransport
-	}
-
-	httpClient := &http.Client{
-		Transport: transport,
-		Timeout:   cfg.Timeout,
-	}
+	httpClient := s.transports.ClientFor(cfg.Protocol, cfg.Timeout)
 
 	url := s.urlBuilder(cfg.Protocol, name, namespace, cfg.Port, cfg.Path)
 	klog.V(6).Infof("scraping metrics from service %s/%s: %s", namespace, name, url)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	families, err := promscrape.FetchMetricFamilies(ctx, httpClient, url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build scrape request: %w", err)
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to scrape service metrics: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Drain a bounded amount of the response body so that the underlying
-		// TCP/TLS connection can be reused by the transport keep-alive pool.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("unexpected status code %d from %s", resp.StatusCode, url)
-	}
-
-	var parser = expfmt.NewTextParser(model.UTF8Validation)
-	families, err := parser.TextToMetricFamilies(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse Prometheus text metrics: %w", err)
+		return nil, err
 	}
 
 	result := make(map[string]float64, len(families))
@@ -153,7 +102,7 @@ func (s *ServiceMetricsScraper) scrapeService(ctx context.Context, name, namespa
 		var sum float64
 		var found bool
 		for _, m := range mf.GetMetric() {
-			v, ok := extractScalarValue(m)
+			v, ok := promscrape.ExtractScalarValue(m)
 			if !ok {
 				continue
 			}
@@ -165,20 +114,4 @@ func (s *ServiceMetricsScraper) scrapeService(ctx context.Context, name, namespa
 		}
 	}
 	return result, nil
-}
-
-// extractScalarValue extracts a single scalar value from a *dto.Metric for the
-// metric types that vLLM commonly exposes (gauges, counters, untyped). Complex
-// types such as histograms and summaries are skipped.
-func extractScalarValue(m *dto.Metric) (float64, bool) {
-	switch {
-	case m.Gauge != nil:
-		return m.GetGauge().GetValue(), true
-	case m.Counter != nil:
-		return m.GetCounter().GetValue(), true
-	case m.Untyped != nil:
-		return m.GetUntyped().GetValue(), true
-	default:
-		return 0, false
-	}
 }

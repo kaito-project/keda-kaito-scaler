@@ -17,9 +17,10 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
-	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
+	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -27,7 +28,8 @@ import (
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/kaito-project/keda-kaito-scaler/pkg/metrics"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/aggregator"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scraper"
 )
 
 const (
@@ -54,6 +56,16 @@ const (
 	MetricPortInMetadata            = "metricPort"
 	MetricPathInMetadata            = "metricPath"
 	ScrapeTimeoutInMetadata         = "scrapeTimeout"
+	// MetricSourceInMetadata selects which registered scraper produces the
+	// metrics snapshot (e.g. "service" for workspace vLLM Services, "epp" for the
+	// EndpointPicker). AggregationInMetadata selects which registered aggregator
+	// reduces that snapshot to a single value (e.g. "sum", "perpod-avg",
+	// "quantile"), or the special "gate" aggregation which needs no scrape.
+	MetricSourceInMetadata = "metricSource"
+	AggregationInMetadata  = "aggregation"
+	// QuantileInMetadata sets the target quantile in (0, 1] for the "quantile"
+	// aggregation (e.g. "0.95" for p95). Ignored by other aggregations.
+	QuantileInMetadata = "quantile"
 
 	// Defaults applied when the corresponding metadata key is omitted. Only
 	// inferenceSetName/inferenceSetNamespace/metricName/threshold remain
@@ -63,6 +75,26 @@ const (
 	defaultMetricPort     = "80"
 	defaultMetricPath     = "/metrics"
 	defaultScrapeTimeout  = 3 * time.Second
+
+	// defaultMetricSource / defaultAggregation preserve the original
+	// single-metric behaviour (scrape workspace Services, sum across them) when
+	// the new metadata keys are absent.
+	defaultMetricSource = "service"
+	defaultAggregation  = "sum"
+	// defaultQuantile is the target quantile used by the "quantile" aggregation
+	// when the quantile metadata key is omitted (p95).
+	defaultQuantile = 0.95
+
+	// AggregationGate is a pseudo-aggregation: instead of scraping, the scaler
+	// reports 1 when the InferenceSet has not-yet-ready replicas (readyReplicas <
+	// spec replicas) and 0 otherwise. It backs the readiness "gate" used by
+	// composite scaling formulas to hold scale decisions until pods are ready.
+	AggregationGate = "gate"
+
+	// AggregationQuantile computes a configurable histogram quantile. It is
+	// parametric (see QuantileInMetadata), so the scaler builds the aggregator
+	// per request instead of looking it up in the static aggregator map.
+	AggregationQuantile = "quantile"
 )
 
 // Config is the parsed scaler metadata payload sent by KEDA for every request.
@@ -75,11 +107,17 @@ type Config struct {
 	MetricPath            string
 	ScrapeTimeout         time.Duration
 	Threshold             float64
+	// MetricSource / Aggregation select the scraper and aggregator used to serve
+	// this trigger. They default to "service"/"sum" for backward compatibility.
+	MetricSource string
+	Aggregation  string
+	// Quantile is the target quantile in (0, 1] for the "quantile" aggregation.
+	Quantile float64
 }
 
 // scrapeConfig projects the subset of Config needed by the metrics Scraper.
-func (c *Config) scrapeConfig() metrics.ScrapeConfig {
-	return metrics.ScrapeConfig{
+func (c *Config) scrapeConfig() scraper.ScrapeConfig {
+	return scraper.ScrapeConfig{
 		Protocol: c.MetricProtocol,
 		Port:     c.MetricPort,
 		Path:     c.MetricPath,
@@ -87,24 +125,47 @@ func (c *Config) scrapeConfig() metrics.ScrapeConfig {
 	}
 }
 
-// KaitoScaler implements the KEDA external scaler gRPC contract on top of a
-// pluggable metrics.Scraper (which fetches raw per-service metrics) and a
-// metrics.Aggregator (which reduces them to the single value KEDA expects).
+// KaitoScaler implements the KEDA external scaler gRPC contract on top of
+// pluggable scraper.Scrapers (which fetch raw per-service metrics) and
+// aggregator.Aggregators (which reduce them to the single value KEDA expects).
+// A trigger selects its scraper/aggregator via the metricSource/aggregation
+// metadata keys, letting one scaler serve both the legacy single-metric path
+// and the new composite (queue length + latency + readiness gate) triggers.
 type KaitoScaler struct {
-	kubeClient client.Client
-	scraper    metrics.Scraper
-	aggregator metrics.Aggregator
+	kubeClient  client.Client
+	scrapers    map[string]scraper.Scraper
+	aggregators map[string]aggregator.Aggregator
+	// quantileAggregators caches the parametric quantile aggregators keyed by
+	// their target quantile (float64 -> aggregator.Aggregator). QuantileAggregator
+	// is immutable and safe for concurrent use, so one instance can be shared by
+	// every request targeting the same quantile instead of allocating a new one
+	// on each GetMetrics call.
+	quantileAggregators sync.Map
 	externalscaler.UnimplementedExternalScalerServer
 }
 
-// NewKaitoScaler wires the Kubernetes client, the metrics scraper and the
-// aggregator that will be used to serve KEDA scaling requests.
-func NewKaitoScaler(kubeClient client.Client, scraper metrics.Scraper, aggregator metrics.Aggregator) *KaitoScaler {
+// NewKaitoScaler wires the Kubernetes client, the set of named metrics scrapers
+// and the set of named aggregators used to serve KEDA scaling requests. The
+// maps must at least contain the "service" scraper and the "sum" aggregator so
+// the default single-metric path keeps working.
+func NewKaitoScaler(kubeClient client.Client, scrapers map[string]scraper.Scraper, aggregators map[string]aggregator.Aggregator) *KaitoScaler {
 	return &KaitoScaler{
-		kubeClient: kubeClient,
-		scraper:    scraper,
-		aggregator: aggregator,
+		kubeClient:  kubeClient,
+		scrapers:    scrapers,
+		aggregators: aggregators,
 	}
+}
+
+// quantileAggregator returns the QuantileAggregator for the given quantile,
+// creating and caching it on first use. The aggregator is immutable and safe
+// for concurrent use, so subsequent requests with the same quantile reuse the
+// cached instance instead of allocating a new one.
+func (e *KaitoScaler) quantileAggregator(quantile float64) aggregator.Aggregator {
+	if agg, ok := e.quantileAggregators.Load(quantile); ok {
+		return agg.(aggregator.Aggregator)
+	}
+	agg, _ := e.quantileAggregators.LoadOrStore(quantile, aggregator.NewQuantileAggregator(quantile))
+	return agg.(aggregator.Aggregator)
 }
 
 func (e *KaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledObjectRef) (*externalscaler.IsActiveResponse, error) {
@@ -113,7 +174,7 @@ func (e *KaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledOb
 		return nil, err
 	}
 
-	inferenceSet := &kaitov1alpha1.InferenceSet{}
+	inferenceSet := &kaitov1beta1.InferenceSet{}
 	if err := e.kubeClient.Get(ctx, client.ObjectKey{
 		Namespace: scalerConfig.InferenceSetNamespace,
 		Name:      scalerConfig.InferenceSetName,
@@ -123,7 +184,7 @@ func (e *KaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledOb
 
 	condition := metav1.Condition{}
 	for i := range inferenceSet.Status.Conditions {
-		if inferenceSet.Status.Conditions[i].Type == string(kaitov1alpha1.InferenceSetConditionTypeReady) {
+		if inferenceSet.Status.Conditions[i].Type == string(kaitov1beta1.InferenceSetConditionTypeReady) {
 			condition = inferenceSet.Status.Conditions[i]
 			break
 		}
@@ -166,7 +227,7 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		return nil, err
 	}
 
-	inferenceSet := &kaitov1alpha1.InferenceSet{}
+	inferenceSet := &kaitov1beta1.InferenceSet{}
 	if err := e.kubeClient.Get(ctx, client.ObjectKey{
 		Namespace: scalerConfig.InferenceSetNamespace,
 		Name:      scalerConfig.InferenceSetName,
@@ -174,17 +235,66 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get InferenceSet(%s) in Namespace(%s): %v", scalerConfig.InferenceSetName, scalerConfig.InferenceSetNamespace, err))
 	}
 
+	// The readiness gate needs no scrape: it reports 1 while the InferenceSet has
+	// replicas that are not yet ready (readyReplicas < desired spec replicas) and
+	// 0 otherwise. Comparing against the desired replicas (spec) rather than the
+	// current status replicas also catches the window where a scale-up was just
+	// requested but the new workspace has not been created yet. Composite formulas
+	// use it to avoid scaling on metrics gathered from a partially-ready fleet.
+	if scalerConfig.Aggregation == AggregationGate {
+		// Spec.Replicas is a pointer with a server-side default of 1; treat an
+		// unset value as that default.
+		desired := 1
+		if inferenceSet.Spec.Replicas != nil {
+			desired = int(*inferenceSet.Spec.Replicas)
+		}
+		value := 0.0
+		if inferenceSet.Status.ReadyReplicas < desired {
+			value = 1
+		}
+		klog.V(4).Infof("readiness gate for InferenceSet %s/%s: %f (ready=%d, desired=%d)",
+			scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, value,
+			inferenceSet.Status.ReadyReplicas, desired)
+		return &externalscaler.GetMetricsResponse{
+			MetricValues: []*externalscaler.MetricValue{
+				{
+					MetricName:       scalerConfig.MetricName,
+					MetricValueFloat: value,
+				},
+			},
+		}, nil
+	}
+
+	scraper, ok := e.scrapers[scalerConfig.MetricSource]
+	if !ok || scraper == nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("unknown metric source %q", scalerConfig.MetricSource))
+	}
+
+	// The quantile aggregation is parametric (target quantile comes from
+	// metadata), so it is not held in the static aggregators map; instead it is
+	// fetched from a per-quantile cache that reuses one immutable aggregator per
+	// distinct quantile value.
+	var agg aggregator.Aggregator
+	if scalerConfig.Aggregation == AggregationQuantile {
+		agg = e.quantileAggregator(scalerConfig.Quantile)
+	} else {
+		agg, ok = e.aggregators[scalerConfig.Aggregation]
+		if !ok || agg == nil {
+			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("unknown aggregation %q", scalerConfig.Aggregation))
+		}
+	}
+
 	// Take a per-call snapshot of metrics across every service belonging to this
-	// InferenceSet. The snapshot is produced by a pluggable metrics.Scraper so
-	// alternative sources (e.g. Pod direct-scraping, Prometheus queries) can be
+	// InferenceSet. The snapshot is produced by a pluggable scraper.Scraper so
+	// alternative sources (e.g. EndpointPicker, Prometheus queries) can be
 	// swapped in without touching the scaler protocol logic below.
-	snapshot, err := e.scraper.Scrape(ctx, inferenceSet, scalerConfig.scrapeConfig())
+	snapshot, err := scraper.Scrape(ctx, inferenceSet, scalerConfig.scrapeConfig())
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to scrape metrics for InferenceSet %s/%s: %v", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, err))
 	}
 	klog.V(6).Infof("scraped snapshot for InferenceSet %s/%s with %d service(s)", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, len(snapshot.Services))
 
-	value, err := e.aggregator.Aggregate(snapshot, scalerConfig.MetricName, scalerConfig.Threshold)
+	value, err := agg.Aggregate(snapshot, scalerConfig.MetricName, scalerConfig.Threshold)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -262,6 +372,31 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		scrapeTimeout = d
 	}
 
+	// Optional routing: which scraper/aggregator serve this trigger. Default to
+	// the legacy service+sum path so existing single-metric ScaledObjects behave
+	// exactly as before.
+	metricSource := md[MetricSourceInMetadata]
+	if metricSource == "" {
+		metricSource = defaultMetricSource
+	}
+	aggregation := md[AggregationInMetadata]
+	if aggregation == "" {
+		aggregation = defaultAggregation
+	}
+
+	// Optional target quantile for the "quantile" aggregation (default p95).
+	quantile := defaultQuantile
+	if q := md[QuantileInMetadata]; q != "" {
+		v, err := strconv.ParseFloat(q, 64)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "quantile must be a valid number")
+		}
+		if v <= 0 || v > 1 {
+			return nil, status.Error(codes.InvalidArgument, "quantile must be in the (0, 1] range")
+		}
+		quantile = v
+	}
+
 	return &Config{
 		InferenceSetName:      inferenceSetName,
 		InferenceSetNamespace: inferenceSetNamespace,
@@ -271,5 +406,8 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		MetricPath:            metricPath,
 		ScrapeTimeout:         scrapeTimeout,
 		Threshold:             threshold,
+		MetricSource:          metricSource,
+		Aggregation:           aggregation,
+		Quantile:              quantile,
 	}, nil
 }

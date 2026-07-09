@@ -17,11 +17,13 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
-	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
+	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"golang.org/x/time/rate"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -31,7 +33,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/utils/ptr"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,7 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scaledobject"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/inferenceset"
 )
 
@@ -51,35 +52,14 @@ const (
 	AnnotationKeyAutoProvision = "scaledobject.kaito.sh/auto-provision"
 	AnnotationKeyMinReplicas   = "scaledobject.kaito.sh/min-replicas"
 	AnnotationKeyMaxReplicas   = "scaledobject.kaito.sh/max-replicas"
-	AnnotationKeyThreshold     = "scaledobject.kaito.sh/threshold"
-	AnnotationKeyMetricName    = "scaledobject.kaito.sh/metricName"
 
-	AnnotationKeyManagedBy = "scaledobject.kaito.sh/managed-by"
-	InferenceSet           = "InferenceSet"
+	requeueInterval = 5 * time.Second
 
-	inferenceSetAPIVersion = "kaito.sh/v1alpha1"
-	requeueInterval        = 5 * time.Second
-
-	// defaultMetricName is the metric scraped from each vLLM inference pod when
-	// the user does not override it via the metricName annotation.
-	defaultMetricName = "vllm:num_requests_waiting"
-
-	// defaultPollingInterval is the interval (in seconds) at which KEDA polls
-	// the external scaler for metrics. Overrides KEDA's built-in default of 30s
-	// to give the autoscaler fresher signals for latency-sensitive inference
-	// workloads.
-	defaultPollingInterval = 15
+	// annotationPrefix is the common prefix for every autoscaling annotation the
+	// controller consumes on an InferenceSet. Any change to a key under this
+	// prefix (including the indexed composite keys) triggers a reconcile.
+	annotationPrefix = "scaledobject.kaito.sh/"
 )
-
-// watchedAnnotations are the annotations whose changes should trigger a
-// reconcile of the owning InferenceSet.
-var watchedAnnotations = []string{
-	AnnotationKeyAutoProvision,
-	AnnotationKeyMinReplicas,
-	AnnotationKeyMaxReplicas,
-	AnnotationKeyThreshold,
-	AnnotationKeyMetricName,
-}
 
 type Controller struct {
 	client.Client
@@ -99,7 +79,7 @@ func NewAutoProvisionController(c client.Client, scalerNamespace, scalerServiceN
 	}
 }
 
-func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceSet) (reconcile.Result, error) {
+func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSet) (reconcile.Result, error) {
 	logger := log.FromContext(ctx).WithName("auto-provision-controller")
 	if !enableAutoProvisioning(is) {
 		return reconcile.Result{}, nil
@@ -127,22 +107,40 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1alpha1.InferenceS
 		}
 		return reconcile.Result{}, nil
 	}
-	threshold := is.Annotations[AnnotationKeyThreshold]
-	metricName := resolveMetricName(is.Annotations)
 
 	managedScaledObjects, err := c.listManagedScaledObjects(ctx, is)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	return reconcile.Result{}, c.syncScaledObjects(ctx, is, managedScaledObjects, minReplicas, maxReplicas, threshold, metricName)
+	// Select the provisioner for this InferenceSet: composite (multi-metric) mode
+	// when the indexed composite annotations are present, single-metric mode
+	// otherwise. Both modes build a desired ScaledObject via the common
+	// scaledobject.Provisioner interface.
+	soBuilder := scaledobject.Builder{
+		ScalerNamespace:   c.ScalerNamespace,
+		ScalerServiceName: c.ScalerServiceName,
+		ScalerGRPCPort:    c.ScalerGRPCPort,
+	}
+	provisioner := scaledobject.ProvisionerFor(soBuilder, is.Annotations)
+	desired, err := provisioner.BuildDesired(is, minReplicas, maxReplicas)
+	if err != nil {
+		logger.Info("skip reconciling inference set because autoscaling config is invalid",
+			"mode", provisioner.Mode(), "namespace", is.Namespace, "name", is.Name, "error", err.Error())
+		if c.Recorder != nil {
+			c.Recorder.Eventf(is, corev1.EventTypeWarning, provisioner.InvalidConfigReason(),
+				"Skip auto-provisioning ScaledObject: %v", err)
+		}
+		return reconcile.Result{}, nil
+	}
+	return reconcile.Result{}, c.syncDesired(ctx, managedScaledObjects, desired)
 }
 
 // resolveMaxReplicas computes the max replicas for the ScaledObject. When
 // NodeCountLimit is set, it derives the value from workspaces and may signal a
 // requeue if information is not yet available. Otherwise it falls back to the
 // max-replicas annotation or a default of 1.
-func (c *Controller) resolveMaxReplicas(ctx context.Context, is *kaitov1alpha1.InferenceSet) (int, bool, error) {
+func (c *Controller) resolveMaxReplicas(ctx context.Context, is *kaitov1beta1.InferenceSet) (int, bool, error) {
 	if is.Spec.NodeCountLimit == 0 {
 		if maxReplicasStr, ok := is.Annotations[AnnotationKeyMaxReplicas]; ok {
 			v, err := strconv.Atoi(maxReplicasStr)
@@ -183,31 +181,35 @@ func (c *Controller) resolveMaxReplicas(ctx context.Context, is *kaitov1alpha1.I
 
 // listManagedScaledObjects returns ScaledObjects that target the given
 // InferenceSet and are managed by this scaler.
-func (c *Controller) listManagedScaledObjects(ctx context.Context, is *kaitov1alpha1.InferenceSet) ([]v1alpha1.ScaledObject, error) {
+func (c *Controller) listManagedScaledObjects(ctx context.Context, is *kaitov1beta1.InferenceSet) ([]v1alpha1.ScaledObject, error) {
 	var scaledObjectList v1alpha1.ScaledObjectList
 	if err := c.List(ctx, &scaledObjectList, client.InNamespace(is.Namespace)); err != nil {
 		return nil, err
 	}
 
 	var managed []v1alpha1.ScaledObject
-	for _, so := range scaledObjectList.Items {
-		if so.Spec.ScaleTargetRef.Name == is.Name &&
-			so.Spec.ScaleTargetRef.Kind == InferenceSet &&
-			so.Annotations[AnnotationKeyManagedBy] == scaler.ScalerName {
+	for i := range scaledObjectList.Items {
+		so := scaledObjectList.Items[i]
+		// Only ScaledObjects owned (controller reference) by this InferenceSet are
+		// considered managed. This is stricter and more robust than matching on the
+		// scale target and managed-by annotation: it excludes ScaledObjects a user
+		// created by hand for the same InferenceSet, which we must not touch.
+		owner := metav1.GetControllerOf(&so)
+		if owner != nil && owner.UID == is.UID && owner.Kind == scaledobject.InferenceSet {
 			managed = append(managed, so)
 		}
 	}
 	return managed, nil
 }
 
-// syncScaledObjects creates, updates, or deduplicates managed ScaledObjects so
-// that exactly one matches the desired spec.
-func (c *Controller) syncScaledObjects(ctx context.Context, is *kaitov1alpha1.InferenceSet, existing []v1alpha1.ScaledObject, minReplicas, maxReplicas int, threshold, metricName string) error {
+// syncDesired creates, updates, or deduplicates managed ScaledObjects so that
+// exactly one matches the desired spec (single-metric or composite).
+func (c *Controller) syncDesired(ctx context.Context, existing []v1alpha1.ScaledObject, desired *v1alpha1.ScaledObject) error {
 	switch len(existing) {
 	case 0:
-		return c.Create(ctx, c.buildScaledObject(is, minReplicas, maxReplicas, threshold, metricName))
+		return c.Create(ctx, desired)
 	case 1:
-		return c.updateScaledObject(ctx, is, &existing[0], minReplicas, maxReplicas, threshold, metricName)
+		return c.reconcileTo(ctx, &existing[0], desired)
 	default:
 		// Keep the oldest one, delete the rest, then reconcile the kept one to
 		// the desired spec so it does not go stale after annotation changes.
@@ -219,106 +221,135 @@ func (c *Controller) syncScaledObjects(ctx context.Context, is *kaitov1alpha1.In
 				return err
 			}
 		}
-		return c.updateScaledObject(ctx, is, &existing[0], minReplicas, maxReplicas, threshold, metricName)
+		return c.reconcileTo(ctx, &existing[0], desired)
 	}
 }
 
-func (c *Controller) buildScaledObject(is *kaitov1alpha1.InferenceSet, minReplicas, maxReplicas int, threshold, metricName string) *v1alpha1.ScaledObject {
-	return &v1alpha1.ScaledObject{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      is.Name,
-			Namespace: is.Namespace,
-			Annotations: map[string]string{
-				AnnotationKeyManagedBy: scaler.ScalerName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion:         inferenceSetAPIVersion,
-					Kind:               InferenceSet,
-					Name:               is.Name,
-					UID:                is.UID,
-					Controller:         ptr.To(true),
-					BlockOwnerDeletion: ptr.To(true),
-				},
-			},
-		},
-		Spec: v1alpha1.ScaledObjectSpec{
-			Advanced: &v1alpha1.AdvancedConfig{
-				HorizontalPodAutoscalerConfig: getDefaultHorizontalPodAutoscalerConfig(),
-			},
-			ScaleTargetRef: &v1alpha1.ScaleTarget{
-				Name:       is.Name,
-				APIVersion: inferenceSetAPIVersion,
-				Kind:       InferenceSet,
-			},
-			PollingInterval: ptr.To(int32(defaultPollingInterval)),
-			MinReplicaCount: ptr.To(int32(minReplicas)),
-			MaxReplicaCount: ptr.To(int32(maxReplicas)),
-			Triggers:        getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, c.ScalerServiceName, c.ScalerGRPCPort, threshold, metricName),
-		},
-	}
-}
-
-func (c *Controller) updateScaledObject(ctx context.Context, is *kaitov1alpha1.InferenceSet, so *v1alpha1.ScaledObject, minReplicas, maxReplicas int, threshold, metricName string) error {
+// reconcileTo mutates the existing ScaledObject toward the desired spec,
+// updating only the fields this controller manages (replica bounds, polling
+// interval, triggers, and the advanced HPA/scalingModifiers config) and issues
+// an Update only when something actually changed.
+func (c *Controller) reconcileTo(ctx context.Context, existing, desired *v1alpha1.ScaledObject) error {
 	updated := false
 
-	if so.Spec.MinReplicaCount == nil || *so.Spec.MinReplicaCount != int32(minReplicas) {
-		so.Spec.MinReplicaCount = ptr.To(int32(minReplicas))
+	if !equalInt32Ptr(existing.Spec.MinReplicaCount, desired.Spec.MinReplicaCount) {
+		existing.Spec.MinReplicaCount = desired.Spec.MinReplicaCount
 		updated = true
 	}
-	if so.Spec.MaxReplicaCount == nil || *so.Spec.MaxReplicaCount != int32(maxReplicas) {
-		so.Spec.MaxReplicaCount = ptr.To(int32(maxReplicas))
+	if !equalInt32Ptr(existing.Spec.MaxReplicaCount, desired.Spec.MaxReplicaCount) {
+		existing.Spec.MaxReplicaCount = desired.Spec.MaxReplicaCount
 		updated = true
 	}
-	if len(so.Spec.Triggers) == 0 {
-		// Restore triggers if they were removed (e.g., manual edit drift).
-		so.Spec.Triggers = getDefaultKedaKaitoScalerTriggers(is.Name, is.Namespace, c.ScalerNamespace, c.ScalerServiceName, c.ScalerGRPCPort, threshold, metricName)
+	if !equalInt32Ptr(existing.Spec.PollingInterval, desired.Spec.PollingInterval) {
+		existing.Spec.PollingInterval = desired.Spec.PollingInterval
 		updated = true
-	} else {
-		if so.Spec.Triggers[0].Metadata == nil {
-			so.Spec.Triggers[0].Metadata = make(map[string]string)
-		}
-		if so.Spec.Triggers[0].Metadata["threshold"] != threshold {
-			so.Spec.Triggers[0].Metadata["threshold"] = threshold
-			updated = true
-		}
-		if so.Spec.Triggers[0].Metadata[scaler.MetricNameInMetadata] != metricName {
-			so.Spec.Triggers[0].Metadata[scaler.MetricNameInMetadata] = metricName
-			updated = true
-		}
+	}
+	if !reflect.DeepEqual(existing.Spec.Triggers, desired.Spec.Triggers) {
+		existing.Spec.Triggers = desired.Spec.Triggers
+		updated = true
+	}
+	if advancedChanged(existing.Spec.Advanced, desired.Spec.Advanced) {
+		existing.Spec.Advanced = desired.Spec.Advanced
+		updated = true
 	}
 
 	if !updated {
 		return nil
 	}
-	return c.Update(ctx, so)
+	return c.Update(ctx, existing)
+}
+
+func equalInt32Ptr(a, b *int32) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// advancedChanged reports whether the managed subset of AdvancedConfig differs
+// between the current and desired ScaledObject. It compares scalingModifiers by
+// value and the HPA behaviour by the specific fields the controller sets,
+// avoiding reflect.DeepEqual on resource.Quantity (whose cached string field can
+// cause spurious diffs and update loops).
+func advancedChanged(existing, desired *v1alpha1.AdvancedConfig) bool {
+	if existing == nil || desired == nil {
+		return existing != desired
+	}
+	if existing.ScalingModifiers != desired.ScalingModifiers {
+		return true
+	}
+	return hpaConfigChanged(existing.HorizontalPodAutoscalerConfig, desired.HorizontalPodAutoscalerConfig)
+}
+
+func hpaConfigChanged(existing, desired *v1alpha1.HorizontalPodAutoscalerConfig) bool {
+	if existing == nil || desired == nil {
+		return existing != desired
+	}
+	if (existing.Behavior == nil) != (desired.Behavior == nil) {
+		return true
+	}
+	if existing.Behavior == nil {
+		return false
+	}
+	return scalingRulesChanged(existing.Behavior.ScaleUp, desired.Behavior.ScaleUp) ||
+		scalingRulesChanged(existing.Behavior.ScaleDown, desired.Behavior.ScaleDown)
+}
+
+func scalingRulesChanged(existing, desired *autoscalingv2.HPAScalingRules) bool {
+	if existing == nil || desired == nil {
+		return existing != desired
+	}
+	if !equalInt32Ptr(existing.StabilizationWindowSeconds, desired.StabilizationWindowSeconds) {
+		return true
+	}
+	if quantityString(existing.Tolerance) != quantityString(desired.Tolerance) {
+		return true
+	}
+	if len(existing.Policies) != len(desired.Policies) {
+		return true
+	}
+	for i := range existing.Policies {
+		if existing.Policies[i].Type != desired.Policies[i].Type ||
+			existing.Policies[i].Value != desired.Policies[i].Value ||
+			existing.Policies[i].PeriodSeconds != desired.Policies[i].PeriodSeconds {
+			return true
+		}
+	}
+	return false
+}
+
+func quantityString(q *resource.Quantity) string {
+	if q == nil {
+		return ""
+	}
+	return q.String()
 }
 
 func generateInferenceSetPredicateFunc() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			inferenceSet, ok := e.Object.(*kaitov1alpha1.InferenceSet)
+			inferenceSet, ok := e.Object.(*kaitov1beta1.InferenceSet)
 			if !ok {
 				return false
 			}
 			return enableAutoProvisioning(inferenceSet)
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldInferenceSet, ok := e.ObjectOld.(*kaitov1alpha1.InferenceSet)
+			oldInferenceSet, ok := e.ObjectOld.(*kaitov1beta1.InferenceSet)
 			if !ok {
 				return false
 			}
 
-			newInferenceSet, ok := e.ObjectNew.(*kaitov1alpha1.InferenceSet)
+			newInferenceSet, ok := e.ObjectNew.(*kaitov1beta1.InferenceSet)
 			if !ok {
 				return false
 			}
 
-			// Reconcile when any watched annotation changes.
-			for _, key := range watchedAnnotations {
-				if oldInferenceSet.Annotations[key] != newInferenceSet.Annotations[key] {
-					return enableAutoProvisioning(newInferenceSet)
-				}
+			// Reconcile when any autoscaling annotation changes. Comparing by
+			// prefix covers the fixed single-metric keys as well as the indexed
+			// composite keys (metricName/0, upthreshold/0, ...).
+			if annotationsWithPrefixChanged(oldInferenceSet.Annotations, newInferenceSet.Annotations, annotationPrefix) {
+				return enableAutoProvisioning(newInferenceSet)
 			}
 			return false
 		},
@@ -340,17 +371,7 @@ func resolveMinReplicas(annotations map[string]string) int {
 	return 1
 }
 
-// resolveMetricName returns the metric name configured via the metricName
-// annotation on the InferenceSet, falling back to defaultMetricName when
-// the annotation is absent or empty.
-func resolveMetricName(annotations map[string]string) string {
-	if name, ok := annotations[AnnotationKeyMetricName]; ok && name != "" {
-		return name
-	}
-	return defaultMetricName
-}
-
-func enableAutoProvisioning(inferenceSet *kaitov1alpha1.InferenceSet) bool {
+func enableAutoProvisioning(inferenceSet *kaitov1beta1.InferenceSet) bool {
 	if inferenceSet.Annotations[AnnotationKeyAutoProvision] != "true" {
 		return false
 	}
@@ -365,12 +386,34 @@ func enableAutoProvisioning(inferenceSet *kaitov1alpha1.InferenceSet) bool {
 		return false
 	}
 
+	// Composite mode validates its own (indexed) thresholds instead of the
+	// single threshold annotation.
+	if scaledobject.IsCompositeMode(inferenceSet.Annotations) {
+		return scaledobject.ValidateComposite(inferenceSet.Annotations) == nil
+	}
+
 	// threshold should be a valid integer
-	if threshold, err := strconv.Atoi(inferenceSet.Annotations[AnnotationKeyThreshold]); err != nil || threshold < 0 {
+	if threshold, err := strconv.Atoi(inferenceSet.Annotations[scaledobject.AnnotationKeyThreshold]); err != nil || threshold < 0 {
 		return false
 	}
 
 	return true
+}
+
+// annotationsWithPrefixChanged reports whether any annotation key starting with
+// prefix differs between the old and new maps (including keys added or removed).
+func annotationsWithPrefixChanged(oldAnnotations, newAnnotations map[string]string, prefix string) bool {
+	for k, v := range oldAnnotations {
+		if strings.HasPrefix(k, prefix) && newAnnotations[k] != v {
+			return true
+		}
+	}
+	for k, v := range newAnnotations {
+		if strings.HasPrefix(k, prefix) && oldAnnotations[k] != v {
+			return true
+		}
+	}
+	return false
 }
 
 // +kubebuilder:rbac:groups="keda.sh",resources=scaledobjects,verbs=create;list;watch;get;update;delete
@@ -380,10 +423,10 @@ func enableAutoProvisioning(inferenceSet *kaitov1alpha1.InferenceSet) bool {
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("scaledobject.provision").
-		For(&kaitov1alpha1.InferenceSet{}, builder.WithPredicates(generateInferenceSetPredicateFunc())).
+		For(&kaitov1beta1.InferenceSet{}, builder.WithPredicates(generateInferenceSetPredicateFunc())).
 		Watches(&v1alpha1.ScaledObject{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 			if scaledObj, ok := obj.(*v1alpha1.ScaledObject); ok {
-				if scaledObj.Spec.ScaleTargetRef.Kind == InferenceSet {
+				if scaledObj.Spec.ScaleTargetRef.Kind == scaledobject.InferenceSet {
 					return []reconcile.Request{
 						{
 							NamespacedName: types.NamespacedName{Namespace: scaledObj.Namespace, Name: scaledObj.Spec.ScaleTargetRef.Name},
@@ -401,66 +444,4 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			MaxConcurrentReconciles: 10,
 		}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
-}
-
-func getDefaultHorizontalPodAutoscalerConfig() *v1alpha1.HorizontalPodAutoscalerConfig {
-	return &v1alpha1.HorizontalPodAutoscalerConfig{
-		Behavior: &autoscalingv2.HorizontalPodAutoscalerBehavior{
-			ScaleUp: &autoscalingv2.HPAScalingRules{
-				StabilizationWindowSeconds: ptr.To(int32(60)),
-				SelectPolicy:               ptr.To(autoscalingv2.MaxChangePolicySelect),
-				Policies: []autoscalingv2.HPAScalingPolicy{
-					{
-						Type:          autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy),
-						Value:         1,
-						PeriodSeconds: 300,
-					},
-				},
-				Tolerance: func() *resource.Quantity {
-					q := resource.MustParse("0.1")
-					return &q
-				}(),
-			},
-			ScaleDown: &autoscalingv2.HPAScalingRules{
-				StabilizationWindowSeconds: ptr.To(int32(300)),
-				SelectPolicy:               ptr.To(autoscalingv2.MaxChangePolicySelect),
-				Policies: []autoscalingv2.HPAScalingPolicy{
-					{
-						Type:          autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy),
-						Value:         1,
-						PeriodSeconds: 600,
-					},
-				},
-				Tolerance: func() *resource.Quantity {
-					q := resource.MustParse("0.5")
-					return &q
-				}(),
-			},
-		},
-	}
-}
-
-func getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, scalerServiceName string, scalerGRPCPort int, threshold, metricName string) []v1alpha1.ScaleTriggers {
-	// metricProtocol/metricPort/metricPath/scrapeTimeout are intentionally
-	// omitted: the scaler-side parseScalerMetadata fills them with defaults
-	// matching Kaito's vLLM exposure (http on Service port 80, /metrics, 3s),
-	// so we only keep keys that the scaler cannot infer on its own.
-	return []v1alpha1.ScaleTriggers{
-		{
-			Type: "external",
-			Name: scaler.ScalerName,
-			Metadata: map[string]string{
-				"threshold":                            threshold,
-				scaler.InferenceSetNameInMetadata:      inferenceSetName,
-				scaler.InferenceSetNamespaceInMetadata: inferenceSetNamespace,
-				scaler.ScalerAddressInMetadata:         fmt.Sprintf("%s.%s.svc.cluster.local:%d", scalerServiceName, scalerNamespace, scalerGRPCPort),
-				scaler.MetricNameInMetadata:            metricName,
-			},
-			AuthenticationRef: &v1alpha1.AuthenticationRef{
-				Name: scaler.ClusterTriggerAuthName,
-				Kind: scaler.ClusterTriggerAuthKind,
-			},
-			MetricType: autoscalingv2.AverageValueMetricType,
-		},
-	}
 }

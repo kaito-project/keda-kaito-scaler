@@ -21,7 +21,6 @@ import (
 	"net/http"
 	"time"
 
-	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/open-policy-agent/cert-controller/pkg/rotator"
@@ -52,10 +51,11 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/kaito-project/keda-kaito-scaler/cmd/app/options"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/aggregator"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/injections"
-	"github.com/kaito-project/keda-kaito-scaler/pkg/metrics"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scraper"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/cert"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/profile"
 )
@@ -86,7 +86,7 @@ const (
 
 func init() {
 	// controller-runtime manager use scheme.Scheme by default
-	utilruntime.Must(kaitov1alpha1.AddToScheme(scheme.Scheme))
+	utilruntime.Must(kaitov1beta1.AddToScheme(scheme.Scheme))
 	utilruntime.Must(kaitov1beta1.AddToScheme(scheme.Scheme))
 	utilruntime.Must(v1alpha1.AddToScheme(scheme.Scheme))
 }
@@ -203,8 +203,21 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	// The runnable waits for the mTLS certificates to be ready before it starts
 	// listening, so the manager alone drives the full lifecycle.
 	lo.Must0(mgr.Add(scaler.NewRunnable(scaler.ServerConfig{
-		Port:                 opts.GrpcPort,
-		Service:              scaler.NewKaitoScaler(mgr.GetClient(), metrics.NewServiceMetricsScraper(mgr.GetClient()), metrics.NewSumAggregator()),
+		Port: opts.GrpcPort,
+		Service: scaler.NewKaitoScaler(
+			mgr.GetClient(),
+			map[string]scraper.Scraper{
+				"service": scraper.NewServiceMetricsScraper(mgr.GetClient()),
+				"epp":     scraper.NewEPPScraper(mgr.GetClient()),
+			},
+			// The "quantile" aggregation is parametric (its target quantile comes
+			// from trigger metadata) so the scaler builds it per request instead of
+			// registering it here.
+			map[string]aggregator.Aggregator{
+				"sum":        aggregator.NewSumAggregator(),
+				"perpod-avg": aggregator.NewPerPodAverageAggregator(),
+			},
+		),
 		GetServerCertificate: cert.NewServerCertLoader(secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName, ServerCert, ServerKey),
 		LoadRootCAs:          cert.NewRootCAsLoader(secretLister, opts.WorkingNamespace, opts.ScalerClientSecretName, CACert),
 		ServerCertReady:      serverCertReady,
@@ -247,7 +260,7 @@ func waitForRequiredCRDs(ctx context.Context, cfg *rest.Config) error {
 	}
 
 	required := []schema.GroupVersionKind{
-		kaitov1alpha1.GroupVersion.WithKind("InferenceSet"),
+		kaitov1beta1.GroupVersion.WithKind("InferenceSet"),
 		v1alpha1.GroupVersion.WithKind("ScaledObject"),
 		v1alpha1.GroupVersion.WithKind("ClusterTriggerAuthentication"),
 	}

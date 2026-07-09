@@ -11,16 +11,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package metrics
+package aggregator
 
 import (
 	"fmt"
 
 	"go.uber.org/multierr"
 	"k8s.io/klog/v2"
+
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scraper"
 )
 
-// Aggregator reduces the per-service values inside a MetricSnapshot to the
+// Aggregator reduces the per-service values inside a scraper.MetricSnapshot to the
 // single metric value that KEDA consumes.
 //
 // The returned value is meant to be paired with HPA's "AverageValue" target
@@ -28,7 +30,7 @@ import (
 // load. HPA then computes desiredReplicas = ceil(value / threshold), so the
 // aggregator must return the *total* (sum) load across all services.
 type Aggregator interface {
-	Aggregate(snapshot *MetricSnapshot, metricName string, threshold float64) (float64, error)
+	Aggregate(snapshot *scraper.MetricSnapshot, metricName string, threshold float64) (float64, error)
 }
 
 // SumAggregator sums a metric across every service that belongs to an
@@ -59,7 +61,7 @@ func NewSumAggregator() *SumAggregator {
 }
 
 // Aggregate implements Aggregator.
-func (a *SumAggregator) Aggregate(snapshot *MetricSnapshot, metricName string, threshold float64) (float64, error) {
+func (a *SumAggregator) Aggregate(snapshot *scraper.MetricSnapshot, metricName string, threshold float64) (float64, error) {
 	if snapshot == nil {
 		return 0, fmt.Errorf("metric snapshot is nil")
 	}

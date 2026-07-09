@@ -20,6 +20,7 @@ The KEDA Kaito Scaler provides intelligent autoscaling for vLLM inference worklo
 ![keda-kaito-scaler-arch](./docs/images/keda-kaito-scaler-arch.png)
 
 ## Prerequisites
+
 ### Enable InferenceSet Controller during KAITO install
 
 To enable autoscaling of KAITO GPU inference workloads, the `InferenceSet` custom resource must be utilized in KAITO, and the InferenceSet Controller should be activated during the KAITO installation. The `InferenceSet` feature was introduced in KAITO version `v0.8.0` as an alpha feature.
@@ -38,14 +39,18 @@ helm upgrade --install kaito-workspace kaito/workspace \
 ```
 
 ### install KEDA
-> the following example demonstrates how to install KEDA using Helm chart. For instructions on installing KEDA through other methods, please refer to the guide [here](https://github.com/kedacore/keda#deploying-keda).
+
+> the following example demonstrates how to install KEDA using Helm chart. For instructions on installing KEDA through other methods, please refer to the [KEDA deployment guide](https://github.com/kedacore/keda#deploying-keda).
+
 ```bash
 helm repo add kedacore https://kedacore.github.io/charts
 helm install keda kedacore/keda --namespace keda --create-namespace
 ```
 
 ## Quick Start
+
 ### Deploy KEDA Kaito Scaler
+
 > autoscaling of KAITO GPU inference workloads requires KEDA Kaito Scaler version v0.3.3 or higher.
 
 ```bash
@@ -54,10 +59,12 @@ helm repo update
 ```
 
 Check available versions:
+
 ```bash
 helm search repo -l keda-kaito-scaler
 ```
-```
+
+```text
 NAME                                    CHART VERSION   APP VERSION   DESCRIPTION
 keda-kaito-scaler/keda-kaito-scaler     0.3.3           v0.3.3        A Helm chart for Kaito keda-kaito-scaler compon...
 keda-kaito-scaler/keda-kaito-scaler     0.3.0           v0.3.0        A Helm chart for Kaito keda-kaito-scaler compon...
@@ -73,23 +80,30 @@ helm upgrade --install keda-kaito-scaler -n keda keda-kaito-scaler/keda-kaito-sc
 > (`keda` in the command above). The chart's `ClusterTriggerAuthentication`
 > references TLS secrets created in the scaler's namespace, and KEDA only
 > resolves those secrets when it can read them from its own namespace.
-
-> **Required CRDs.** keda-kaito-scaler verifies that the `ScaledObject`
-> (`keda.sh/v1alpha1`) and `InferenceSet` (`kaito.sh/v1alpha1`) CRDs are
-> installed in the cluster at startup and exits with an error if either is
-> missing. Make sure both KEDA and the KAITO `InferenceSet` controller (see
-> [Prerequisites](#prerequisites)) are installed before deploying the scaler.
+>
+> **Required CRDs.** At startup keda-kaito-scaler waits for every CRD it relies
+> on to be installed: `InferenceSet` (`kaito.sh/v1beta1`), `ScaledObject`
+> (`keda.sh/v1alpha1`), and `ClusterTriggerAuthentication` (`keda.sh/v1alpha1`).
+> It polls for them rather than failing fast, so keda-kaito-scaler can be
+> deployed in any order relative to KEDA and the KAITO `InferenceSet` controller
+> (see [Prerequisites](#prerequisites)) — it simply blocks until all three CRDs
+> are present.
 
 ### Create a Kaito InferenceSet for running inference workloads
 
-You can drive autoscaling in two ways:
+You can drive autoscaling in three ways:
 
-1. **Auto-provision mode (recommended)** — annotate the `InferenceSet` and let
-   keda-kaito-scaler create and reconcile the `ScaledObject` for you.
-2. **Manual mode** — author the `ScaledObject` yourself and point its `external`
+1. **Composite multi-metric auto-provision (recommended)** — annotate the
+   `InferenceSet` with several signals (queue length, latency, waiting requests)
+   and let keda-kaito-scaler combine them under a conservative AND policy. See
+   [Composite multi-metric auto-provision](#option-1-composite-multi-metric-auto-provision-recommended).
+2. **Single-metric auto-provision** — annotate the `InferenceSet` with one
+   metric and let keda-kaito-scaler create and reconcile the `ScaledObject` for
+   you.
+3. **Manual mode** — author the `ScaledObject` yourself and point its `external`
    trigger at the keda-kaito-scaler service.
 
-Both modes share the same scaling semantics:
+The single-metric and manual approaches share the same scaling semantics:
 
 - The trigger uses HPA `metricType: AverageValue`. The scaler returns the
   **sum** of the metric across all `Workspace` services owned by the
@@ -102,7 +116,93 @@ Both modes share the same scaling semantics:
   metric exposed on the workspace `Service` works (use a metric family name
   identical to what `/metrics` exposes).
 
-#### Option 1: Auto-provision via InferenceSet annotations
+#### Option 1: Composite multi-metric auto-provision (recommended)
+
+For production inference workloads we **recommend combining several signals**
+(queue length, latency, waiting requests) so the autoscaler only reacts when
+multiple indicators agree. Adding the indexed `metricName/0` annotation switches
+the `InferenceSet` into **composite mode**: keda-kaito-scaler builds a
+`ScaledObject` whose KEDA `scalingModifiers` formula applies a conservative
+**AND** policy — scale up by one replica only when *every* metric is above its
+up-threshold (and newly added pods are ready), scale down by one replica only
+when *every* metric is below its down-threshold, otherwise hold. Each scale
+step is capped at ±1 replica per cooldown to protect expensive GPU capacity.
+
+Composite metrics are drawn from a fixed catalog:
+
+| `metricName/{i}` | Source | Aggregation | Meaning |
+| --- | --- | --- | --- |
+| `inference_pool_per_pod_queue_size` | EPP | per-pod average (float) | Average in-flight queue length per serving pod. |
+| `inference_objective_request_duration_seconds` | EPP | histogram quantile | End-to-end request latency at the configured quantile (default p95). |
+| `vllm:num_requests_waiting` | workspace `Service` | sum | vLLM waiting-queue length summed across pods. |
+
+Each metric is configured by a group of `/{i}`-indexed annotations; global
+behaviour is tuned by the un-indexed composite annotations:
+
+| Annotation | Required | Default | Description |
+| --- | --- | --- | --- |
+| `scaledobject.kaito.sh/metricName/{i}` | yes | – | Catalog metric for slot `i`. Presence of `metricName/0` enables composite mode. |
+| `scaledobject.kaito.sh/upthreshold/{i}` | yes | – | Scale-up threshold for metric `i` (float). |
+| `scaledobject.kaito.sh/downthreshold/{i}` | yes | – | Scale-down threshold for metric `i` (float). Must be `<= upthreshold/{i}`. |
+| `scaledobject.kaito.sh/quantile/{i}` | no | `0.95` | Target quantile for `inference_objective_request_duration_seconds`; must be in `(0, 1]`. Ignored by other metrics. |
+| `scaledobject.kaito.sh/combinepolicy` | no | `AND` | How per-metric conditions are combined. Only `AND` is currently supported. |
+| `scaledobject.kaito.sh/evaluationwindow` | no | `60` | Scale-up stabilization window (seconds). |
+| `scaledobject.kaito.sh/scaleupcooldown` | no | `300` | Minimum seconds between scale-up steps. |
+| `scaledobject.kaito.sh/scaledowncooldown` | no | `300` | Minimum seconds between scale-down steps. |
+
+The single-metric `threshold`/`metricName` annotations are ignored in composite
+mode; `min-replicas`, `max-replicas`, and `nodeCountLimit` behave exactly as in
+single-metric mode.
+
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: kaito.sh/v1beta1
+kind: InferenceSet
+metadata:
+  annotations:
+    scaledobject.kaito.sh/auto-provision: "true"
+
+    # Metric 0: per-pod queue length (EPP, float average)
+    scaledobject.kaito.sh/metricName/0: "inference_pool_per_pod_queue_size"
+    scaledobject.kaito.sh/upthreshold/0: "5"
+    scaledobject.kaito.sh/downthreshold/0: "1"
+
+    # Metric 1: p95 end-to-end request latency (EPP, histogram quantile)
+    scaledobject.kaito.sh/metricName/1: "inference_objective_request_duration_seconds"
+    scaledobject.kaito.sh/upthreshold/1: "2.0"
+    scaledobject.kaito.sh/downthreshold/1: "0.5"
+    scaledobject.kaito.sh/quantile/1: "0.95"
+
+    # Optional global tuning (defaults shown)
+    scaledobject.kaito.sh/combinepolicy: "AND"
+    scaledobject.kaito.sh/evaluationwindow: "60"
+    scaledobject.kaito.sh/scaleupcooldown: "300"
+    scaledobject.kaito.sh/scaledowncooldown: "300"
+  name: phi-4
+  namespace: default
+spec:
+  labelSelector:
+    matchLabels:
+      apps: phi-4
+  replicas: 1
+  nodeCountLimit: 5
+  template:
+    inference:
+      preset:
+        accessMode: public
+        name: phi-4-mini-instruct
+    resource:
+      instanceType: Standard_NC24ads_A100_v4
+EOF
+```
+
+With this configuration the `InferenceSet` scales up by one replica only when the
+per-pod queue **and** p95 latency **and** vLLM waiting queue are all above their
+up-thresholds, and scales down by one replica only when all three are below their
+down-thresholds — a deliberately conservative policy well suited to expensive GPU
+capacity.
+
+#### Option 2: Single-metric auto-provision
 
 Annotations under the `scaledobject.kaito.sh/` prefix configure the auto-provision
 controller. When `auto-provision=true` and the configuration is valid, the
@@ -110,7 +210,7 @@ controller creates a `ScaledObject` named after the `InferenceSet` (and keeps
 it in sync on annotation updates).
 
 | Annotation | Required | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `scaledobject.kaito.sh/auto-provision` | yes | – | Must be `"true"` to enable auto-provisioning. |
 | `scaledobject.kaito.sh/threshold` | yes | – | Per-replica target value passed to the trigger. Non-negative integer. |
 | `scaledobject.kaito.sh/metricName` | no | `vllm:num_requests_waiting` | Prometheus metric family name to scrape from each pod. |
@@ -119,7 +219,7 @@ it in sync on annotation updates).
 
 ```bash
 cat <<EOF | kubectl apply -f -
-apiVersion: kaito.sh/v1alpha1
+apiVersion: kaito.sh/v1beta1
 kind: InferenceSet
 metadata:
   annotations:
@@ -151,14 +251,14 @@ metrics, both objects flip to `READY=True`:
 ```bash
 # kubectl get scaledobject
 NAME    SCALETARGETKIND                  SCALETARGETNAME   MIN   MAX   READY   ACTIVE   FALLBACK   PAUSED   TRIGGERS   AUTHENTICATIONS           AGE
-phi-4   kaito.sh/v1alpha1.InferenceSet   phi-4             1     5     True    True     False      False    external   keda-kaito-scaler-creds   10m
+phi-4   kaito.sh/v1beta1.InferenceSet   phi-4             1     5     True    True     False      False    external   keda-kaito-scaler-creds   10m
 
 # kubectl get hpa
 NAME             REFERENCE            TARGETS      MINPODS   MAXPODS   REPLICAS   AGE
 keda-hpa-phi-4   InferenceSet/phi-4   0/10 (avg)   1         5         1          11m
 ```
 
-#### Option 2: Manage the ScaledObject yourself
+#### Option 3: Manage the ScaledObject yourself
 
 If you prefer to author the `ScaledObject` directly (e.g. to plug in custom
 scaling policies or additional triggers), point an `external` trigger at the
@@ -173,7 +273,7 @@ metadata:
   namespace: default
 spec:
   scaleTargetRef:
-    apiVersion: kaito.sh/v1alpha1
+    apiVersion: kaito.sh/v1beta1
     kind: InferenceSet
     name: phi-4
   minReplicaCount: 1
@@ -205,7 +305,7 @@ spec:
 The trigger metadata fields map 1:1 to the scaler's gRPC payload:
 
 | Field | Required | Default | Notes |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `scalerAddress` | yes | – | Used by KEDA to dial the scaler. Format: `keda-kaito-scaler-svc.<scaler-namespace>.svc.cluster.local:10450`. |
 | `inferenceSetName` | yes | – | Target `InferenceSet` name. |
 | `inferenceSetNamespace` | yes | – | Target `InferenceSet` namespace. May differ from the `ScaledObject` namespace; a single keda-kaito-scaler instance serves all namespaces in the cluster. |

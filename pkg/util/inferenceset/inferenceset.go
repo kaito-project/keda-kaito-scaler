@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 
-	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/util/retry"
@@ -29,7 +28,7 @@ import (
 const WorkspaceCreatedByInferenceSetLabel = "inferenceset.kaito.sh/created-by"
 
 // ListWorkspaces lists Workspaces in iObj.Namespace created by the given InferenceSet.
-func ListWorkspaces(ctx context.Context, iObj *kaitov1alpha1.InferenceSet, kubeClient client.Client) (*kaitov1beta1.WorkspaceList, error) {
+func ListWorkspaces(ctx context.Context, iObj *kaitov1beta1.InferenceSet, kubeClient client.Client) (*kaitov1beta1.WorkspaceList, error) {
 	if iObj == nil {
 		return nil, fmt.Errorf("InferenceSet object is nil")
 	}
