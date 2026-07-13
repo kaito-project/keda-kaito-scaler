@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package scraper
+package metricsource
 
 import (
 	"context"
@@ -33,7 +33,7 @@ import (
 
 const workspaceCreatedByLabel = "inferenceset.kaito.sh/created-by"
 
-func newScraperFakeClient(t *testing.T, objs ...client.Object) client.Client {
+func newSourceFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
@@ -66,7 +66,7 @@ func newTestServerURLBuilder(base string) func(protocol, name, namespace, port, 
 	}
 }
 
-func TestServiceMetricsScraper_Scrape(t *testing.T) {
+func TestModelPodSource_Scrape(t *testing.T) {
 	// Test server returns valid prometheus text per workspace name. ws-fail returns 500.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/services/", func(w http.ResponseWriter, r *http.Request) {
@@ -119,7 +119,7 @@ vllm:num_requests_waiting 5
 	// Unrelated workspace in same namespace to make sure label selector filters it out.
 	wsOther := newWorkspaceForIS("ws-other", ns, "some-other-is")
 
-	s := NewServiceMetricsScraper(newScraperFakeClient(t, is, wsA, wsB, wsFail, wsOther))
+	s := NewModelPodSource(newSourceFakeClient(t, is, wsA, wsB, wsFail, wsOther))
 	s.urlBuilder = newTestServerURLBuilder(srv.URL)
 
 	cfg := ScrapeConfig{Protocol: "http", Port: "80", Path: "/metrics", Timeout: 2 * time.Second}
@@ -146,9 +146,9 @@ vllm:num_requests_waiting 5
 	assert.Nil(t, byName["ws-fail"].Metrics)
 }
 
-func TestServiceMetricsScraper_Scrape_NoWorkspaces(t *testing.T) {
+func TestModelPodSource_Scrape_NoWorkspaces(t *testing.T) {
 	is := newInferenceSet("is1", "ns1")
-	s := NewServiceMetricsScraper(newScraperFakeClient(t, is))
+	s := NewModelPodSource(newSourceFakeClient(t, is))
 	s.urlBuilder = newTestServerURLBuilder("http://unused")
 	snap, err := s.Scrape(context.Background(), is, ScrapeConfig{Protocol: "http", Port: "80", Path: "/metrics", Timeout: time.Second})
 	assert.NoError(t, err)

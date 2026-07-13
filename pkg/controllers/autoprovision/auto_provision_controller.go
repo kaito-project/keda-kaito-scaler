@@ -45,15 +45,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaledobject"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/inferenceset"
 )
 
 const (
-	AnnotationKeyAutoProvision = "scaledobject.kaito.sh/auto-provision"
-	AnnotationKeyMinReplicas   = "scaledobject.kaito.sh/min-replicas"
-	AnnotationKeyMaxReplicas   = "scaledobject.kaito.sh/max-replicas"
-
 	requeueInterval = 5 * time.Second
 
 	// annotationPrefix is the common prefix for every autoscaling annotation the
@@ -123,22 +120,20 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSe
 		return reconcile.Result{}, err
 	}
 
-	// Select the provisioner for this InferenceSet: composite (multi-metric) mode
-	// when the indexed composite annotations are present, single-metric mode
-	// otherwise. Both modes build a desired ScaledObject via the common
-	// scaledobject.Provisioner interface.
+	// Build the desired ScaledObject from the InferenceSet's auto-provision
+	// annotations (one or more indexed metrics combined under a conservative AND
+	// policy).
 	soBuilder := scaledobject.Builder{
 		ScalerNamespace:   c.ScalerNamespace,
 		ScalerServiceName: c.ScalerServiceName,
 		ScalerGRPCPort:    c.ScalerGRPCPort,
 	}
-	provisioner := scaledobject.ProvisionerFor(soBuilder, is.Annotations)
-	desired, err := provisioner.BuildDesired(is, minReplicas, maxReplicas)
+	desired, err := soBuilder.BuildDesired(is, minReplicas, maxReplicas)
 	if err != nil {
 		logger.Info("skip reconciling inference set because autoscaling config is invalid",
-			"mode", provisioner.Mode(), "namespace", is.Namespace, "name", is.Name, "error", err.Error())
+			"namespace", is.Namespace, "name", is.Name, "error", err.Error())
 		if c.Recorder != nil {
-			c.Recorder.Eventf(is, corev1.EventTypeWarning, provisioner.InvalidConfigReason(),
+			c.Recorder.Eventf(is, corev1.EventTypeWarning, "InvalidConfig",
 				"Skip auto-provisioning ScaledObject: %v", err)
 		}
 		return reconcile.Result{}, nil
@@ -152,7 +147,7 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSe
 // max-replicas annotation or a default of 1.
 func (c *Controller) resolveMaxReplicas(ctx context.Context, is *kaitov1beta1.InferenceSet) (int, bool, error) {
 	if is.Spec.NodeCountLimit == 0 {
-		if maxReplicasStr, ok := is.Annotations[AnnotationKeyMaxReplicas]; ok {
+		if maxReplicasStr, ok := is.Annotations[constants.AnnotationKeyMaxReplicas]; ok {
 			v, err := strconv.Atoi(maxReplicasStr)
 			if err != nil || v < 1 {
 				v = 1
@@ -205,7 +200,7 @@ func (c *Controller) listManagedScaledObjects(ctx context.Context, is *kaitov1be
 		// scale target and managed-by annotation: it excludes ScaledObjects a user
 		// created by hand for the same InferenceSet, which we must not touch.
 		owner := metav1.GetControllerOf(&so)
-		if owner != nil && owner.UID == is.UID && owner.Kind == scaledobject.InferenceSet {
+		if owner != nil && owner.UID == is.UID && owner.Kind == constants.InferenceSet {
 			managed = append(managed, so)
 		}
 	}
@@ -397,7 +392,7 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 }
 
 func resolveMinReplicas(annotations map[string]string) int {
-	if minReplicasStr, ok := annotations[AnnotationKeyMinReplicas]; ok {
+	if minReplicasStr, ok := annotations[constants.AnnotationKeyMinReplicas]; ok {
 		if v, err := strconv.Atoi(minReplicasStr); err == nil && v > 1 {
 			if v > math.MaxInt32 {
 				return math.MaxInt32
@@ -412,11 +407,11 @@ func resolveMinReplicas(annotations map[string]string) int {
 // configuration is valid enough to provision a ScaledObject. It assumes the
 // caller has already confirmed auto-provisioning was requested (see
 // autoProvisionRequested) and only validates the replica bounds and the
-// metric threshold configuration (single-metric or composite).
+// auto-provision configuration.
 func autoscalingConfigValid(inferenceSet *kaitov1beta1.InferenceSet) bool {
 	// if max-replicas annotation exists, max replicas should be more than 1
 	// if not exists, NodeCountLimit should be more than 1, we will use it to calculate max replicas
-	if maxReplicasStr, ok := inferenceSet.Annotations[AnnotationKeyMaxReplicas]; ok {
+	if maxReplicasStr, ok := inferenceSet.Annotations[constants.AnnotationKeyMaxReplicas]; ok {
 		if maxReplicas, err := strconv.Atoi(maxReplicasStr); err != nil || maxReplicas <= 1 {
 			return false
 		}
@@ -424,24 +419,13 @@ func autoscalingConfigValid(inferenceSet *kaitov1beta1.InferenceSet) bool {
 		return false
 	}
 
-	// Composite mode validates its own (indexed) thresholds instead of the
-	// single threshold annotation.
-	if scaledobject.IsCompositeMode(inferenceSet.Annotations) {
-		return scaledobject.ValidateComposite(inferenceSet.Annotations) == nil
-	}
-
-	// threshold should be a valid integer
-	if threshold, err := strconv.Atoi(inferenceSet.Annotations[scaledobject.AnnotationKeyThreshold]); err != nil || threshold < 0 {
-		return false
-	}
-
-	return true
+	return scaledobject.ValidateConfig(inferenceSet.Annotations) == nil
 }
 
 // autoProvisionRequested reports whether the InferenceSet opts into
 // auto-provisioning via the scaledobject.kaito.sh/auto-provision annotation.
 func autoProvisionRequested(inferenceSet *kaitov1beta1.InferenceSet) bool {
-	return inferenceSet.Annotations[AnnotationKeyAutoProvision] == "true"
+	return inferenceSet.Annotations[constants.AnnotationKeyAutoProvision] == "true"
 }
 
 // annotationsWithPrefixChanged reports whether any annotation key starting with
@@ -470,7 +454,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		For(&kaitov1beta1.InferenceSet{}, builder.WithPredicates(generateInferenceSetPredicateFunc())).
 		Watches(&v1alpha1.ScaledObject{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 			if scaledObj, ok := obj.(*v1alpha1.ScaledObject); ok {
-				if scaledObj.Spec.ScaleTargetRef.Kind == scaledobject.InferenceSet {
+				if scaledObj.Spec.ScaleTargetRef.Kind == constants.InferenceSet {
 					return []reconcile.Request{
 						{
 							NamespacedName: types.NamespacedName{Namespace: scaledObj.Namespace, Name: scaledObj.Spec.ScaleTargetRef.Name},

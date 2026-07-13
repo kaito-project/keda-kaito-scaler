@@ -11,15 +11,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package scraper provides abstractions for scraping inference metrics that
-// drive KEDA scaling decisions.
+// Package metricsource provides abstractions for scraping inference metrics
+// that drive KEDA scaling decisions.
 //
-// The package follows a per-call snapshot model: each invocation of Scraper.Scrape
-// returns a point-in-time MetricSnapshot for all services belonging to a given
-// InferenceSet. The snapshot carries every metric parsed from each service, so
-// the caller (typically the KEDA external scaler) can pick one or more metric
-// names from the same snapshot without issuing additional network requests.
-package scraper
+// The package follows a per-call snapshot model: each invocation of
+// MetricSource.Scrape returns a point-in-time MetricSnapshot for all services
+// belonging to a given InferenceSet. The snapshot carries every metric parsed
+// from each service, so the caller (typically the KEDA external scaler) can pick
+// one or more metric names from the same snapshot without issuing additional
+// network requests.
+package metricsource
 
 import (
 	"context"
@@ -29,7 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// ScrapeConfig controls how a Scraper connects to an individual service.
+// ScrapeConfig controls how a MetricSource connects to an individual service.
 type ScrapeConfig struct {
 	// Protocol is either "http" or "https".
 	Protocol string
@@ -68,7 +69,7 @@ type ServiceMetrics struct {
 	Metrics map[string]float64
 	// Histograms maps a histogram metric family name to its parsed buckets/count/
 	// sum, enabling quantile aggregation (e.g. p95 latency). nil when the service
-	// exposes no histograms or the scraper does not parse them.
+	// exposes no histograms or the metric source does not parse them.
 	Histograms map[string]Histogram
 	// Err is non-nil when scraping or parsing this specific service failed. Other
 	// services in the same snapshot may still have been scraped successfully.
@@ -76,15 +77,23 @@ type ServiceMetrics struct {
 }
 
 // MetricSnapshot is a point-in-time collection of per-service metrics for an
-// InferenceSet. It is produced by Scraper.Scrape and consumed by an Aggregator.
+// InferenceSet. It is produced by MetricSource.Scrape and consumed by an Aggregator.
 type MetricSnapshot struct {
 	InferenceSet types.NamespacedName
 	Services     []ServiceMetrics
 	ScrapedAt    time.Time
 }
 
-// Scraper collects metrics from every service that backs an InferenceSet and
+// ModelPodSourceName is the registered name of the metric source that collects
+// metrics from the model-serving pods behind an InferenceSet's workspace
+// Services. It is the single source of truth shared by the metric-source map key,
+// ModelPodSource.Name, the default metric source, and the composite
+// "metricsource" annotation / metricSource metadata value.
+const ModelPodSourceName = "modelpod"
+
+// MetricSource collects metrics from every service that backs an InferenceSet and
 // returns a MetricSnapshot. Implementations must be safe for concurrent use.
-type Scraper interface {
+type MetricSource interface {
+	Name() string
 	Scrape(ctx context.Context, is *kaitov1beta1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error)
 }

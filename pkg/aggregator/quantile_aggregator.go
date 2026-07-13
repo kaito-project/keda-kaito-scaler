@@ -20,39 +20,45 @@ import (
 
 	"go.uber.org/multierr"
 
-	"github.com/kaito-project/keda-kaito-scaler/pkg/scraper"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
 )
 
 // QuantileAggregator estimates a quantile (e.g. p95) from a Prometheus-style
-// cumulative histogram, merging the histogram buckets of metricName across all
+// cumulative histogram, merging the histogram buckets of the metric across all
 // scraped services and applying the same linear-interpolation formula as
-// Prometheus' histogram_quantile.
-type QuantileAggregator struct {
-	// quantile is the target rank in [0, 1], e.g. 0.95 for p95.
-	quantile float64
+// Prometheus' histogram_quantile. The target quantile is supplied per request
+// via AggregateInput.Quantile, so a single instance serves every quantile.
+type QuantileAggregator struct{}
+
+// NewQuantileAggregator constructs a QuantileAggregator.
+func NewQuantileAggregator() *QuantileAggregator {
+	return &QuantileAggregator{}
 }
 
-// NewQuantileAggregator constructs a QuantileAggregator for the given quantile
-// in [0, 1]. Values outside the range are clamped.
-func NewQuantileAggregator(quantile float64) *QuantileAggregator {
+// QuantileAggregatorName is the registered name of the QuantileAggregator.
+const QuantileAggregatorName = "quantile"
+
+// Name identifies the QuantileAggregator.
+func (a *QuantileAggregator) Name() string { return QuantileAggregatorName }
+
+// Aggregate merges the metric's histogram buckets across all services and
+// returns the interpolated quantile (input.Quantile). Returns 0 when the
+// histogram is present but has no observations yet (cold start / no traffic).
+// Returns an error on a nil snapshot, when every service failed to scrape, or
+// when the histogram is exposed by no scraped service (misconfigured metric
+// name) — reporting a total outage or a missing metric as unknown rather than as
+// "no latency pressure", which could otherwise trigger a spurious scale-down.
+func (a *QuantileAggregator) Aggregate(snapshot *metricsource.MetricSnapshot, input AggregateInput) (float64, error) {
+	metricName := input.MetricName
+	// Clamp the target quantile to [0, 1]; callers should already validate it.
+	quantile := input.Quantile
 	if quantile < 0 {
 		quantile = 0
 	} else if quantile > 1 {
 		quantile = 1
 	}
-	return &QuantileAggregator{quantile: quantile}
-}
-
-// Aggregate merges metricName's histogram buckets across all services and
-// returns the interpolated quantile. The threshold argument is unused (kept to
-// satisfy the Aggregator interface). Returns 0 when at least one service was
-// scraped successfully but exposes no histogram observations (e.g. cold start /
-// no traffic). Returns an error when services exist but every one of them failed
-// to scrape, so a total outage is reported as unknown rather than as "no
-// latency pressure" (which could otherwise trigger a spurious scale-down).
-func (a *QuantileAggregator) Aggregate(snapshot *scraper.MetricSnapshot, metricName string, _ float64) (float64, error) {
 	if snapshot == nil {
-		return 0, nil
+		return 0, fmt.Errorf("metric snapshot is nil")
 	}
 
 	// Merge cumulative bucket counts across services by upper bound.
@@ -91,13 +97,20 @@ func (a *QuantileAggregator) Aggregate(snapshot *scraper.MetricSnapshot, metricN
 		return 0, fmt.Errorf("failed to resolve metric %q for inferenceset %s", metricName, snapshot.InferenceSet)
 	}
 
-	if !found || len(bucketCounts) == 0 {
+	// The histogram was absent on every service that scraped successfully: treat
+	// it as unknown (misconfigured metric name, or a metric the pods do not
+	// expose) so KEDA holds rather than scaling down on a phantom 0.
+	if !found {
+		return 0, fmt.Errorf("metric %q not exposed by any scraped service for inferenceset %s", metricName, snapshot.InferenceSet)
+	}
+	// Found but no observations yet (cold start / no traffic): a genuine 0.
+	if len(bucketCounts) == 0 {
 		return 0, nil
 	}
 
-	buckets := make([]scraper.Bucket, 0, len(bucketCounts))
+	buckets := make([]metricsource.Bucket, 0, len(bucketCounts))
 	for le, c := range bucketCounts {
-		buckets = append(buckets, scraper.Bucket{Le: le, CumulativeCount: c})
+		buckets = append(buckets, metricsource.Bucket{Le: le, CumulativeCount: c})
 	}
 	sort.Slice(buckets, func(i, j int) bool { return buckets[i].Le < buckets[j].Le })
 
@@ -107,12 +120,12 @@ func (a *QuantileAggregator) Aggregate(snapshot *scraper.MetricSnapshot, metricN
 		return 0, nil
 	}
 
-	return histogramQuantile(a.quantile, buckets, totalCount), nil
+	return histogramQuantile(quantile, buckets, totalCount), nil
 }
 
 // histogramQuantile replicates Prometheus' histogram_quantile linear
 // interpolation over cumulative buckets sorted ascending by upper bound.
-func histogramQuantile(q float64, buckets []scraper.Bucket, totalCount uint64) float64 {
+func histogramQuantile(q float64, buckets []metricsource.Bucket, totalCount uint64) float64 {
 	rank := q * float64(totalCount)
 
 	// Find the first bucket whose cumulative count is >= rank.
@@ -145,7 +158,7 @@ func histogramQuantile(q float64, buckets []scraper.Bucket, totalCount uint64) f
 
 // finiteUpperBound returns the largest non-+Inf bucket upper bound, or 0 when
 // all buckets are +Inf.
-func finiteUpperBound(buckets []scraper.Bucket) float64 {
+func finiteUpperBound(buckets []metricsource.Bucket) float64 {
 	for i := len(buckets) - 1; i >= 0; i-- {
 		if !math.IsInf(buckets[i].Le, 1) {
 			return buckets[i].Le

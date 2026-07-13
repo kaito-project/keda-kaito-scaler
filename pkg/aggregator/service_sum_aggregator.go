@@ -19,7 +19,7 @@ import (
 	"go.uber.org/multierr"
 	"k8s.io/klog/v2"
 
-	"github.com/kaito-project/keda-kaito-scaler/pkg/scraper"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
 )
 
 // SumAggregator sums a metric across every service that belongs to an
@@ -41,16 +41,24 @@ import (
 //
 // Negative aggregated values are clamped to 0; KEDA's external_scaler client
 // otherwise silently treats negative MetricValueFloat as 0 by falling back to
-// the deprecated int64 MetricValue, which would mask bugs in the scraper.
+// the deprecated int64 MetricValue, which would mask bugs in the metric source.
 type SumAggregator struct{}
+
+// SumAggregatorName is the registered name of the SumAggregator.
+const SumAggregatorName = "sum"
 
 // NewSumAggregator returns a ready-to-use SumAggregator.
 func NewSumAggregator() *SumAggregator {
 	return &SumAggregator{}
 }
 
+// Name identifies the SumAggregator.
+func (a *SumAggregator) Name() string { return SumAggregatorName }
+
 // Aggregate implements Aggregator.
-func (a *SumAggregator) Aggregate(snapshot *scraper.MetricSnapshot, metricName string, threshold float64) (float64, error) {
+func (a *SumAggregator) Aggregate(snapshot *metricsource.MetricSnapshot, input AggregateInput) (float64, error) {
+	metricName := input.MetricName
+	threshold := input.Threshold
 	if snapshot == nil {
 		return 0, fmt.Errorf("metric snapshot is nil")
 	}

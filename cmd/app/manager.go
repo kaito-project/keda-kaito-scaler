@@ -52,10 +52,11 @@ import (
 
 	"github.com/kaito-project/keda-kaito-scaler/cmd/app/options"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/aggregator"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/injections"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
-	"github.com/kaito-project/keda-kaito-scaler/pkg/scraper"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/cert"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/profile"
 )
@@ -205,18 +206,16 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		Port: opts.GrpcPort,
 		Service: scaler.NewKaitoScaler(
 			mgr.GetClient(),
-			map[string]scraper.Scraper{
-				// Wrap the service scraper in a short-lived cache so the several
+			map[string]metricsource.MetricSource{
+				// Wrap the model-pod source in a short-lived cache so the several
 				// triggers of a composite ScaledObject share a single per-cycle
 				// scrape instead of each re-scraping every pod.
-				"service": scraper.NewCachingScraper(scraper.NewServiceMetricsScraper(mgr.GetClient())),
+				metricsource.ModelPodSourceName: metricsource.NewCachingSource(metricsource.NewModelPodSource(mgr.GetClient())),
 			},
-			// The "quantile" aggregation is parametric (its target quantile comes
-			// from trigger metadata) so the scaler builds it per request instead of
-			// registering it here.
 			map[string]aggregator.Aggregator{
-				"sum":         aggregator.NewSumAggregator(),
-				"service-avg": aggregator.NewServiceAverageAggregator(),
+				aggregator.SumAggregatorName:            aggregator.NewSumAggregator(),
+				aggregator.ServiceAverageAggregatorName: aggregator.NewServiceAverageAggregator(),
+				aggregator.QuantileAggregatorName:       aggregator.NewQuantileAggregator(),
 			},
 		),
 		GetServerCertificate: cert.NewServerCertLoader(secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName, ServerCert, ServerKey),
@@ -315,7 +314,7 @@ func ensureClusterTriggerAuthentication(ctx context.Context, cfg *rest.Config, o
 	}
 
 	cta := &v1alpha1.ClusterTriggerAuthentication{
-		ObjectMeta: metav1.ObjectMeta{Name: scaler.ClusterTriggerAuthName},
+		ObjectMeta: metav1.ObjectMeta{Name: constants.ClusterTriggerAuthName},
 	}
 	op, err := controllerutil.CreateOrUpdate(ctx, c, cta, func() error {
 		cta.Spec = v1alpha1.TriggerAuthenticationSpec{
@@ -328,9 +327,9 @@ func ensureClusterTriggerAuthentication(ctx context.Context, cfg *rest.Config, o
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create/update ClusterTriggerAuthentication %q: %w", scaler.ClusterTriggerAuthName, err)
+		return fmt.Errorf("failed to create/update ClusterTriggerAuthentication %q: %w", constants.ClusterTriggerAuthName, err)
 	}
-	ctrl.Log.WithName("cluster-trigger-auth").Info("ensured ClusterTriggerAuthentication", "name", scaler.ClusterTriggerAuthName, "operation", op)
+	ctrl.Log.WithName("cluster-trigger-auth").Info("ensured ClusterTriggerAuthentication", "name", constants.ClusterTriggerAuthName, "operation", op)
 	return nil
 }
 

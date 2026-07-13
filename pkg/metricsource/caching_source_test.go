@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package scraper
+package metricsource
 
 import (
 	"context"
@@ -24,15 +24,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// fakeScraper is a test double for Scraper that counts calls and records the
+// fakeSource is a test double for MetricSource that counts calls and records the
 // InferenceSet it was asked to scrape.
-type fakeScraper struct {
+type fakeSource struct {
 	callCount int
 	err       error
 	snapshot  *MetricSnapshot
 }
 
-func (f *fakeScraper) Scrape(_ context.Context, is *kaitov1beta1.InferenceSet, _ ScrapeConfig) (*MetricSnapshot, error) {
+func (f *fakeSource) Name() string { return "fake-source" }
+
+func (f *fakeSource) Scrape(_ context.Context, is *kaitov1beta1.InferenceSet, _ ScrapeConfig) (*MetricSnapshot, error) {
 	f.callCount++
 	if f.err != nil {
 		return nil, f.err
@@ -50,13 +52,13 @@ func newIS(namespace, name string) *kaitov1beta1.InferenceSet {
 	}
 }
 
-func TestCachingScraper(t *testing.T) {
+func TestCachingSource(t *testing.T) {
 	ctx := context.Background()
 	cfg := ScrapeConfig{Protocol: "http", Port: "80", Path: "/metrics", Timeout: 3 * time.Second}
 
 	t.Run("reuses cached snapshot within TTL", func(t *testing.T) {
-		inner := &fakeScraper{snapshot: &MetricSnapshot{}}
-		c := NewCachingScraper(inner)
+		inner := &fakeSource{snapshot: &MetricSnapshot{}}
+		c := NewCachingSource(inner)
 		is := newIS("ns1", "is1")
 
 		// Two consecutive scrapes (e.g. two composite triggers) within the TTL
@@ -71,8 +73,8 @@ func TestCachingScraper(t *testing.T) {
 	})
 
 	t.Run("re-scrapes after TTL expires", func(t *testing.T) {
-		inner := &fakeScraper{snapshot: &MetricSnapshot{}}
-		c := NewCachingScraper(inner)
+		inner := &fakeSource{snapshot: &MetricSnapshot{}}
+		c := NewCachingSource(inner)
 		is := newIS("ns1", "is1")
 
 		now := time.Unix(0, 0)
@@ -90,8 +92,8 @@ func TestCachingScraper(t *testing.T) {
 	})
 
 	t.Run("different InferenceSets are cached separately", func(t *testing.T) {
-		inner := &fakeScraper{snapshot: &MetricSnapshot{}}
-		c := NewCachingScraper(inner)
+		inner := &fakeSource{snapshot: &MetricSnapshot{}}
+		c := NewCachingSource(inner)
 
 		_, err := c.Scrape(ctx, newIS("ns1", "is1"), cfg)
 		assert.NoError(t, err)
@@ -102,8 +104,8 @@ func TestCachingScraper(t *testing.T) {
 	})
 
 	t.Run("different scrape endpoints are cached separately", func(t *testing.T) {
-		inner := &fakeScraper{snapshot: &MetricSnapshot{}}
-		c := NewCachingScraper(inner)
+		inner := &fakeSource{snapshot: &MetricSnapshot{}}
+		c := NewCachingSource(inner)
 		is := newIS("ns1", "is1")
 
 		_, err := c.Scrape(ctx, is, cfg)
@@ -117,8 +119,8 @@ func TestCachingScraper(t *testing.T) {
 	})
 
 	t.Run("errors are not cached", func(t *testing.T) {
-		inner := &fakeScraper{err: errors.New("scrape failed")}
-		c := NewCachingScraper(inner)
+		inner := &fakeSource{err: errors.New("scrape failed")}
+		c := NewCachingSource(inner)
 		is := newIS("ns1", "is1")
 
 		_, err := c.Scrape(ctx, is, cfg)
@@ -126,13 +128,13 @@ func TestCachingScraper(t *testing.T) {
 		_, err = c.Scrape(ctx, is, cfg)
 		assert.Error(t, err)
 
-		// No successful snapshot was cached, so both calls hit the inner scraper.
+		// No successful snapshot was cached, so both calls hit the inner metric source.
 		assert.Equal(t, 2, inner.callCount)
 	})
 
 	t.Run("caching disabled when timeout is not positive", func(t *testing.T) {
-		inner := &fakeScraper{snapshot: &MetricSnapshot{}}
-		c := NewCachingScraper(inner)
+		inner := &fakeSource{snapshot: &MetricSnapshot{}}
+		c := NewCachingSource(inner)
 		is := newIS("ns1", "is1")
 		noTTL := cfg
 		noTTL.Timeout = 0

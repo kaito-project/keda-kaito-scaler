@@ -30,7 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"github.com/kaito-project/keda-kaito-scaler/pkg/scaledobject"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
 )
 
 func TestResolveMinReplicas(t *testing.T) {
@@ -51,27 +51,27 @@ func TestResolveMinReplicas(t *testing.T) {
 		},
 		{
 			name:        "annotation value less than 1 is clamped to 1",
-			annotations: map[string]string{AnnotationKeyMinReplicas: "0"},
+			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "0"},
 			expected:    1,
 		},
 		{
 			name:        "annotation value equal to 1 returns 1",
-			annotations: map[string]string{AnnotationKeyMinReplicas: "1"},
+			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "1"},
 			expected:    1,
 		},
 		{
 			name:        "negative annotation value is clamped to 1",
-			annotations: map[string]string{AnnotationKeyMinReplicas: "-5"},
+			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "-5"},
 			expected:    1,
 		},
 		{
 			name:        "invalid annotation value falls back to 1",
-			annotations: map[string]string{AnnotationKeyMinReplicas: "abc"},
+			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "abc"},
 			expected:    1,
 		},
 		{
 			name:        "valid value greater than 1 is returned",
-			annotations: map[string]string{AnnotationKeyMinReplicas: "3"},
+			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "3"},
 			expected:    3,
 		},
 	}
@@ -138,22 +138,22 @@ func TestResolveMaxReplicas(t *testing.T) {
 		},
 		{
 			name:          "NodeCountLimit=0 with valid annotation returns annotation value",
-			is:            newInferenceSet(0, map[string]string{AnnotationKeyMaxReplicas: "5"}),
+			is:            newInferenceSet(0, map[string]string{constants.AnnotationKeyMaxReplicas: "5"}),
 			expectedValue: 5,
 		},
 		{
 			name:          "NodeCountLimit=0 with annotation <1 is clamped to 1",
-			is:            newInferenceSet(0, map[string]string{AnnotationKeyMaxReplicas: "0"}),
+			is:            newInferenceSet(0, map[string]string{constants.AnnotationKeyMaxReplicas: "0"}),
 			expectedValue: 1,
 		},
 		{
 			name:          "NodeCountLimit=0 with invalid annotation is clamped to 1",
-			is:            newInferenceSet(0, map[string]string{AnnotationKeyMaxReplicas: "abc"}),
+			is:            newInferenceSet(0, map[string]string{constants.AnnotationKeyMaxReplicas: "abc"}),
 			expectedValue: 1,
 		},
 		{
 			name:          "NodeCountLimit=0 with annotation exceeding MaxInt32 is clamped to MaxInt32",
-			is:            newInferenceSet(0, map[string]string{AnnotationKeyMaxReplicas: fmt.Sprintf("%d", int64(math.MaxInt32)+1)}),
+			is:            newInferenceSet(0, map[string]string{constants.AnnotationKeyMaxReplicas: fmt.Sprintf("%d", int64(math.MaxInt32)+1)}),
 			expectedValue: math.MaxInt32,
 		},
 		{
@@ -205,12 +205,14 @@ func TestResolveMaxReplicas(t *testing.T) {
 // auto-provisioning.
 func compositeAnnotations() map[string]string {
 	return map[string]string{
-		AnnotationKeyAutoProvision:              "true",
-		AnnotationKeyMaxReplicas:                "5",
+		constants.AnnotationKeyAutoProvision:    "true",
+		constants.AnnotationKeyMaxReplicas:      "5",
 		"scaledobject.kaito.sh/metricName/0":    "vllm:num_requests_waiting",
+		"scaledobject.kaito.sh/metricstype/0":   "gauge",
 		"scaledobject.kaito.sh/upthreshold/0":   "10",
 		"scaledobject.kaito.sh/downthreshold/0": "2",
 		"scaledobject.kaito.sh/metricName/1":    "vllm:request_queue_time_seconds",
+		"scaledobject.kaito.sh/metricstype/1":   "histogram",
 		"scaledobject.kaito.sh/upthreshold/1":   "1.5",
 		"scaledobject.kaito.sh/downthreshold/1": "0.5",
 	}
@@ -224,19 +226,29 @@ func TestAutoscalingConfigValid_Composite(t *testing.T) {
 
 	t.Run("invalid composite disabled", func(t *testing.T) {
 		ann := compositeAnnotations()
-		ann["scaledobject.kaito.sh/metricName/0"] = "bogus"
+		ann["scaledobject.kaito.sh/metricstype/0"] = "bogus"
 		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}
 		assert.False(t, autoscalingConfigValid(is))
 	})
 
-	t.Run("single metric mode still uses scaledobject schema", func(t *testing.T) {
+	t.Run("single metric config accepted", func(t *testing.T) {
 		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
-			AnnotationKeyAutoProvision:           "true",
-			AnnotationKeyMaxReplicas:             "5",
-			scaledobject.AnnotationKeyThreshold:  "10",
-			scaledobject.AnnotationKeyMetricName: "vllm:num_requests_waiting",
+			constants.AnnotationKeyAutoProvision:    "true",
+			constants.AnnotationKeyMaxReplicas:      "5",
+			"scaledobject.kaito.sh/metricName/0":    "vllm:num_requests_waiting",
+			"scaledobject.kaito.sh/metricstype/0":   "gauge",
+			"scaledobject.kaito.sh/upthreshold/0":   "5",
+			"scaledobject.kaito.sh/downthreshold/0": "1",
 		}}}
 		assert.True(t, autoscalingConfigValid(is))
+	})
+
+	t.Run("no metrics rejected", func(t *testing.T) {
+		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			constants.AnnotationKeyAutoProvision: "true",
+			constants.AnnotationKeyMaxReplicas:   "5",
+		}}}
+		assert.False(t, autoscalingConfigValid(is))
 	})
 }
 
@@ -272,7 +284,7 @@ func newManagedScaledObject(name string, is *kaitov1beta1.InferenceSet) *v1alpha
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: "kaito.sh/v1beta1",
-					Kind:       scaledobject.InferenceSet,
+					Kind:       constants.InferenceSet,
 					Name:       is.Name,
 					UID:        is.UID,
 					Controller: ptr.To(true),
@@ -280,7 +292,7 @@ func newManagedScaledObject(name string, is *kaitov1beta1.InferenceSet) *v1alpha
 			},
 		},
 		Spec: v1alpha1.ScaledObjectSpec{
-			ScaleTargetRef: &v1alpha1.ScaleTarget{Name: is.Name, Kind: scaledobject.InferenceSet},
+			ScaleTargetRef: &v1alpha1.ScaleTarget{Name: is.Name, Kind: constants.InferenceSet},
 		},
 	}
 }
@@ -301,7 +313,7 @@ func TestReconcile_CleanupWhenAutoProvisionDisabled(t *testing.T) {
 				Name:        isName,
 				Namespace:   ns,
 				UID:         types.UID("is-uid"),
-				Annotations: map[string]string{AnnotationKeyAutoProvision: "false"},
+				Annotations: map[string]string{constants.AnnotationKeyAutoProvision: "false"},
 			},
 		}
 	}
@@ -341,7 +353,7 @@ func TestReconcile_CleanupWhenAutoProvisionDisabled(t *testing.T) {
 		so := &v1alpha1.ScaledObject{
 			ObjectMeta: metav1.ObjectMeta{Name: "user-so", Namespace: ns},
 			Spec: v1alpha1.ScaledObjectSpec{
-				ScaleTargetRef: &v1alpha1.ScaleTarget{Name: isName, Kind: scaledobject.InferenceSet},
+				ScaleTargetRef: &v1alpha1.ScaleTarget{Name: isName, Kind: constants.InferenceSet},
 			},
 		}
 		c := newReconcileFakeClient(t, is, so)

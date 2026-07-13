@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/kaito-project/keda-kaito-scaler/pkg/scraper"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
 )
 
 func TestSumAggregator_Aggregate(t *testing.T) {
@@ -28,7 +28,7 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		snapshot   *scraper.MetricSnapshot
+		snapshot   *metricsource.MetricSnapshot
 		metricName string
 		threshold  float64
 		wantValue  float64
@@ -41,7 +41,7 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 		},
 		{
 			name: "empty services errors",
-			snapshot: &scraper.MetricSnapshot{
+			snapshot: &metricsource.MetricSnapshot{
 				InferenceSet: types.NamespacedName{Namespace: "ns", Name: "is"},
 				Services:     nil,
 			},
@@ -49,8 +49,8 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 		},
 		{
 			name: "sum over all successful services",
-			snapshot: &scraper.MetricSnapshot{
-				Services: []scraper.ServiceMetrics{
+			snapshot: &metricsource.MetricSnapshot{
+				Services: []metricsource.ServiceMetrics{
 					{Name: "a", Metrics: map[string]float64{"m": 10}},
 					{Name: "b", Metrics: map[string]float64{"m": 30}},
 				},
@@ -61,8 +61,8 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 		},
 		{
 			name: "scale-down missing service compensated with threshold",
-			snapshot: &scraper.MetricSnapshot{
-				Services: []scraper.ServiceMetrics{
+			snapshot: &metricsource.MetricSnapshot{
+				Services: []metricsource.ServiceMetrics{
 					{Name: "a", Metrics: map[string]float64{"m": 2}},
 					{Name: "b", Err: errors.New("scrape failed")},
 				},
@@ -74,8 +74,8 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 		},
 		{
 			name: "scale-up missing service not compensated",
-			snapshot: &scraper.MetricSnapshot{
-				Services: []scraper.ServiceMetrics{
+			snapshot: &metricsource.MetricSnapshot{
+				Services: []metricsource.ServiceMetrics{
 					{Name: "a", Metrics: map[string]float64{"m": 20}},
 					{Name: "b", Err: errors.New("scrape failed")},
 				},
@@ -87,8 +87,8 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 		},
 		{
 			name: "metric name missing on a scraped service counts as zero",
-			snapshot: &scraper.MetricSnapshot{
-				Services: []scraper.ServiceMetrics{
+			snapshot: &metricsource.MetricSnapshot{
+				Services: []metricsource.ServiceMetrics{
 					{Name: "a", Metrics: map[string]float64{"m": 4}},
 					{Name: "b", Metrics: map[string]float64{"other": 99}},
 				},
@@ -101,8 +101,8 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 		},
 		{
 			name: "negative aggregated value is clamped to zero",
-			snapshot: &scraper.MetricSnapshot{
-				Services: []scraper.ServiceMetrics{
+			snapshot: &metricsource.MetricSnapshot{
+				Services: []metricsource.ServiceMetrics{
 					{Name: "a", Metrics: map[string]float64{"m": -5}},
 					{Name: "b", Metrics: map[string]float64{"m": -3}},
 				},
@@ -113,8 +113,8 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 		},
 		{
 			name: "all services failed returns error",
-			snapshot: &scraper.MetricSnapshot{
-				Services: []scraper.ServiceMetrics{
+			snapshot: &metricsource.MetricSnapshot{
+				Services: []metricsource.ServiceMetrics{
 					{Name: "a", Err: errors.New("x")},
 					{Name: "b", Err: errors.New("y")},
 				},
@@ -127,7 +127,7 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			val, err := agg.Aggregate(tt.snapshot, tt.metricName, tt.threshold)
+			val, err := agg.Aggregate(tt.snapshot, AggregateInput{MetricName: tt.metricName, Threshold: tt.threshold})
 			if tt.wantErr {
 				assert.Error(t, err)
 				return

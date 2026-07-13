@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package scraper
+package metricsource
 
 import (
 	"context"
@@ -30,10 +30,10 @@ import (
 // +kubebuilder:rbac:groups="kaito.sh",resources=inferencesets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=list;watch
 
-// ServiceMetricsScraper scrapes the Prometheus /metrics endpoint exposed by
+// ModelPodSource scrapes the Prometheus /metrics endpoint exposed by
 // each workspace Service (e.g. the vLLM inference server). Services are
 // discovered via the Workspace objects owned by the InferenceSet.
-type ServiceMetricsScraper struct {
+type ModelPodSource struct {
 	kubeClient client.Client
 	transports *promscrape.Transports
 	// urlBuilder produces the scrape URL for a given service. Overridable in
@@ -41,22 +41,27 @@ type ServiceMetricsScraper struct {
 	urlBuilder func(protocol, name, namespace, port, path string) string
 }
 
-// NewServiceMetricsScraper constructs a ServiceMetricsScraper that reuses a
+// NewModelPodSource constructs a ModelPodSource that reuses a
 // small HTTP connection pool for plain-text scraping and a separate one for
 // https with InsecureSkipVerify (matching the previous scaler behaviour).
-func NewServiceMetricsScraper(kubeClient client.Client) *ServiceMetricsScraper {
-	return &ServiceMetricsScraper{
+func NewModelPodSource(kubeClient client.Client) *ModelPodSource {
+	return &ModelPodSource{
 		kubeClient: kubeClient,
 		transports: promscrape.NewTransports(),
 		urlBuilder: promscrape.DefaultURLBuilder,
 	}
 }
 
+// Name identifies the source the metrics are scraped from.
+func (s *ModelPodSource) Name() string {
+	return ModelPodSourceName
+}
+
 // Scrape iterates over every Workspace owned by the InferenceSet and scrapes
 // its /metrics endpoint. A per-service error is recorded on the corresponding
 // ServiceMetrics entry; Scrape itself only returns an error when workspace
 // discovery fails.
-func (s *ServiceMetricsScraper) Scrape(ctx context.Context, is *kaitov1beta1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error) {
+func (s *ModelPodSource) Scrape(ctx context.Context, is *kaitov1beta1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error) {
 	workspaceList, err := inferenceset.ListWorkspaces(ctx, is, s.kubeClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list workspaces for InferenceSet %s/%s: %w", is.Namespace, is.Name, err)
@@ -88,7 +93,7 @@ func (s *ServiceMetricsScraper) Scrape(ctx context.Context, is *kaitov1beta1.Inf
 
 // scrapeService fetches and parses the /metrics endpoint of a single workspace
 // Service, returning summed scalars and merged histograms.
-func (s *ServiceMetricsScraper) scrapeService(ctx context.Context, name, namespace string, cfg ScrapeConfig) (map[string]float64, map[string]Histogram, error) {
+func (s *ModelPodSource) scrapeService(ctx context.Context, name, namespace string, cfg ScrapeConfig) (map[string]float64, map[string]Histogram, error) {
 	httpClient := s.transports.ClientFor(cfg.Protocol, cfg.Timeout)
 
 	url := s.urlBuilder(cfg.Protocol, name, namespace, cfg.Port, cfg.Path)

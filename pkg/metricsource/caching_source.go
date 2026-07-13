@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package scraper
+package metricsource
 
 import (
 	"context"
@@ -23,7 +23,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// CachingScraper wraps another Scraper with a short-lived, per-InferenceSet
+// CachingSource wraps another MetricSource with a short-lived, per-InferenceSet
 // snapshot cache so that the several triggers of a composite ScaledObject do not
 // each re-scrape every pod within the same KEDA polling cycle.
 //
@@ -37,8 +37,13 @@ import (
 // underlying scrape runs at a time, and the others reuse its result. Only
 // successful snapshots are cached; an error is returned to the caller without
 // being stored so the next trigger retries.
-type CachingScraper struct {
-	inner Scraper
+//
+// The cache is keyed by InferenceSet identity plus scrape endpoint. Because an
+// InferenceSet maps to a long-lived LLM workload that is rarely created or
+// deleted, the number of distinct keys stays bounded by the live workload count,
+// so entries are not actively evicted.
+type CachingSource struct {
+	inner MetricSource
 
 	mu      sync.Mutex
 	entries map[string]cacheEntry
@@ -54,9 +59,9 @@ type cacheEntry struct {
 	at   time.Time
 }
 
-// NewCachingScraper returns a CachingScraper that delegates to inner.
-func NewCachingScraper(inner Scraper) *CachingScraper {
-	return &CachingScraper{
+// NewCachingSource returns a CachingSource that delegates to inner.
+func NewCachingSource(inner MetricSource) *CachingSource {
+	return &CachingSource{
 		inner:   inner,
 		entries: make(map[string]cacheEntry),
 		keyLock: make(map[string]*sync.Mutex),
@@ -64,15 +69,16 @@ func NewCachingScraper(inner Scraper) *CachingScraper {
 	}
 }
 
+// Name returns the name of the wrapped metric source.
+func (c *CachingSource) Name() string {
+	return c.inner.Name()
+}
+
 // Scrape returns a cached snapshot when a fresh one exists for the same
 // InferenceSet and scrape configuration, otherwise it delegates to the wrapped
-// scraper and caches the result. Caching is disabled when cfg.Timeout <= 0.
-func (c *CachingScraper) Scrape(ctx context.Context, is *kaitov1beta1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error) {
+// metric source and caches the result. Caching is disabled when cfg.Timeout <= 0.
+func (c *CachingSource) Scrape(ctx context.Context, is *kaitov1beta1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error) {
 	ttl := cfg.Timeout
-	if ttl <= 0 {
-		return c.inner.Scrape(ctx, is, cfg)
-	}
-
 	key := cacheKey(is, cfg)
 
 	// Fast path: a fresh snapshot is already cached.
@@ -106,7 +112,7 @@ func (c *CachingScraper) Scrape(ctx context.Context, is *kaitov1beta1.InferenceS
 }
 
 // freshSnapshot returns the cached snapshot for key when its age is below ttl.
-func (c *CachingScraper) freshSnapshot(key string, ttl time.Duration) (*MetricSnapshot, bool) {
+func (c *CachingSource) freshSnapshot(key string, ttl time.Duration) (*MetricSnapshot, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[key]
@@ -117,7 +123,7 @@ func (c *CachingScraper) freshSnapshot(key string, ttl time.Duration) (*MetricSn
 }
 
 // keyMutex returns the per-key mutex, creating it on first use.
-func (c *CachingScraper) keyMutex(key string) *sync.Mutex {
+func (c *CachingSource) keyMutex(key string) *sync.Mutex {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	kl, ok := c.keyLock[key]

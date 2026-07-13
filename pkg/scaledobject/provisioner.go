@@ -12,75 +12,509 @@
 // limitations under the License.
 
 // Package scaledobject owns the InferenceSet autoscaling annotation schema and
-// builds the desired KEDA ScaledObject for each autoscaling mode. Each mode
-// (single-metric or composite multi-metric) is expressed as a Provisioner, so
-// the reconciler stays agnostic of how each mode assembles its ScaledObject and
-// new modes can be added without touching the reconcile loop.
+// builds the desired KEDA ScaledObject. Autoscaling is driven by one or more
+// indexed metric annotations (metricName/{i}, ...): configuring a single metric
+// yields a single-signal ScaledObject, configuring several combines them under a
+// conservative AND policy. The reconciler stays agnostic of how the ScaledObject
+// is assembled by delegating to Builder.BuildDesired.
 package scaledobject
 
 import (
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+
+	"github.com/kaito-project/keda-kaito-scaler/pkg/aggregator"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
+)
+
+const (
+	// defaultPollingInterval is the interval (in seconds) at which KEDA polls
+	// the external scaler for metrics. Overrides KEDA's built-in default of 30s
+	// to give the autoscaler fresher signals for latency-sensitive inference
+	// workloads.
+	defaultPollingInterval = 15
+)
+
+// Auto-provision constants.
+const (
+	// Supported metricstype values.
+	metricsTypeGauge     = "gauge"
+	metricsTypeHistogram = "histogram"
+
+	// combinePolicyAnd is the only supported combine policy: scale up only when
+	// every metric is above its up-threshold, scale down only when every metric
+	// is below its down-threshold.
+	combinePolicyAnd = "AND"
+
+	// Scaling multipliers and target drive the scalingModifiers formula, which
+	// always evaluates to exactly one of the three multipliers below. KEDA feeds
+	// that result as the metric value into HPA with metricType=Value and
+	// scalingTarget, so HPA computes:
+	//   desiredReplicas = ceil(currentReplicas * formulaOutput / scalingTarget)
+	// With scalingTarget = 1 the formula output is exactly the desired-to-current
+	// replica ratio: scale-up (>1) grows, scale-down (<1) shrinks, hold (=1)
+	// keeps the count.
+	//
+	// The exact magnitudes are not significant: scaleUpMultiplier may be any
+	// value > 1 and scaleDownMultiplier any value < 1 (each just has to sit
+	// outside the tolerance band, see scalingTolerance). The HPA Pods policy
+	// (value 1) then caps the actual change to +/-1 replica per cooldown
+	// regardless of magnitude, giving conservative single-step scaling.
+	scaleUpMultiplier   = "2.0"
+	scaleDownMultiplier = "0.5"
+	holdMultiplier      = "1.0"
+
+	// scalingTarget is the scalingModifiers target. It must stay "1" so the
+	// formula output maps directly to the desired-to-current replica ratio; it
+	// also has to be > 0 for KEDA to create the scaler at all.
+	scalingTarget = "1"
+
+	// gateTriggerName is the reserved trigger/variable name for the readiness
+	// gate in the scalingModifiers formula. Metric triggers instead use their
+	// (sanitized) metric name as the variable name, so the formula reads in terms
+	// of the real metrics rather than opaque indexed placeholders.
+	gateTriggerName = "readiness_gate"
+
+	// defaultQuantile is the target quantile applied to quantile-based metrics
+	// when the per-metric quantile annotation is absent (p95).
+	defaultQuantile = "0.95"
+
+	// Defaults (seconds) when the corresponding annotation is absent.
+	defaultEvaluationWindow  = 60
+	defaultScaleUpCooldown   = 300
+	defaultScaleDownCooldown = 300
+
+	// scalingTolerance must be strictly below the scale-down multiplier's
+	// distance from 1 (|0.5 - 1| = 0.5) so a 0.5 ratio still triggers a
+	// scale-down, while a hold ratio of 1.0 is left untouched.
+	scalingTolerance = "0.1"
 )
 
 // Builder carries the scaler service coordinates needed to build ScaledObject
-// triggers that point back at the external scaler, and provides the per-mode
-// ScaledObject construction consumed by the Provisioner strategies.
+// triggers that point back at the external scaler, and provides the
+// auto-provision ScaledObject construction consumed by the reconciler.
 type Builder struct {
 	ScalerNamespace   string
 	ScalerServiceName string
 	ScalerGRPCPort    int
 }
 
-// Provisioner builds the desired ScaledObject for one autoscaling mode of an
-// InferenceSet. Abstracting the single-metric and composite modes behind a
-// common interface keeps the reconciler agnostic of how each mode assembles its
-// ScaledObject and leaves room for future modes.
-type Provisioner interface {
-	// Mode returns a short human-readable name used for logging.
-	Mode() string
-	// InvalidConfigReason is the Kubernetes event reason emitted when
-	// BuildDesired reports an invalid configuration.
-	InvalidConfigReason() string
-	// BuildDesired validates the InferenceSet annotations and returns the desired
-	// ScaledObject, or an error when the configuration is invalid.
-	BuildDesired(is *kaitov1beta1.InferenceSet, minReplicas, maxReplicas int) (*v1alpha1.ScaledObject, error)
-}
-
-// ProvisionerFor selects the Provisioner for an InferenceSet based on its
-// annotations: composite (multi-metric) mode when the indexed composite
-// annotations are present, single-metric mode otherwise.
-func ProvisionerFor(b Builder, annotations map[string]string) Provisioner {
-	if IsCompositeMode(annotations) {
-		return &compositeProvisioner{builder: b}
-	}
-	return &singleMetricProvisioner{builder: b}
-}
-
-// singleMetricProvisioner builds a ScaledObject driven by a single scraped
-// metric compared against a threshold.
-type singleMetricProvisioner struct{ builder Builder }
-
-func (p *singleMetricProvisioner) Mode() string                { return "single-metric" }
-func (p *singleMetricProvisioner) InvalidConfigReason() string { return "InvalidConfig" }
-
-func (p *singleMetricProvisioner) BuildDesired(is *kaitov1beta1.InferenceSet, minReplicas, maxReplicas int) (*v1alpha1.ScaledObject, error) {
-	threshold := is.Annotations[AnnotationKeyThreshold]
-	metricName := resolveMetricName(is.Annotations)
-	return p.builder.buildScaledObject(is, minReplicas, maxReplicas, threshold, metricName), nil
-}
-
-// compositeProvisioner builds a ScaledObject that combines several metrics via a
-// KEDA scalingModifiers formula.
-type compositeProvisioner struct{ builder Builder }
-
-func (p *compositeProvisioner) Mode() string                { return "composite" }
-func (p *compositeProvisioner) InvalidConfigReason() string { return "InvalidCompositeConfig" }
-
-func (p *compositeProvisioner) BuildDesired(is *kaitov1beta1.InferenceSet, minReplicas, maxReplicas int) (*v1alpha1.ScaledObject, error) {
-	cc, err := parseCompositeConfig(is.Annotations)
+// BuildDesired validates the InferenceSet's auto-provision annotations
+// and returns the desired ScaledObject, or an error when the configuration is
+// invalid.
+func (b Builder) BuildDesired(is *kaitov1beta1.InferenceSet, minReplicas, maxReplicas int) (*v1alpha1.ScaledObject, error) {
+	cfg, err := parseMetricsConfig(is.Annotations)
 	if err != nil {
 		return nil, err
 	}
-	return p.builder.buildCompositeScaledObject(is, minReplicas, maxReplicas, cc), nil
+	return b.buildScaledObject(is, minReplicas, maxReplicas, cfg), nil
+}
+
+// combinePolicy expresses how per-metric conditions are combined into the
+// scale-up and scale-down predicates of the scalingModifiers formula.
+// Abstracting it behind an interface keeps buildFormula agnostic of the concrete
+// policy and leaves room for future policies (e.g. OR) without touching the
+// formula assembly.
+type combinePolicy interface {
+	// name returns the canonical policy name as used in the combinepolicy
+	// annotation.
+	name() string
+	// scaleUpExpr builds the boolean predicate that must hold to scale up, given
+	// the readiness-gate variable and each metric's up-threshold condition.
+	scaleUpExpr(gateVar string, upConds []string) string
+	// scaleDownExpr builds the boolean predicate that must hold to scale down.
+	scaleDownExpr(downConds []string) string
+}
+
+// andCombinePolicy is the conservative policy: scale up only when the gate
+// reports ready (== 1) AND every metric is above its up-threshold; scale down
+// only when every metric is below its down-threshold.
+type andCombinePolicy struct{}
+
+func (andCombinePolicy) name() string { return combinePolicyAnd }
+
+func (andCombinePolicy) scaleUpExpr(gateVar string, upConds []string) string {
+	conds := append([]string{fmt.Sprintf("%s == 1", gateVar)}, upConds...)
+	return strings.Join(conds, " && ")
+}
+
+func (andCombinePolicy) scaleDownExpr(downConds []string) string {
+	return strings.Join(downConds, " && ")
+}
+
+// combinePolicies is the registry of supported combine policies keyed by name.
+var combinePolicies = map[string]combinePolicy{
+	combinePolicyAnd: andCombinePolicy{},
+}
+
+// metric is one parsed entry of an auto-provision configuration.
+type metric struct {
+	key string
+	// source is the metric source name that produces this metric (from the metricsource
+	// annotation; defaults to "modelpod").
+	source string
+	// aggregation is derived from the metricstype annotation: "service-avg" for
+	// gauge metrics, "quantile" for histogram metrics.
+	aggregation   string
+	upThreshold   string
+	downThreshold string
+	// quantile is the target quantile (as a string, e.g. "0.95") for histogram
+	// metrics using the "quantile" aggregation; empty for gauge metrics.
+	quantile string
+}
+
+// aggregationForMetricsType maps a metricstype annotation value to the scaler
+// aggregation used to reduce the scraped snapshot. metricstype is required, so an
+// empty or unknown value is rejected.
+func aggregationForMetricsType(t string) (string, error) {
+	switch t {
+	case metricsTypeGauge:
+		return aggregator.ServiceAverageAggregatorName, nil
+	case metricsTypeHistogram:
+		return aggregator.QuantileAggregatorName, nil
+	default:
+		return "", fmt.Errorf("metricstype must be %q or %q, got %q", metricsTypeGauge, metricsTypeHistogram, t)
+	}
+}
+
+// sourceForMetricSource validates the metricsource annotation value, defaulting
+// to "modelpod" when empty. "modelpod" is currently the only supported source.
+func sourceForMetricSource(s string) (string, error) {
+	switch s {
+	case "":
+		return metricsource.ModelPodSourceName, nil
+	case metricsource.ModelPodSourceName:
+		return metricsource.ModelPodSourceName, nil
+	default:
+		return "", fmt.Errorf("metricsource must be %q, got %q", metricsource.ModelPodSourceName, s)
+	}
+}
+
+// metricsConfig is the fully parsed auto-provision configuration.
+type metricsConfig struct {
+	metrics           []metric
+	policy            combinePolicy
+	evaluationWindow  int32
+	scaleUpCooldown   int32
+	scaleDownCooldown int32
+}
+
+// ValidateConfig validates the auto-provision annotations, returning an
+// error describing the first invalid field. It lets the controller admit or
+// reject an InferenceSet's configuration without exposing the internal parsed
+// representation.
+func ValidateConfig(annotations map[string]string) error {
+	_, err := parseMetricsConfig(annotations)
+	return err
+}
+
+// indexedKey builds an indexed annotation key such as
+// "scaledobject.kaito.sh/metricName/0".
+func indexedKey(base string, i int) string {
+	return fmt.Sprintf("%s/%d", base, i)
+}
+
+// parseMetricsConfig parses and validates the auto-provision annotations
+// into a metricsConfig. It returns an error describing the first invalid or
+// missing field encountered.
+func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
+	var cfg metricsConfig
+
+	// Resolve the combine policy (default AND). Only registered policies are
+	// accepted.
+	policyName := combinePolicyAnd
+	if p, ok := annotations[constants.AnnotationKeyCombinePolicy]; ok && p != "" {
+		policyName = strings.ToUpper(p)
+	}
+	policy, ok := combinePolicies[policyName]
+	if !ok {
+		return cfg, fmt.Errorf("unsupported combinepolicy %q", annotations[constants.AnnotationKeyCombinePolicy])
+	}
+	cfg.policy = policy
+
+	seenVars := make(map[string]string)
+	for i := 0; ; i++ {
+		key := annotations[indexedKey(constants.AnnotationKeyMetricName, i)]
+		if key == "" {
+			break
+		}
+
+		// metricstype is required and decides the aggregation; metricsource is
+		// optional and selects the metric source (default "modelpod").
+		aggregation, err := aggregationForMetricsType(annotations[indexedKey(constants.AnnotationKeyMetricsType, i)])
+		if err != nil {
+			return cfg, fmt.Errorf("metric %q (index %d): %w", key, i, err)
+		}
+		source, err := sourceForMetricSource(annotations[indexedKey(constants.AnnotationKeyMetricSource, i)])
+		if err != nil {
+			return cfg, fmt.Errorf("metric %q (index %d): %w", key, i, err)
+		}
+
+		// The metric name doubles as the formula variable/trigger name after
+		// sanitization; two metrics collapsing to the same variable would make the
+		// formula ambiguous and KEDA reject duplicate trigger names.
+		varName := formulaVarName(key)
+		if prev, dup := seenVars[varName]; dup {
+			return cfg, fmt.Errorf("metric %q (index %d) collides with %q on formula variable %q", key, i, prev, varName)
+		}
+		seenVars[varName] = key
+
+		upStr := annotations[indexedKey(constants.AnnotationKeyUpThreshold, i)]
+		downStr := annotations[indexedKey(constants.AnnotationKeyDownThreshold, i)]
+		up, err := strconv.ParseFloat(upStr, 64)
+		if err != nil || math.IsNaN(up) || math.IsInf(up, 0) {
+			return cfg, fmt.Errorf("metric %q (index %d): upthreshold must be a valid finite number, got %q", key, i, upStr)
+		}
+		down, err := strconv.ParseFloat(downStr, 64)
+		if err != nil || math.IsNaN(down) || math.IsInf(down, 0) {
+			return cfg, fmt.Errorf("metric %q (index %d): downthreshold must be a valid finite number, got %q", key, i, downStr)
+		}
+		if down > up {
+			return cfg, fmt.Errorf("metric %q (index %d): downthreshold (%s) must not exceed upthreshold (%s)", key, i, downStr, upStr)
+		}
+
+		// Quantile is only meaningful for histogram metrics (quantile aggregation);
+		// default to p95 and validate the (0, 1] range when provided.
+		quantile := ""
+		if aggregation == aggregator.QuantileAggregatorName {
+			quantile = defaultQuantile
+			if q := annotations[indexedKey(constants.AnnotationKeyQuantile, i)]; q != "" {
+				qv, err := strconv.ParseFloat(q, 64)
+				if err != nil {
+					return cfg, fmt.Errorf("metric %q (index %d): quantile must be a valid number, got %q", key, i, q)
+				}
+				if math.IsNaN(qv) || qv <= 0 || qv > 1 {
+					return cfg, fmt.Errorf("metric %q (index %d): quantile must be in the (0, 1] range, got %q", key, i, q)
+				}
+				quantile = strconv.FormatFloat(qv, 'f', -1, 64)
+			}
+		}
+
+		cfg.metrics = append(cfg.metrics, metric{
+			key:           key,
+			source:        source,
+			aggregation:   aggregation,
+			upThreshold:   strconv.FormatFloat(up, 'f', -1, 64),
+			downThreshold: strconv.FormatFloat(down, 'f', -1, 64),
+			quantile:      quantile,
+		})
+	}
+
+	if len(cfg.metrics) == 0 {
+		return cfg, fmt.Errorf("auto-provision requires at least one metricName/0 annotation")
+	}
+
+	var err error
+	if cfg.evaluationWindow, err = parseSecondsAnnotation(annotations, constants.AnnotationKeyEvaluationWindow, defaultEvaluationWindow); err != nil {
+		return cfg, err
+	}
+	if cfg.scaleUpCooldown, err = parseSecondsAnnotation(annotations, constants.AnnotationKeyScaleUpCooldown, defaultScaleUpCooldown); err != nil {
+		return cfg, err
+	}
+	if cfg.scaleDownCooldown, err = parseSecondsAnnotation(annotations, constants.AnnotationKeyScaleDownCooldown, defaultScaleDownCooldown); err != nil {
+		return cfg, err
+	}
+
+	return cfg, nil
+}
+
+// parseSecondsAnnotation parses a non-negative seconds value from the given
+// annotation. It returns the default when the annotation is absent or empty, but
+// returns an error when the annotation is present with an invalid value
+// (non-integer, negative, or out of int32 range) so misconfiguration is surfaced
+// instead of being silently ignored.
+func parseSecondsAnnotation(annotations map[string]string, key string, def int32) (int32, error) {
+	v, ok := annotations[key]
+	if !ok || v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > math.MaxInt32 {
+		return 0, fmt.Errorf("%s must be a non-negative integer within int32 range, got %q", key, v)
+	}
+	return int32(n), nil
+}
+
+// formulaVarName converts a metric name into a valid expr-lang identifier so it
+// can be used as both the KEDA trigger name and the scalingModifiers formula
+// variable. Any character that is not a letter, digit, or underscore is replaced
+// with an underscore, and a leading digit is prefixed with one, ensuring names
+// like "vllm:num_requests_waiting" become valid (e.g. "vllm_num_requests_waiting").
+func formulaVarName(metricName string) string {
+	var b strings.Builder
+	for i, r := range metricName {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			if i == 0 {
+				b.WriteRune('_')
+			}
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+// buildFormula assembles the scalingModifiers expression implementing the
+// conservative AND policy: scale up (multiplier 2.0) only when the readiness
+// gate reports ready (== 1) AND every metric exceeds its up-threshold; scale
+// down (multiplier 0.5) only when every metric is below its down-threshold;
+// otherwise hold (1.0).
+func buildFormula(cfg metricsConfig) string {
+	upConds := make([]string, 0, len(cfg.metrics))
+	downConds := make([]string, 0, len(cfg.metrics))
+	for _, m := range cfg.metrics {
+		v := formulaVarName(m.key)
+		upConds = append(upConds, fmt.Sprintf("%s > %s", v, m.upThreshold))
+		downConds = append(downConds, fmt.Sprintf("%s < %s", v, m.downThreshold))
+	}
+	return fmt.Sprintf("(%s) ? %s : ((%s) ? %s : %s)",
+		cfg.policy.scaleUpExpr(gateTriggerName, upConds), scaleUpMultiplier,
+		cfg.policy.scaleDownExpr(downConds), scaleDownMultiplier,
+		holdMultiplier)
+}
+
+// buildTriggers builds one external trigger per metric (named after the
+// sanitized metric name) plus the readiness gate trigger. All triggers use
+// metricType Value; KEDA replaces their individual specs with a single composite
+// spec derived from the scalingModifiers formula.
+func (b Builder) buildTriggers(inferenceSetName, inferenceSetNamespace string, cfg metricsConfig) []v1alpha1.ScaleTriggers {
+	scalerAddress := fmt.Sprintf("%s.%s.svc.cluster.local:%d", b.ScalerServiceName, b.ScalerNamespace, b.ScalerGRPCPort)
+	authRef := &v1alpha1.AuthenticationRef{
+		Name: constants.ClusterTriggerAuthName,
+		Kind: constants.ClusterTriggerAuthKind,
+	}
+
+	triggers := make([]v1alpha1.ScaleTriggers, 0, len(cfg.metrics)+1)
+	for _, m := range cfg.metrics {
+		metadata := map[string]string{
+			constants.InferenceSetNameInMetadata:      inferenceSetName,
+			constants.InferenceSetNamespaceInMetadata: inferenceSetNamespace,
+			constants.ScalerAddressInMetadata:         scalerAddress,
+			constants.MetricNameInMetadata:            m.key,
+			constants.MetricSourceInMetadata:          m.source,
+			constants.AggregationInMetadata:           m.aggregation,
+		}
+		if m.quantile != "" {
+			metadata[constants.QuantileInMetadata] = m.quantile
+		}
+		triggers = append(triggers, v1alpha1.ScaleTriggers{
+			Type:              "external",
+			Name:              formulaVarName(m.key),
+			Metadata:          metadata,
+			AuthenticationRef: authRef,
+			MetricType:        autoscalingv2.ValueMetricType,
+		})
+	}
+
+	// Readiness gate trigger: reports 1 once all replicas are ready, 0 otherwise.
+	triggers = append(triggers, v1alpha1.ScaleTriggers{
+		Type: "external",
+		Name: gateTriggerName,
+		Metadata: map[string]string{
+			constants.InferenceSetNameInMetadata:      inferenceSetName,
+			constants.InferenceSetNamespaceInMetadata: inferenceSetNamespace,
+			constants.ScalerAddressInMetadata:         scalerAddress,
+			constants.MetricNameInMetadata:            gateTriggerName,
+			constants.AggregationInMetadata:           constants.AggregationGate,
+		},
+		AuthenticationRef: authRef,
+		MetricType:        autoscalingv2.ValueMetricType,
+	})
+
+	return triggers
+}
+
+// buildHPAConfig builds the HPA behaviour for auto-provision: the
+// evaluation window gates scale-up stabilization, the cooldowns bound how often
+// replicas may change, and the tolerance is tightened to 0.1 in both directions
+// so the 0.5 scale-down ratio is not swallowed.
+func buildHPAConfig(cfg metricsConfig) *v1alpha1.HorizontalPodAutoscalerConfig {
+	tolerance := func() *resource.Quantity {
+		q := resource.MustParse(scalingTolerance)
+		return &q
+	}
+	return &v1alpha1.HorizontalPodAutoscalerConfig{
+		Behavior: &autoscalingv2.HorizontalPodAutoscalerBehavior{
+			ScaleUp: &autoscalingv2.HPAScalingRules{
+				StabilizationWindowSeconds: ptr.To(cfg.evaluationWindow),
+				SelectPolicy:               ptr.To(autoscalingv2.MaxChangePolicySelect),
+				Policies: []autoscalingv2.HPAScalingPolicy{
+					{
+						Type:          autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy),
+						Value:         1,
+						PeriodSeconds: cfg.scaleUpCooldown,
+					},
+				},
+				Tolerance: tolerance(),
+			},
+			ScaleDown: &autoscalingv2.HPAScalingRules{
+				StabilizationWindowSeconds: ptr.To(cfg.scaleDownCooldown),
+				SelectPolicy:               ptr.To(autoscalingv2.MaxChangePolicySelect),
+				Policies: []autoscalingv2.HPAScalingPolicy{
+					{
+						Type:          autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy),
+						Value:         1,
+						PeriodSeconds: cfg.scaleDownCooldown,
+					},
+				},
+				Tolerance: tolerance(),
+			},
+		},
+	}
+}
+
+func (b Builder) buildScaledObject(is *kaitov1beta1.InferenceSet, minReplicas, maxReplicas int, cfg metricsConfig) *v1alpha1.ScaledObject {
+	return &v1alpha1.ScaledObject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      is.Name,
+			Namespace: is.Namespace,
+			Annotations: map[string]string{
+				constants.AnnotationKeyManagedBy: scaler.ScalerName,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         constants.InferenceSetAPIVersion,
+					Kind:               constants.InferenceSet,
+					Name:               is.Name,
+					UID:                is.UID,
+					Controller:         ptr.To(true),
+					BlockOwnerDeletion: ptr.To(true),
+				},
+			},
+		},
+		Spec: v1alpha1.ScaledObjectSpec{
+			Advanced: &v1alpha1.AdvancedConfig{
+				HorizontalPodAutoscalerConfig: buildHPAConfig(cfg),
+				ScalingModifiers: v1alpha1.ScalingModifiers{
+					Formula:    buildFormula(cfg),
+					Target:     scalingTarget,
+					MetricType: autoscalingv2.ValueMetricType,
+				},
+			},
+			ScaleTargetRef: &v1alpha1.ScaleTarget{
+				Name:       is.Name,
+				APIVersion: constants.InferenceSetAPIVersion,
+				Kind:       constants.InferenceSet,
+			},
+			PollingInterval: ptr.To(int32(defaultPollingInterval)),
+			MinReplicaCount: ptr.To(int32(minReplicas)),
+			MaxReplicaCount: ptr.To(int32(maxReplicas)),
+			Triggers:        b.buildTriggers(is.Name, is.Namespace, cfg),
+		},
+	}
 }
