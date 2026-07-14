@@ -134,6 +134,142 @@ un-indexed. Any Prometheus metric name is accepted.
 | `min-replicas` | global | no | `1` | Minimum replica count. Values `<= 1` collapse to `1`. |
 | `max-replicas` | global | no | derived from `spec.nodeCountLimit` | Maximum replica count. Must be `> 1` and `>= min-replicas`; if absent, `spec.nodeCountLimit` must be set. |
 
+##### Single-metric example
+
+The simplest way to get started is to configure a single metric. The following
+`InferenceSet` scales on just the vLLM waiting-queue length (a `gauge`, averaged
+per replica):
+
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: kaito.sh/v1beta1
+kind: InferenceSet
+metadata:
+  annotations:
+    scaledobject.kaito.sh/auto-provision: "true"
+
+    # Metric 0: vLLM waiting-queue length (modelpod, gauge -> per-replica average)
+    scaledobject.kaito.sh/metricName/0: "vllm:num_requests_waiting"
+    scaledobject.kaito.sh/metricstype/0: "gauge"
+    scaledobject.kaito.sh/upthreshold/0: "5"
+    scaledobject.kaito.sh/downthreshold/0: "1"
+  name: phi-4
+  namespace: default
+spec:
+  labelSelector:
+    matchLabels:
+      apps: phi-4
+  replicas: 1
+  nodeCountLimit: 5
+  template:
+    inference:
+      preset:
+        accessMode: public
+        name: phi-4-mini-instruct
+    resource:
+      instanceType: Standard_NC24ads_A100_v4
+EOF
+```
+
+With a single metric the AND policy collapses to a one-signal formula: scale up by
+one replica when the **per-replica waiting-queue length** is above its up-threshold
+(and newly added pods are ready), scale down by one replica when it is below its
+down-threshold, otherwise hold.
+
+<details>
+<summary>Rendered <code>ScaledObject</code> for the single-metric example above</summary>
+
+keda-kaito-scaler translates the auto-provision annotations into the following
+`ScaledObject` (assuming the scaler is deployed as Service `keda-kaito-scaler` in
+namespace `keda-kaito-scaler` on gRPC port `9443`). One external trigger is emitted
+for the metric — named after the sanitized metric name — plus a `readiness_gate`
+trigger, and the single-signal policy is encoded in the `scalingModifiers.formula`:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: phi-4
+  namespace: default
+  annotations:
+    scaledobject.kaito.sh/managed-by: keda-kaito-scaler
+  ownerReferences:
+    - apiVersion: kaito.sh/v1beta1
+      kind: InferenceSet
+      name: phi-4
+      controller: true
+      blockOwnerDeletion: true
+spec:
+  scaleTargetRef:
+    apiVersion: kaito.sh/v1beta1
+    kind: InferenceSet
+    name: phi-4
+  pollingInterval: 15
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60     # evaluationwindow
+          selectPolicy: Max
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 300             # scaleupcooldown
+          tolerance: "0.1"
+        scaleDown:
+          stabilizationWindowSeconds: 300    # scaledowncooldown
+          selectPolicy: Max
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 300             # scaledowncooldown
+          tolerance: "0.1"
+    scalingModifiers:
+      target: "1"
+      metricType: Value
+      formula: >-
+        (readiness_gate == 1 && vllm_num_requests_waiting > 5) ? 2.0 :
+        ((vllm_num_requests_waiting < 1) ? 0.5 : 1.0)
+  triggers:
+    # Metric 0: gauge -> service-avg
+    - type: external
+      name: vllm_num_requests_waiting
+      metricType: Value
+      authenticationRef:
+        name: keda-kaito-scaler-creds
+        kind: ClusterTriggerAuthentication
+      metadata:
+        inferenceSetName: phi-4
+        inferenceSetNamespace: default
+        scalerAddress: keda-kaito-scaler.keda-kaito-scaler.svc.cluster.local:9443
+        metricName: vllm:num_requests_waiting
+        metricSource: modelpod
+        aggregation: service-avg
+    # Readiness gate: no scrape, reports 1 once all replicas are ready, 0 otherwise
+    - type: external
+      name: readiness_gate
+      metricType: Value
+      authenticationRef:
+        name: keda-kaito-scaler-creds
+        kind: ClusterTriggerAuthentication
+      metadata:
+        inferenceSetName: phi-4
+        inferenceSetNamespace: default
+        scalerAddress: keda-kaito-scaler.keda-kaito-scaler.svc.cluster.local:9443
+        metricName: readiness_gate
+        aggregation: gate
+```
+
+</details>
+
+##### Multi-metric example
+
+Adding more metrics combines them under the conservative AND policy. The following
+`InferenceSet` scales on both the waiting-queue length and the p95 request queue
+time:
+
 ```bash
 cat <<EOF | kubectl apply -f -
 apiVersion: kaito.sh/v1beta1
