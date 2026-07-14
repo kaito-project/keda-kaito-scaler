@@ -11,25 +11,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package metrics
+package aggregator
 
 import (
 	"fmt"
 
 	"go.uber.org/multierr"
 	"k8s.io/klog/v2"
-)
 
-// Aggregator reduces the per-service values inside a MetricSnapshot to the
-// single metric value that KEDA consumes.
-//
-// The returned value is meant to be paired with HPA's "AverageValue" target
-// type, where the threshold passed by KEDA represents the per-replica desired
-// load. HPA then computes desiredReplicas = ceil(value / threshold), so the
-// aggregator must return the *total* (sum) load across all services.
-type Aggregator interface {
-	Aggregate(snapshot *MetricSnapshot, metricName string, threshold float64) (float64, error)
-}
+	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
+)
 
 // SumAggregator sums a metric across every service that belongs to an
 // InferenceSet, compensating for services that could not be scraped in order
@@ -50,16 +41,24 @@ type Aggregator interface {
 //
 // Negative aggregated values are clamped to 0; KEDA's external_scaler client
 // otherwise silently treats negative MetricValueFloat as 0 by falling back to
-// the deprecated int64 MetricValue, which would mask bugs in the scraper.
+// the deprecated int64 MetricValue, which would mask bugs in the metric source.
 type SumAggregator struct{}
+
+// SumAggregatorName is the registered name of the SumAggregator.
+const SumAggregatorName = "sum"
 
 // NewSumAggregator returns a ready-to-use SumAggregator.
 func NewSumAggregator() *SumAggregator {
 	return &SumAggregator{}
 }
 
+// Name identifies the SumAggregator.
+func (a *SumAggregator) Name() string { return SumAggregatorName }
+
 // Aggregate implements Aggregator.
-func (a *SumAggregator) Aggregate(snapshot *MetricSnapshot, metricName string, threshold float64) (float64, error) {
+func (a *SumAggregator) Aggregate(snapshot *metricsource.MetricSnapshot, input AggregateInput) (float64, error) {
+	metricName := input.MetricName
+	threshold := input.Threshold
 	if snapshot == nil {
 		return 0, fmt.Errorf("metric snapshot is nil")
 	}
@@ -78,10 +77,14 @@ func (a *SumAggregator) Aggregate(snapshot *MetricSnapshot, metricName string, t
 			errs = append(errs, fmt.Errorf("service %s/%s: %w", sm.Namespace, sm.Name, sm.Err))
 			continue
 		}
+		// The service was scraped successfully. A missing metric key means this
+		// replica currently reports no such activity (e.g. no requests queued),
+		// so it contributes 0 and still counts as a real replica instead of being
+		// treated as a scrape failure. This keeps cold-start / no-traffic windows
+		// from erroring (which would otherwise block composite formulas).
 		val, ok := sm.Metrics[metricName]
 		if !ok {
-			errs = append(errs, fmt.Errorf("service %s/%s: metric %q not found", sm.Namespace, sm.Name, metricName))
-			continue
+			klog.V(4).Infof("metric %q absent on scraped service %s/%s; treating as 0", metricName, sm.Namespace, sm.Name)
 		}
 		sum += val
 		successCount++

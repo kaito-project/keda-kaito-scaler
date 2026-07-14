@@ -19,219 +19,19 @@ import (
 	"math"
 	"testing"
 
-	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/stretchr/testify/assert"
-	autoscalingv2 "k8s.io/api/autoscaling/v2"
-	"k8s.io/apimachinery/pkg/api/resource"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
 )
-
-func TestGetDefaultKedaKaitoScalerTriggers(t *testing.T) {
-	const (
-		testScalerServiceName = "keda-kaito-scaler-svc"
-		testScalerGRPCPort    = 10450
-	)
-	tests := []struct {
-		name                  string
-		inferenceSetName      string
-		inferenceSetNamespace string
-		scalerNamespace       string
-		threshold             string
-		expectedTriggerCount  int
-		expectedType          string
-		expectedName          string
-		expectedMetricType    autoscalingv2.MetricTargetType
-		expectedAuthRefName   string
-		expectedAuthRefKind   string
-	}{
-		{
-			name:                  "basic trigger creation",
-			inferenceSetName:      "test-inference-set",
-			inferenceSetNamespace: "test-namespace",
-			scalerNamespace:       "kaito-workspace",
-			threshold:             "10",
-			expectedTriggerCount:  1,
-			expectedType:          "external",
-			expectedName:          "keda-kaito-scaler",
-			expectedMetricType:    autoscalingv2.AverageValueMetricType,
-			expectedAuthRefName:   scaler.ClusterTriggerAuthName,
-			expectedAuthRefKind:   scaler.ClusterTriggerAuthKind,
-		},
-		{
-			name:                  "different threshold value",
-			inferenceSetName:      "another-inference-set",
-			inferenceSetNamespace: "another-namespace",
-			scalerNamespace:       "kaito-workspace",
-			threshold:             "5",
-			expectedTriggerCount:  1,
-			expectedType:          "external",
-			expectedName:          "keda-kaito-scaler",
-			expectedMetricType:    autoscalingv2.AverageValueMetricType,
-			expectedAuthRefName:   scaler.ClusterTriggerAuthName,
-			expectedAuthRefKind:   scaler.ClusterTriggerAuthKind,
-		},
-		{
-			name:                  "empty threshold",
-			inferenceSetName:      "test-inference-set",
-			inferenceSetNamespace: "test-namespace",
-			scalerNamespace:       "kaito-workspace",
-			threshold:             "",
-			expectedTriggerCount:  1,
-			expectedType:          "external",
-			expectedName:          "keda-kaito-scaler",
-			expectedMetricType:    autoscalingv2.AverageValueMetricType,
-			expectedAuthRefName:   scaler.ClusterTriggerAuthName,
-			expectedAuthRefKind:   scaler.ClusterTriggerAuthKind,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			triggers := getDefaultKedaKaitoScalerTriggers(tt.inferenceSetName, tt.inferenceSetNamespace, tt.scalerNamespace, testScalerServiceName, testScalerGRPCPort, tt.threshold, defaultMetricName)
-
-			// Check trigger count
-			assert.Equal(t, tt.expectedTriggerCount, len(triggers))
-
-			if len(triggers) > 0 {
-				trigger := triggers[0]
-
-				// Check basic properties
-				assert.Equal(t, tt.expectedType, trigger.Type)
-				assert.Equal(t, tt.expectedName, trigger.Name)
-				assert.Equal(t, tt.expectedMetricType, trigger.MetricType)
-
-				// Check authentication reference
-				assert.NotNil(t, trigger.AuthenticationRef)
-				assert.Equal(t, tt.expectedAuthRefName, trigger.AuthenticationRef.Name)
-				assert.Equal(t, tt.expectedAuthRefKind, trigger.AuthenticationRef.Kind)
-
-				// Check metadata
-				assert.NotNil(t, trigger.Metadata)
-				assert.Equal(t, tt.threshold, trigger.Metadata["threshold"])
-				assert.Equal(t, tt.inferenceSetName, trigger.Metadata[scaler.InferenceSetNameInMetadata])
-				assert.Equal(t, tt.inferenceSetNamespace, trigger.Metadata[scaler.InferenceSetNamespaceInMetadata])
-				assert.Equal(t, fmt.Sprintf("%s.%s.svc.cluster.local:%d", testScalerServiceName, tt.scalerNamespace, testScalerGRPCPort), trigger.Metadata[scaler.ScalerAddressInMetadata])
-				assert.Equal(t, "vllm:num_requests_waiting", trigger.Metadata[scaler.MetricNameInMetadata])
-				// Optional scrape settings (protocol/port/path/timeout) are intentionally
-				// omitted from the trigger metadata so the scaler can apply its defaults.
-				assert.NotContains(t, trigger.Metadata, scaler.MetricProtocolInMetadata)
-				assert.NotContains(t, trigger.Metadata, scaler.MetricPortInMetadata)
-				assert.NotContains(t, trigger.Metadata, scaler.MetricPathInMetadata)
-				assert.NotContains(t, trigger.Metadata, scaler.ScrapeTimeoutInMetadata)
-			}
-		})
-	}
-}
-
-func TestGetDefaultKedaKaitoScalerTriggers_MetadataKeys(t *testing.T) {
-	inferenceSetName := "test-inference-set"
-	inferenceSetNamespace := "test-namespace"
-	scalerNamespace := "kaito-workspace"
-	threshold := "10"
-
-	triggers := getDefaultKedaKaitoScalerTriggers(inferenceSetName, inferenceSetNamespace, scalerNamespace, "keda-kaito-scaler-svc", 10450, threshold, defaultMetricName)
-
-	assert.Equal(t, 1, len(triggers))
-	trigger := triggers[0]
-
-	// Verify all expected metadata keys are present
-	expectedKeys := []string{
-		"threshold",
-		scaler.InferenceSetNameInMetadata,
-		scaler.InferenceSetNamespaceInMetadata,
-		scaler.ScalerAddressInMetadata,
-		scaler.MetricNameInMetadata,
-	}
-
-	for _, key := range expectedKeys {
-		assert.Contains(t, trigger.Metadata, key, "Expected metadata key %s to be present", key)
-	}
-
-	// Verify metadata count matches expected keys
-	assert.Equal(t, len(expectedKeys), len(trigger.Metadata))
-}
-
-func TestGetDefaultHorizontalPodAutoscalerConfig(t *testing.T) {
-	config := getDefaultHorizontalPodAutoscalerConfig()
-
-	// Verify config is not nil
-	assert.NotNil(t, config)
-	assert.NotNil(t, config.Behavior)
-
-	// Test ScaleUp configuration
-	assert.NotNil(t, config.Behavior.ScaleUp)
-	scaleUp := config.Behavior.ScaleUp
-
-	// Check ScaleUp stabilization window
-	assert.NotNil(t, scaleUp.StabilizationWindowSeconds)
-	assert.Equal(t, int32(60), *scaleUp.StabilizationWindowSeconds)
-
-	// Check ScaleUp select policy
-	assert.NotNil(t, scaleUp.SelectPolicy)
-	assert.Equal(t, autoscalingv2.MaxChangePolicySelect, *scaleUp.SelectPolicy)
-
-	// Check ScaleUp policies
-	assert.Len(t, scaleUp.Policies, 1)
-	scaleUpPolicy := scaleUp.Policies[0]
-	assert.Equal(t, autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy), scaleUpPolicy.Type)
-	assert.Equal(t, int32(1), scaleUpPolicy.Value)
-	assert.Equal(t, int32(300), scaleUpPolicy.PeriodSeconds)
-
-	// Check ScaleUp tolerance
-	assert.NotNil(t, scaleUp.Tolerance)
-	expectedScaleUpTolerance := resource.MustParse("0.1")
-	assert.True(t, scaleUp.Tolerance.Equal(expectedScaleUpTolerance))
-
-	// Test ScaleDown configuration
-	assert.NotNil(t, config.Behavior.ScaleDown)
-	scaleDown := config.Behavior.ScaleDown
-
-	// Check ScaleDown stabilization window
-	assert.NotNil(t, scaleDown.StabilizationWindowSeconds)
-	assert.Equal(t, int32(300), *scaleDown.StabilizationWindowSeconds)
-
-	// Check ScaleDown select policy
-	assert.NotNil(t, scaleDown.SelectPolicy)
-	assert.Equal(t, autoscalingv2.MaxChangePolicySelect, *scaleDown.SelectPolicy)
-
-	// Check ScaleDown policies
-	assert.Len(t, scaleDown.Policies, 1)
-	scaleDownPolicy := scaleDown.Policies[0]
-	assert.Equal(t, autoscalingv2.HPAScalingPolicyType(autoscalingv2.PodsScalingPolicy), scaleDownPolicy.Type)
-	assert.Equal(t, int32(1), scaleDownPolicy.Value)
-	assert.Equal(t, int32(600), scaleDownPolicy.PeriodSeconds)
-
-	// Check ScaleDown tolerance
-	assert.NotNil(t, scaleDown.Tolerance)
-	expectedScaleDownTolerance := resource.MustParse("0.5")
-	assert.True(t, scaleDown.Tolerance.Equal(expectedScaleDownTolerance))
-}
-
-func TestGetDefaultHorizontalPodAutoscalerConfig_Consistency(t *testing.T) {
-	// Test that multiple calls return equivalent configurations
-	config1 := getDefaultHorizontalPodAutoscalerConfig()
-	config2 := getDefaultHorizontalPodAutoscalerConfig()
-
-	// Verify both configurations are not nil
-	assert.NotNil(t, config1)
-	assert.NotNil(t, config2)
-
-	// Verify ScaleUp configurations are equivalent
-	assert.Equal(t, *config1.Behavior.ScaleUp.StabilizationWindowSeconds, *config2.Behavior.ScaleUp.StabilizationWindowSeconds)
-	assert.Equal(t, *config1.Behavior.ScaleUp.SelectPolicy, *config2.Behavior.ScaleUp.SelectPolicy)
-	assert.True(t, config1.Behavior.ScaleUp.Tolerance.Equal(*config2.Behavior.ScaleUp.Tolerance))
-
-	// Verify ScaleDown configurations are equivalent
-	assert.Equal(t, *config1.Behavior.ScaleDown.StabilizationWindowSeconds, *config2.Behavior.ScaleDown.StabilizationWindowSeconds)
-	assert.Equal(t, *config1.Behavior.ScaleDown.SelectPolicy, *config2.Behavior.ScaleDown.SelectPolicy)
-	assert.True(t, config1.Behavior.ScaleDown.Tolerance.Equal(*config2.Behavior.ScaleDown.Tolerance))
-}
 
 func TestResolveMinReplicas(t *testing.T) {
 	tests := []struct {
@@ -251,27 +51,27 @@ func TestResolveMinReplicas(t *testing.T) {
 		},
 		{
 			name:        "annotation value less than 1 is clamped to 1",
-			annotations: map[string]string{AnnotationKeyMinReplicas: "0"},
+			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "0"},
 			expected:    1,
 		},
 		{
 			name:        "annotation value equal to 1 returns 1",
-			annotations: map[string]string{AnnotationKeyMinReplicas: "1"},
+			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "1"},
 			expected:    1,
 		},
 		{
 			name:        "negative annotation value is clamped to 1",
-			annotations: map[string]string{AnnotationKeyMinReplicas: "-5"},
+			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "-5"},
 			expected:    1,
 		},
 		{
 			name:        "invalid annotation value falls back to 1",
-			annotations: map[string]string{AnnotationKeyMinReplicas: "abc"},
+			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "abc"},
 			expected:    1,
 		},
 		{
 			name:        "valid value greater than 1 is returned",
-			annotations: map[string]string{AnnotationKeyMinReplicas: "3"},
+			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "3"},
 			expected:    3,
 		},
 	}
@@ -286,7 +86,6 @@ func TestResolveMinReplicas(t *testing.T) {
 func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
-	assert.NoError(t, kaitov1alpha1.AddToScheme(scheme))
 	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 }
@@ -296,14 +95,14 @@ func TestResolveMaxReplicas(t *testing.T) {
 	const inferenceSetName = "test-is"
 	const inferenceSetNamespace = "default"
 
-	newInferenceSet := func(nodeCountLimit int, annotations map[string]string) *kaitov1alpha1.InferenceSet {
-		return &kaitov1alpha1.InferenceSet{
+	newInferenceSet := func(nodeCountLimit int, annotations map[string]string) *kaitov1beta1.InferenceSet {
+		return &kaitov1beta1.InferenceSet{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        inferenceSetName,
 				Namespace:   inferenceSetNamespace,
 				Annotations: annotations,
 			},
-			Spec: kaitov1alpha1.InferenceSetSpec{
+			Spec: kaitov1beta1.InferenceSetSpec{
 				NodeCountLimit: nodeCountLimit,
 			},
 		}
@@ -326,7 +125,7 @@ func TestResolveMaxReplicas(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		is              *kaitov1alpha1.InferenceSet
+		is              *kaitov1beta1.InferenceSet
 		workspaces      []client.Object
 		expectedValue   int
 		expectedRequeue bool
@@ -339,22 +138,22 @@ func TestResolveMaxReplicas(t *testing.T) {
 		},
 		{
 			name:          "NodeCountLimit=0 with valid annotation returns annotation value",
-			is:            newInferenceSet(0, map[string]string{AnnotationKeyMaxReplicas: "5"}),
+			is:            newInferenceSet(0, map[string]string{constants.AnnotationKeyMaxReplicas: "5"}),
 			expectedValue: 5,
 		},
 		{
 			name:          "NodeCountLimit=0 with annotation <1 is clamped to 1",
-			is:            newInferenceSet(0, map[string]string{AnnotationKeyMaxReplicas: "0"}),
+			is:            newInferenceSet(0, map[string]string{constants.AnnotationKeyMaxReplicas: "0"}),
 			expectedValue: 1,
 		},
 		{
 			name:          "NodeCountLimit=0 with invalid annotation is clamped to 1",
-			is:            newInferenceSet(0, map[string]string{AnnotationKeyMaxReplicas: "abc"}),
+			is:            newInferenceSet(0, map[string]string{constants.AnnotationKeyMaxReplicas: "abc"}),
 			expectedValue: 1,
 		},
 		{
 			name:          "NodeCountLimit=0 with annotation exceeding MaxInt32 is clamped to MaxInt32",
-			is:            newInferenceSet(0, map[string]string{AnnotationKeyMaxReplicas: fmt.Sprintf("%d", int64(math.MaxInt32)+1)}),
+			is:            newInferenceSet(0, map[string]string{constants.AnnotationKeyMaxReplicas: fmt.Sprintf("%d", int64(math.MaxInt32)+1)}),
 			expectedValue: math.MaxInt32,
 		},
 		{
@@ -401,56 +200,170 @@ func TestResolveMaxReplicas(t *testing.T) {
 	}
 }
 
-func TestBuildScaledObject(t *testing.T) {
-	const (
-		inferenceSetName      = "test-is"
-		inferenceSetNamespace = "default"
-		scalerNamespace       = "kaito-workspace"
-		threshold             = "10"
-		minReplicas           = 2
-		maxReplicas           = 5
-	)
+// compositeAnnotations returns a valid composite autoscaling annotation set,
+// including the gating annotations the controller requires to enable
+// auto-provisioning.
+func compositeAnnotations() map[string]string {
+	return map[string]string{
+		constants.AnnotationKeyAutoProvision:    "true",
+		constants.AnnotationKeyMaxReplicas:      "5",
+		"scaledobject.kaito.sh/metricName/0":    "vllm:num_requests_waiting",
+		"scaledobject.kaito.sh/metricstype/0":   "gauge",
+		"scaledobject.kaito.sh/upthreshold/0":   "10",
+		"scaledobject.kaito.sh/downthreshold/0": "2",
+		"scaledobject.kaito.sh/metricName/1":    "vllm:request_queue_time_seconds",
+		"scaledobject.kaito.sh/metricstype/1":   "histogram",
+		"scaledobject.kaito.sh/upthreshold/1":   "1.5",
+		"scaledobject.kaito.sh/downthreshold/1": "0.5",
+	}
+}
 
-	is := &kaitov1alpha1.InferenceSet{
+func TestAutoscalingConfigValid_Composite(t *testing.T) {
+	t.Run("valid composite enabled", func(t *testing.T) {
+		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: compositeAnnotations()}}
+		assert.True(t, autoscalingConfigValid(is))
+	})
+
+	t.Run("invalid composite disabled", func(t *testing.T) {
+		ann := compositeAnnotations()
+		ann["scaledobject.kaito.sh/metricstype/0"] = "bogus"
+		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}
+		assert.False(t, autoscalingConfigValid(is))
+	})
+
+	t.Run("single metric config accepted", func(t *testing.T) {
+		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			constants.AnnotationKeyAutoProvision:    "true",
+			constants.AnnotationKeyMaxReplicas:      "5",
+			"scaledobject.kaito.sh/metricName/0":    "vllm:num_requests_waiting",
+			"scaledobject.kaito.sh/metricstype/0":   "gauge",
+			"scaledobject.kaito.sh/upthreshold/0":   "5",
+			"scaledobject.kaito.sh/downthreshold/0": "1",
+		}}}
+		assert.True(t, autoscalingConfigValid(is))
+	})
+
+	t.Run("no metrics rejected", func(t *testing.T) {
+		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			constants.AnnotationKeyAutoProvision: "true",
+			constants.AnnotationKeyMaxReplicas:   "5",
+		}}}
+		assert.False(t, autoscalingConfigValid(is))
+	})
+}
+
+func TestAnnotationsWithPrefixChanged(t *testing.T) {
+	old := map[string]string{"scaledobject.kaito.sh/metricName/0": "queue", "other": "x"}
+
+	// Changing an indexed composite key is detected.
+	next := map[string]string{"scaledobject.kaito.sh/metricName/0": "latency-p95", "other": "x"}
+	assert.True(t, annotationsWithPrefixChanged(old, next, annotationPrefix))
+
+	// Adding a new prefixed key is detected.
+	added := map[string]string{"scaledobject.kaito.sh/metricName/0": "queue", "scaledobject.kaito.sh/upthreshold/0": "10", "other": "x"}
+	assert.True(t, annotationsWithPrefixChanged(old, added, annotationPrefix))
+
+	// Changing a non-prefixed key is ignored.
+	unrelated := map[string]string{"scaledobject.kaito.sh/metricName/0": "queue", "other": "y"}
+	assert.False(t, annotationsWithPrefixChanged(old, unrelated, annotationPrefix))
+}
+
+func newReconcileFakeClient(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
+	assert.NoError(t, v1alpha1.AddToScheme(scheme))
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+}
+
+func newManagedScaledObject(name string, is *kaitov1beta1.InferenceSet) *v1alpha1.ScaledObject {
+	return &v1alpha1.ScaledObject{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      inferenceSetName,
-			Namespace: inferenceSetNamespace,
-			UID:       "test-uid",
+			Name:      name,
+			Namespace: is.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "kaito.sh/v1beta1",
+					Kind:       constants.InferenceSet,
+					Name:       is.Name,
+					UID:        is.UID,
+					Controller: ptr.To(true),
+				},
+			},
+		},
+		Spec: v1alpha1.ScaledObjectSpec{
+			ScaleTargetRef: &v1alpha1.ScaleTarget{Name: is.Name, Kind: constants.InferenceSet},
 		},
 	}
+}
 
-	ctrl := &Controller{ScalerNamespace: scalerNamespace}
-	so := ctrl.buildScaledObject(is, minReplicas, maxReplicas, threshold, defaultMetricName)
+// TestReconcile_CleanupWhenAutoProvisionDisabled verifies that toggling the
+// auto-provision annotation to a non-"true" value deletes the ScaledObject the
+// controller previously provisioned, while leaving user-managed ScaledObjects
+// untouched.
+func TestReconcile_CleanupWhenAutoProvisionDisabled(t *testing.T) {
+	const (
+		isName = "test-is"
+		ns     = "default"
+	)
 
-	// Object meta
-	assert.Equal(t, inferenceSetName, so.Name)
-	assert.Equal(t, inferenceSetNamespace, so.Namespace)
-	assert.Equal(t, scaler.ScalerName, so.Annotations[AnnotationKeyManagedBy])
-	assert.Len(t, so.OwnerReferences, 1)
-	assert.Equal(t, InferenceSet, so.OwnerReferences[0].Kind)
-	assert.Equal(t, inferenceSetName, so.OwnerReferences[0].Name)
+	newDisabledIS := func() *kaitov1beta1.InferenceSet {
+		return &kaitov1beta1.InferenceSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        isName,
+				Namespace:   ns,
+				UID:         types.UID("is-uid"),
+				Annotations: map[string]string{constants.AnnotationKeyAutoProvision: "false"},
+			},
+		}
+	}
 
-	// PollingInterval defaults to 15s so KEDA polls the external scaler more
-	// frequently than its built-in 30s default.
-	assert.NotNil(t, so.Spec.PollingInterval)
-	assert.Equal(t, int32(defaultPollingInterval), *so.Spec.PollingInterval)
-	assert.Equal(t, int32(15), *so.Spec.PollingInterval)
+	t.Run("deletes managed ScaledObject when auto-provision is false", func(t *testing.T) {
+		is := newDisabledIS()
+		so := newManagedScaledObject("test-is-so", is)
+		c := newReconcileFakeClient(t, is, so)
+		ctrl := &Controller{Client: c}
 
-	// Replica bounds
-	assert.NotNil(t, so.Spec.MinReplicaCount)
-	assert.Equal(t, int32(minReplicas), *so.Spec.MinReplicaCount)
-	assert.NotNil(t, so.Spec.MaxReplicaCount)
-	assert.Equal(t, int32(maxReplicas), *so.Spec.MaxReplicaCount)
+		_, err := ctrl.Reconcile(context.Background(), is)
+		assert.NoError(t, err)
 
-	// Scale target
-	assert.NotNil(t, so.Spec.ScaleTargetRef)
-	assert.Equal(t, inferenceSetName, so.Spec.ScaleTargetRef.Name)
-	assert.Equal(t, InferenceSet, so.Spec.ScaleTargetRef.Kind)
-	assert.Equal(t, inferenceSetAPIVersion, so.Spec.ScaleTargetRef.APIVersion)
+		var got v1alpha1.ScaledObject
+		err = c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "test-is-so"}, &got)
+		assert.True(t, apierrors.IsNotFound(err), "managed ScaledObject should be deleted")
+	})
 
-	// Advanced HPA config and triggers wired in
-	assert.NotNil(t, so.Spec.Advanced)
-	assert.NotNil(t, so.Spec.Advanced.HorizontalPodAutoscalerConfig)
-	assert.Len(t, so.Spec.Triggers, 1)
-	assert.Equal(t, threshold, so.Spec.Triggers[0].Metadata["threshold"])
+	t.Run("deletes managed ScaledObject when annotation is absent", func(t *testing.T) {
+		is := newDisabledIS()
+		is.Annotations = nil
+		so := newManagedScaledObject("test-is-so", is)
+		c := newReconcileFakeClient(t, is, so)
+		ctrl := &Controller{Client: c}
+
+		_, err := ctrl.Reconcile(context.Background(), is)
+		assert.NoError(t, err)
+
+		var got v1alpha1.ScaledObject
+		err = c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "test-is-so"}, &got)
+		assert.True(t, apierrors.IsNotFound(err), "managed ScaledObject should be deleted")
+	})
+
+	t.Run("preserves ScaledObject not owned by the InferenceSet", func(t *testing.T) {
+		is := newDisabledIS()
+		// Hand-created ScaledObject with no controller owner reference: not managed.
+		so := &v1alpha1.ScaledObject{
+			ObjectMeta: metav1.ObjectMeta{Name: "user-so", Namespace: ns},
+			Spec: v1alpha1.ScaledObjectSpec{
+				ScaleTargetRef: &v1alpha1.ScaleTarget{Name: isName, Kind: constants.InferenceSet},
+			},
+		}
+		c := newReconcileFakeClient(t, is, so)
+		ctrl := &Controller{Client: c}
+
+		_, err := ctrl.Reconcile(context.Background(), is)
+		assert.NoError(t, err)
+
+		var got v1alpha1.ScaledObject
+		err = c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "user-so"}, &got)
+		assert.NoError(t, err, "user-managed ScaledObject should be preserved")
+	})
 }

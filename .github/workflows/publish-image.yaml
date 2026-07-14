@@ -12,7 +12,7 @@ permissions:
   packages: write
 
 env:
-  GO_VERSION: '1.25'
+  GO_VERSION: '1.26.4'
   IMAGE_NAME: 'keda-kaito-scaler'
   REGISTRY: ghcr.io
 
@@ -81,7 +81,7 @@ jobs:
       - id: get-tag
         name: Get tag
         run: |
-          echo "IMG_TAG=$(echo ${{ needs.check-tag.outputs.tag }} | tr -d v)" >> $GITHUB_ENV
+          echo "img_tag=$(echo ${{ needs.check-tag.outputs.tag }} | tr -d v)" >> $GITHUB_OUTPUT
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -108,13 +108,13 @@ jobs:
           VERSION: ${{ needs.check-tag.outputs.tag }}
           REGISTRY: ${{ steps.get-registry.outputs.registry_repository }}
           KEDA_KAITO_SCALER_IMG_NAME: ${{ env.IMAGE_NAME }}
-          IMG_TAG: ${{ env.IMG_TAG }}
+          IMG_TAG: ${{ steps.get-tag.outputs.img_tag }}
           GIT_COMMIT: ${{ steps.get-commit.outputs.git_commit }}
 
-      - name: Scan ${{ steps.get-registry.outputs.registry_repository }}/${{ env.IMAGE_NAME }}:${{ env.IMG_TAG }}
+      - name: Scan ${{ steps.get-registry.outputs.registry_repository }}/${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.img_tag }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ steps.get-registry.outputs.registry_repository }}/${{ env.IMAGE_NAME }}:${{ env.IMG_TAG }}
+          image-ref: ${{ steps.get-registry.outputs.registry_repository }}/${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.img_tag }}
           format: 'table'
           exit-code: '1'
           ignore-unfixed: true

@@ -1,0 +1,99 @@
+// Copyright (c) KAITO authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package metricsource provides abstractions for scraping inference metrics
+// that drive KEDA scaling decisions.
+//
+// The package follows a per-call snapshot model: each invocation of
+// MetricSource.Scrape returns a point-in-time MetricSnapshot for all services
+// belonging to a given InferenceSet. The snapshot carries every metric parsed
+// from each service, so the caller (typically the KEDA external scaler) can pick
+// one or more metric names from the same snapshot without issuing additional
+// network requests.
+package metricsource
+
+import (
+	"context"
+	"time"
+
+	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+	"k8s.io/apimachinery/pkg/types"
+)
+
+// ScrapeConfig controls how a MetricSource connects to an individual service.
+type ScrapeConfig struct {
+	// Protocol is either "http" or "https".
+	Protocol string
+	// Port is the service port exposing the Prometheus metrics endpoint.
+	Port string
+	// Path is the HTTP path of the metrics endpoint (e.g. "/metrics").
+	Path string
+	// Timeout bounds a single per-service scrape.
+	Timeout time.Duration
+}
+
+// Bucket is a single cumulative histogram bucket: CumulativeCount observations
+// were less than or equal to the upper bound Le.
+type Bucket struct {
+	Le              float64
+	CumulativeCount uint64
+}
+
+// Histogram captures a Prometheus histogram metric family: its cumulative
+// buckets (sorted by Le ascending) plus the overall observation count and sum.
+type Histogram struct {
+	Buckets []Bucket
+	Count   uint64
+	Sum     float64
+}
+
+// ServiceMetrics captures the metrics scraped from a single service (one
+// workspace replica, or a single EPP endpoint) that belongs to an InferenceSet.
+type ServiceMetrics struct {
+	// Name / Namespace identify the service that was scraped.
+	Name      string
+	Namespace string
+	// Metrics maps a metric family name (e.g. "vllm:num_requests_waiting") to its
+	// aggregated scalar value. When a metric family contains multiple label sets
+	// (for example one per model), the values are summed. Empty when Err != nil.
+	Metrics map[string]float64
+	// Histograms maps a histogram metric family name to its parsed buckets/count/
+	// sum, enabling quantile aggregation (e.g. p95 latency). nil when the service
+	// exposes no histograms or the metric source does not parse them.
+	Histograms map[string]Histogram
+	// Err is non-nil when scraping or parsing this specific service failed. Other
+	// services in the same snapshot may still have been scraped successfully.
+	Err error
+}
+
+// MetricSnapshot is a point-in-time collection of per-service metrics for an
+// InferenceSet. It is produced by MetricSource.Scrape and consumed by an Aggregator.
+type MetricSnapshot struct {
+	InferenceSet types.NamespacedName
+	Services     []ServiceMetrics
+	ScrapedAt    time.Time
+}
+
+// ModelPodSourceName is the registered name of the metric source that collects
+// metrics from the model-serving pods behind an InferenceSet's workspace
+// Services. It is the single source of truth shared by the metric-source map key,
+// ModelPodSource.Name, the default metric source, and the composite
+// "metricsource" annotation / metricSource metadata value.
+const ModelPodSourceName = "modelpod"
+
+// MetricSource collects metrics from every service that backs an InferenceSet and
+// returns a MetricSnapshot. Implementations must be safe for concurrent use.
+type MetricSource interface {
+	Name() string
+	Scrape(ctx context.Context, is *kaitov1beta1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error)
+}
