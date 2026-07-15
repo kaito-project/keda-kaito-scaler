@@ -55,7 +55,7 @@ const (
 
 	// annotationPrefix is the common prefix for every autoscaling annotation the
 	// controller consumes on an InferenceSet. Any change to a key under this
-	// prefix (including the indexed composite keys) triggers a reconcile.
+	// prefix (including the metrics list annotation) triggers a reconcile.
 	annotationPrefix = "scaledobject.kaito.sh/"
 )
 
@@ -121,7 +121,7 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSe
 	}
 
 	// Build the desired ScaledObject from the InferenceSet's auto-provision
-	// annotations (one or more indexed metrics combined under a conservative AND
+	// annotations (one or more metrics combined under a conservative AND
 	// policy).
 	soBuilder := scaledobject.Builder{
 		ScalerNamespace:   c.ScalerNamespace,
@@ -375,8 +375,8 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			}
 
 			// Reconcile when any autoscaling annotation changes. Comparing by
-			// prefix covers the fixed single-metric keys as well as the indexed
-			// composite keys (metricName/0, upthreshold/0, ...).
+			// prefix covers all scaledobject.kaito.sh/ keys, including the
+			// scaledobject.kaito.sh/metrics list annotation.
 			if annotationsWithPrefixChanged(oldInferenceSet.Annotations, newInferenceSet.Annotations, annotationPrefix) {
 				// Fire when the new state is validly enabled (provision/update) or
 				// the old state requested auto-provisioning (so toggling the

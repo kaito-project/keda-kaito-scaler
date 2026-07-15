@@ -205,16 +205,18 @@ func TestResolveMaxReplicas(t *testing.T) {
 // auto-provisioning.
 func compositeAnnotations() map[string]string {
 	return map[string]string{
-		constants.AnnotationKeyAutoProvision:    "true",
-		constants.AnnotationKeyMaxReplicas:      "5",
-		"scaledobject.kaito.sh/metricName/0":    "vllm:num_requests_waiting",
-		"scaledobject.kaito.sh/metricstype/0":   "gauge",
-		"scaledobject.kaito.sh/upthreshold/0":   "10",
-		"scaledobject.kaito.sh/downthreshold/0": "2",
-		"scaledobject.kaito.sh/metricName/1":    "vllm:request_queue_time_seconds",
-		"scaledobject.kaito.sh/metricstype/1":   "histogram",
-		"scaledobject.kaito.sh/upthreshold/1":   "1.5",
-		"scaledobject.kaito.sh/downthreshold/1": "0.5",
+		constants.AnnotationKeyAutoProvision: "true",
+		constants.AnnotationKeyMaxReplicas:   "5",
+		constants.AnnotationKeyMetrics: `
+- name: vllm:num_requests_waiting
+  type: gauge
+  upthreshold: 10
+  downthreshold: 2
+- name: vllm:request_queue_time_seconds
+  type: histogram
+  upthreshold: 1.5
+  downthreshold: 0.5
+`,
 	}
 }
 
@@ -226,19 +228,26 @@ func TestAutoscalingConfigValid_Composite(t *testing.T) {
 
 	t.Run("invalid composite disabled", func(t *testing.T) {
 		ann := compositeAnnotations()
-		ann["scaledobject.kaito.sh/metricstype/0"] = "bogus"
+		ann[constants.AnnotationKeyMetrics] = `
+- name: vllm:num_requests_waiting
+  type: bogus
+  upthreshold: 10
+  downthreshold: 2
+`
 		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}
 		assert.False(t, autoscalingConfigValid(is))
 	})
 
 	t.Run("single metric config accepted", func(t *testing.T) {
 		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
-			constants.AnnotationKeyAutoProvision:    "true",
-			constants.AnnotationKeyMaxReplicas:      "5",
-			"scaledobject.kaito.sh/metricName/0":    "vllm:num_requests_waiting",
-			"scaledobject.kaito.sh/metricstype/0":   "gauge",
-			"scaledobject.kaito.sh/upthreshold/0":   "5",
-			"scaledobject.kaito.sh/downthreshold/0": "1",
+			constants.AnnotationKeyAutoProvision: "true",
+			constants.AnnotationKeyMaxReplicas:   "5",
+			constants.AnnotationKeyMetrics: `
+- name: vllm:num_requests_waiting
+  type: gauge
+  upthreshold: 5
+  downthreshold: 1
+`,
 		}}}
 		assert.True(t, autoscalingConfigValid(is))
 	})
@@ -253,18 +262,18 @@ func TestAutoscalingConfigValid_Composite(t *testing.T) {
 }
 
 func TestAnnotationsWithPrefixChanged(t *testing.T) {
-	old := map[string]string{"scaledobject.kaito.sh/metricName/0": "queue", "other": "x"}
+	old := map[string]string{"scaledobject.kaito.sh/metrics": "queue", "other": "x"}
 
-	// Changing an indexed composite key is detected.
-	next := map[string]string{"scaledobject.kaito.sh/metricName/0": "latency-p95", "other": "x"}
+	// Changing a composite key is detected.
+	next := map[string]string{"scaledobject.kaito.sh/metrics": "latency-p95", "other": "x"}
 	assert.True(t, annotationsWithPrefixChanged(old, next, annotationPrefix))
 
 	// Adding a new prefixed key is detected.
-	added := map[string]string{"scaledobject.kaito.sh/metricName/0": "queue", "scaledobject.kaito.sh/upthreshold/0": "10", "other": "x"}
+	added := map[string]string{"scaledobject.kaito.sh/metrics": "queue", "scaledobject.kaito.sh/max-replicas": "10", "other": "x"}
 	assert.True(t, annotationsWithPrefixChanged(old, added, annotationPrefix))
 
 	// Changing a non-prefixed key is ignored.
-	unrelated := map[string]string{"scaledobject.kaito.sh/metricName/0": "queue", "other": "y"}
+	unrelated := map[string]string{"scaledobject.kaito.sh/metrics": "queue", "other": "y"}
 	assert.False(t, annotationsWithPrefixChanged(old, unrelated, annotationPrefix))
 }
 
