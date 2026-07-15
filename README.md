@@ -104,9 +104,9 @@ You can drive autoscaling in two ways:
 
 #### Option 1: Auto-provision (recommended)
 
-Adding the indexed `metricName/0` annotation enables auto-provisioning:
-keda-kaito-scaler builds and reconciles a `ScaledObject` whose KEDA
-`scalingModifiers` formula applies a conservative **AND** policy — scale up by
+Adding the `metrics` annotation (together with `auto-provision: "true"`) enables
+auto-provisioning: keda-kaito-scaler builds and reconciles a `ScaledObject` whose
+KEDA `scalingModifiers` formula applies a conservative **AND** policy — scale up by
 one replica only when *every* configured metric is above its
 up-threshold (and newly added pods are ready), scale down by one replica only
 when *every* metric is below its down-threshold, otherwise hold. Each scale
@@ -114,25 +114,34 @@ step is capped at ±1 replica per cooldown to protect expensive GPU capacity.
 Configuring a single metric is fully supported; it just yields a one-signal
 formula.
 
-All configuration lives under the `scaledobject.kaito.sh/` prefix. Per-metric
-keys are indexed with a `/{i}` suffix (`/0`, `/1`, ...); global keys are
-un-indexed. Any Prometheus metric name is accepted.
+The per-metric configuration lives in a single `scaledobject.kaito.sh/metrics`
+annotation, whose value is a YAML (or JSON) list — one entry per metric. Global
+settings stay as their own `scaledobject.kaito.sh/` annotations. Any Prometheus
+metric name is accepted.
 
-| Annotation (`scaledobject.kaito.sh/`) | Scope | Required | Default | Description |
-| --- | --- | --- | --- | --- |
-| `auto-provision` | global | yes | – | Must be `"true"` to enable auto-provisioning. |
-| `metricName/{i}` | per-metric | yes | – | Prometheus metric name for slot `i`. Presence of `metricName/0` enables auto-provisioning. |
-| `metricstype/{i}` | per-metric | yes | – | Aggregation for metric `i`: `gauge` → per-replica average across pods; `histogram` → per-pod quantile. Both are replica-count independent. |
-| `metricsource/{i}` | per-metric | no | `modelpod` | Where metric `i` is scraped. Only `modelpod` (the model-serving pods behind the `InferenceSet`'s workspace `Service`s) is supported. |
-| `upthreshold/{i}` | per-metric | yes | – | Scale-up threshold for metric `i` (float). |
-| `downthreshold/{i}` | per-metric | yes | – | Scale-down threshold for metric `i` (float). Must be `<= upthreshold/{i}`. |
-| `quantile/{i}` | per-metric | no | `0.95` | Target quantile in `(0, 1]` for `histogram` metrics; ignored for `gauge`. |
-| `combinepolicy` | global | no | `AND` | How per-metric conditions are combined. Only `AND` is currently supported. |
-| `evaluationwindow` | global | no | `60` | Scale-up stabilization window (seconds). |
-| `scaleupcooldown` | global | no | `300` | Minimum seconds between scale-up steps. |
-| `scaledowncooldown` | global | no | `300` | Minimum seconds between scale-down steps. |
-| `min-replicas` | global | no | `1` | Minimum replica count. Values `<= 1` collapse to `1`. |
-| `max-replicas` | global | no | derived from `spec.nodeCountLimit` | Maximum replica count. Must be `> 1` and `>= min-replicas`; if absent, `spec.nodeCountLimit` must be set. |
+Each entry in the `metrics` list accepts the following fields:
+
+| Field | Required | Default | Description |
+| --- | --- | --- | --- |
+| `name` | yes | – | Prometheus metric name. |
+| `type` | yes | – | Aggregation: `gauge` → per-replica average across pods; `histogram` → per-pod quantile. Both are replica-count independent. |
+| `source` | no | `modelpod` | Where the metric is scraped. Only `modelpod` (the model-serving pods behind the `InferenceSet`'s workspace `Service`s) is supported. |
+| `upthreshold` | yes | – | Scale-up threshold (float). |
+| `downthreshold` | yes | – | Scale-down threshold (float). Must be `<= upthreshold`. |
+| `quantile` | no | `0.95` | Target quantile in `(0, 1]` for `histogram` metrics; ignored for `gauge`. |
+
+The remaining global annotations:
+
+| Annotation (`scaledobject.kaito.sh/`) | Required | Default | Description |
+| --- | --- | --- | --- |
+| `auto-provision` | yes | – | Must be `"true"` to enable auto-provisioning. |
+| `metrics` | yes | – | YAML/JSON list of metric entries (see fields above). At least one entry is required. |
+| `combinepolicy` | no | `AND` | How per-metric conditions are combined. Only `AND` is currently supported. |
+| `evaluationwindow` | no | `60` | Scale-up stabilization window (seconds). |
+| `scaleupcooldown` | no | `300` | Minimum seconds between scale-up steps. |
+| `scaledowncooldown` | no | `300` | Minimum seconds between scale-down steps. |
+| `min-replicas` | no | `1` | Minimum replica count. Values `<= 1` collapse to `1`. |
+| `max-replicas` | no | derived from `spec.nodeCountLimit` | Maximum replica count. Must be `> 1` and `>= min-replicas`; if absent, `spec.nodeCountLimit` must be set. |
 
 ##### Single-metric example
 
@@ -148,11 +157,12 @@ metadata:
   annotations:
     scaledobject.kaito.sh/auto-provision: "true"
 
-    # Metric 0: vLLM waiting-queue length (modelpod, gauge -> per-replica average)
-    scaledobject.kaito.sh/metricName/0: "vllm:num_requests_waiting"
-    scaledobject.kaito.sh/metricstype/0: "gauge"
-    scaledobject.kaito.sh/upthreshold/0: "5"
-    scaledobject.kaito.sh/downthreshold/0: "1"
+    # A single metric: vLLM waiting-queue length (modelpod, gauge -> per-replica average)
+    scaledobject.kaito.sh/metrics: |
+      - name: vllm:num_requests_waiting
+        type: gauge
+        upthreshold: 5
+        downthreshold: 1
   name: phi-4
   namespace: default
 spec:
@@ -278,18 +288,19 @@ metadata:
   annotations:
     scaledobject.kaito.sh/auto-provision: "true"
 
-    # Metric 0: vLLM waiting-queue length (modelpod, gauge -> per-replica average)
-    scaledobject.kaito.sh/metricName/0: "vllm:num_requests_waiting"
-    scaledobject.kaito.sh/metricstype/0: "gauge"
-    scaledobject.kaito.sh/upthreshold/0: "5"
-    scaledobject.kaito.sh/downthreshold/0: "1"
-
-    # Metric 1: p95 request queue time (modelpod, histogram -> quantile)
-    scaledobject.kaito.sh/metricName/1: "vllm:request_queue_time_seconds"
-    scaledobject.kaito.sh/metricstype/1: "histogram"
-    scaledobject.kaito.sh/upthreshold/1: "2.0"
-    scaledobject.kaito.sh/downthreshold/1: "0.5"
-    scaledobject.kaito.sh/quantile/1: "0.95"
+    # Two metrics combined under the conservative AND policy:
+    #   - vLLM waiting-queue length (modelpod, gauge -> per-replica average)
+    #   - p95 request queue time     (modelpod, histogram -> quantile)
+    scaledobject.kaito.sh/metrics: |
+      - name: vllm:num_requests_waiting
+        type: gauge
+        upthreshold: 5
+        downthreshold: 1
+      - name: vllm:request_queue_time_seconds
+        type: histogram
+        upthreshold: 2.0
+        downthreshold: 0.5
+        quantile: 0.95
 
     # Optional global tuning (defaults shown)
     scaledobject.kaito.sh/combinepolicy: "AND"

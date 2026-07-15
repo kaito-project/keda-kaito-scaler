@@ -12,11 +12,12 @@
 // limitations under the License.
 
 // Package scaledobject owns the InferenceSet autoscaling annotation schema and
-// builds the desired KEDA ScaledObject. Autoscaling is driven by one or more
-// indexed metric annotations (metricName/{i}, ...): configuring a single metric
-// yields a single-signal ScaledObject, configuring several combines them under a
-// conservative AND policy. The reconciler stays agnostic of how the ScaledObject
-// is assembled by delegating to Builder.BuildDesired.
+// builds the desired KEDA ScaledObject. Autoscaling is driven by the
+// scaledobject.kaito.sh/metrics annotation, a YAML list of metric entries:
+// configuring a single metric yields a single-signal ScaledObject, configuring
+// several combines them under a conservative AND policy. The reconciler stays
+// agnostic of how the ScaledObject is assembled by delegating to
+// Builder.BuildDesired.
 package scaledobject
 
 import (
@@ -31,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 
 	"github.com/kaito-project/keda-kaito-scaler/pkg/aggregator"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
@@ -219,15 +221,29 @@ func ValidateConfig(annotations map[string]string) error {
 	return err
 }
 
-// indexedKey builds an indexed annotation key such as
-// "scaledobject.kaito.sh/metricName/0".
-func indexedKey(base string, i int) string {
-	return fmt.Sprintf("%s/%d", base, i)
+// metricSpec is one entry of the scaledobject.kaito.sh/metrics annotation, a
+// YAML (or JSON) list. Threshold and quantile fields are pointers so a missing
+// key can be told apart from an explicit zero.
+type metricSpec struct {
+	// Name is the Prometheus metric name.
+	Name string `json:"name"`
+	// Type selects the aggregation: "gauge" or "histogram".
+	Type string `json:"type"`
+	// Source selects the metric source (optional, default "modelpod").
+	Source string `json:"source,omitempty"`
+	// UpThreshold is the scale-up threshold.
+	UpThreshold *float64 `json:"upthreshold"`
+	// DownThreshold is the scale-down threshold (must be <= upthreshold).
+	DownThreshold *float64 `json:"downthreshold"`
+	// Quantile is the target quantile in (0, 1] for histogram metrics (optional).
+	Quantile *float64 `json:"quantile,omitempty"`
 }
 
-// parseMetricsConfig parses and validates the auto-provision annotations
-// into a metricsConfig. It returns an error describing the first invalid or
-// missing field encountered.
+// parseMetricsConfig parses and validates the auto-provision annotations into a
+// metricsConfig. The per-metric configuration is read from the
+// scaledobject.kaito.sh/metrics annotation (a YAML list); the remaining global
+// settings come from their own annotations. It returns an error describing the
+// first invalid or missing field encountered.
 func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
 	var cfg metricsConfig
 
@@ -243,45 +259,54 @@ func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
 	}
 	cfg.policy = policy
 
+	// The per-metric configuration lives in a single YAML/JSON list annotation.
+	raw := annotations[constants.AnnotationKeyMetrics]
+	if strings.TrimSpace(raw) == "" {
+		return cfg, fmt.Errorf("auto-provision requires the %s annotation with at least one metric", constants.AnnotationKeyMetrics)
+	}
+	var specs []metricSpec
+	if err := yaml.Unmarshal([]byte(raw), &specs); err != nil {
+		return cfg, fmt.Errorf("invalid %s annotation: %w", constants.AnnotationKeyMetrics, err)
+	}
+	if len(specs) == 0 {
+		return cfg, fmt.Errorf("auto-provision requires the %s annotation with at least one metric", constants.AnnotationKeyMetrics)
+	}
+
 	seenVars := make(map[string]string)
-	for i := 0; ; i++ {
-		key := annotations[indexedKey(constants.AnnotationKeyMetricName, i)]
-		if key == "" {
-			break
+	for i, spec := range specs {
+		if spec.Name == "" {
+			return cfg, fmt.Errorf("metric index %d: name is required", i)
 		}
 
-		// metricstype is required and decides the aggregation; metricsource is
-		// optional and selects the metric source (default "modelpod").
-		aggregation, err := aggregationForMetricsType(annotations[indexedKey(constants.AnnotationKeyMetricsType, i)])
+		// type is required and decides the aggregation; source is optional and
+		// selects the metric source (default "modelpod").
+		aggregation, err := aggregationForMetricsType(spec.Type)
 		if err != nil {
-			return cfg, fmt.Errorf("metric %q (index %d): %w", key, i, err)
+			return cfg, fmt.Errorf("metric %q (index %d): %w", spec.Name, i, err)
 		}
-		source, err := sourceForMetricSource(annotations[indexedKey(constants.AnnotationKeyMetricSource, i)])
+		source, err := sourceForMetricSource(spec.Source)
 		if err != nil {
-			return cfg, fmt.Errorf("metric %q (index %d): %w", key, i, err)
+			return cfg, fmt.Errorf("metric %q (index %d): %w", spec.Name, i, err)
 		}
 
 		// The metric name doubles as the formula variable/trigger name after
 		// sanitization; two metrics collapsing to the same variable would make the
 		// formula ambiguous and KEDA reject duplicate trigger names.
-		varName := formulaVarName(key)
+		varName := formulaVarName(spec.Name)
 		if prev, dup := seenVars[varName]; dup {
-			return cfg, fmt.Errorf("metric %q (index %d) collides with %q on formula variable %q", key, i, prev, varName)
+			return cfg, fmt.Errorf("metric %q (index %d) collides with %q on formula variable %q", spec.Name, i, prev, varName)
 		}
-		seenVars[varName] = key
+		seenVars[varName] = spec.Name
 
-		upStr := annotations[indexedKey(constants.AnnotationKeyUpThreshold, i)]
-		downStr := annotations[indexedKey(constants.AnnotationKeyDownThreshold, i)]
-		up, err := strconv.ParseFloat(upStr, 64)
-		if err != nil || math.IsNaN(up) || math.IsInf(up, 0) {
-			return cfg, fmt.Errorf("metric %q (index %d): upthreshold must be a valid finite number, got %q", key, i, upStr)
+		if spec.UpThreshold == nil {
+			return cfg, fmt.Errorf("metric %q (index %d): upthreshold is required", spec.Name, i)
 		}
-		down, err := strconv.ParseFloat(downStr, 64)
-		if err != nil || math.IsNaN(down) || math.IsInf(down, 0) {
-			return cfg, fmt.Errorf("metric %q (index %d): downthreshold must be a valid finite number, got %q", key, i, downStr)
+		if spec.DownThreshold == nil {
+			return cfg, fmt.Errorf("metric %q (index %d): downthreshold is required", spec.Name, i)
 		}
+		up, down := *spec.UpThreshold, *spec.DownThreshold
 		if down > up {
-			return cfg, fmt.Errorf("metric %q (index %d): downthreshold (%s) must not exceed upthreshold (%s)", key, i, downStr, upStr)
+			return cfg, fmt.Errorf("metric %q (index %d): downthreshold (%s) must not exceed upthreshold (%s)", spec.Name, i, strconv.FormatFloat(down, 'f', -1, 64), strconv.FormatFloat(up, 'f', -1, 64))
 		}
 
 		// Quantile is only meaningful for histogram metrics (quantile aggregation);
@@ -289,30 +314,23 @@ func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
 		quantile := ""
 		if aggregation == aggregator.QuantileAggregatorName {
 			quantile = defaultQuantile
-			if q := annotations[indexedKey(constants.AnnotationKeyQuantile, i)]; q != "" {
-				qv, err := strconv.ParseFloat(q, 64)
-				if err != nil {
-					return cfg, fmt.Errorf("metric %q (index %d): quantile must be a valid number, got %q", key, i, q)
-				}
-				if math.IsNaN(qv) || qv <= 0 || qv > 1 {
-					return cfg, fmt.Errorf("metric %q (index %d): quantile must be in the (0, 1] range, got %q", key, i, q)
+			if spec.Quantile != nil {
+				qv := *spec.Quantile
+				if qv <= 0 || qv > 1 {
+					return cfg, fmt.Errorf("metric %q (index %d): quantile must be in the (0, 1] range, got %s", spec.Name, i, strconv.FormatFloat(qv, 'f', -1, 64))
 				}
 				quantile = strconv.FormatFloat(qv, 'f', -1, 64)
 			}
 		}
 
 		cfg.metrics = append(cfg.metrics, metric{
-			key:           key,
+			key:           spec.Name,
 			source:        source,
 			aggregation:   aggregation,
 			upThreshold:   strconv.FormatFloat(up, 'f', -1, 64),
 			downThreshold: strconv.FormatFloat(down, 'f', -1, 64),
 			quantile:      quantile,
 		})
-	}
-
-	if len(cfg.metrics) == 0 {
-		return cfg, fmt.Errorf("auto-provision requires at least one metricName/0 annotation")
 	}
 
 	var err error

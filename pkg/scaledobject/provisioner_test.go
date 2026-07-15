@@ -14,6 +14,7 @@
 package scaledobject
 
 import (
+	"fmt"
 	"testing"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
@@ -24,18 +25,23 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
 )
 
+// metricsAnn wraps a metrics YAML list body into an annotation map.
+func metricsAnn(body string) map[string]string {
+	return map[string]string{constants.AnnotationKeyMetrics: body}
+}
+
 // metricsAnnotations returns a valid two-metric annotation set.
 func metricsAnnotations() map[string]string {
-	return map[string]string{
-		indexedKey(constants.AnnotationKeyMetricName, 0): "vllm:num_requests_waiting",
-		"scaledobject.kaito.sh/metricstype/0":            "gauge",
-		"scaledobject.kaito.sh/upthreshold/0":            "10",
-		"scaledobject.kaito.sh/downthreshold/0":          "2",
-		indexedKey(constants.AnnotationKeyMetricName, 1): "vllm:request_queue_time_seconds",
-		"scaledobject.kaito.sh/metricstype/1":            "histogram",
-		"scaledobject.kaito.sh/upthreshold/1":            "1.5",
-		"scaledobject.kaito.sh/downthreshold/1":          "0.5",
-	}
+	return metricsAnn(`
+- name: vllm:num_requests_waiting
+  type: gauge
+  upthreshold: 10
+  downthreshold: 2
+- name: vllm:request_queue_time_seconds
+  type: histogram
+  upthreshold: 1.5
+  downthreshold: 0.5
+`)
 }
 
 func TestParseMetricsConfig(t *testing.T) {
@@ -59,12 +65,12 @@ func TestParseMetricsConfig(t *testing.T) {
 	})
 
 	t.Run("valid single-metric config", func(t *testing.T) {
-		ann := map[string]string{
-			indexedKey(constants.AnnotationKeyMetricName, 0): "vllm:num_requests_waiting",
-			"scaledobject.kaito.sh/metricstype/0":            "gauge",
-			"scaledobject.kaito.sh/upthreshold/0":            "5",
-			"scaledobject.kaito.sh/downthreshold/0":          "1",
-		}
+		ann := metricsAnn(`
+- name: vllm:num_requests_waiting
+  type: gauge
+  upthreshold: 5
+  downthreshold: 1
+`)
 		cfg, err := parseMetricsConfig(ann)
 		assert.NoError(t, err)
 		assert.Len(t, cfg.metrics, 1)
@@ -84,57 +90,90 @@ func TestParseMetricsConfig(t *testing.T) {
 	})
 
 	t.Run("missing metricstype rejected", func(t *testing.T) {
-		ann := metricsAnnotations()
-		delete(ann, "scaledobject.kaito.sh/metricstype/0")
+		ann := metricsAnn(`
+- name: vllm:num_requests_waiting
+  upthreshold: 10
+  downthreshold: 2
+`)
 		_, err := parseMetricsConfig(ann)
 		assert.Error(t, err)
 	})
 
 	t.Run("invalid metricstype rejected", func(t *testing.T) {
-		ann := metricsAnnotations()
-		ann["scaledobject.kaito.sh/metricstype/0"] = "bogus"
+		ann := metricsAnn(`
+- name: vllm:num_requests_waiting
+  type: bogus
+  upthreshold: 10
+  downthreshold: 2
+`)
 		_, err := parseMetricsConfig(ann)
 		assert.Error(t, err)
 	})
 
 	t.Run("invalid metricsource rejected", func(t *testing.T) {
-		ann := metricsAnnotations()
-		ann["scaledobject.kaito.sh/metricsource/0"] = "bogus"
+		ann := metricsAnn(`
+- name: vllm:num_requests_waiting
+  type: gauge
+  source: bogus
+  upthreshold: 10
+  downthreshold: 2
+`)
 		_, err := parseMetricsConfig(ann)
 		assert.Error(t, err)
 	})
 
 	t.Run("invalid up threshold rejected", func(t *testing.T) {
-		ann := metricsAnnotations()
-		ann["scaledobject.kaito.sh/upthreshold/0"] = "abc"
+		ann := metricsAnn(`
+- name: vllm:num_requests_waiting
+  type: gauge
+  upthreshold: abc
+  downthreshold: 2
+`)
 		_, err := parseMetricsConfig(ann)
 		assert.Error(t, err)
 	})
 
 	t.Run("non-finite thresholds rejected", func(t *testing.T) {
-		for _, v := range []string{"NaN", "Inf", "+Inf", "-Inf"} {
-			ann := metricsAnnotations()
-			ann["scaledobject.kaito.sh/upthreshold/0"] = v
+		for _, v := range []string{"NaN", ".inf", "+.inf", "-.inf"} {
+			ann := metricsAnn(fmt.Sprintf(`
+- name: vllm:num_requests_waiting
+  type: gauge
+  upthreshold: %s
+  downthreshold: 2
+`, v))
 			_, err := parseMetricsConfig(ann)
 			assert.Error(t, err, "upthreshold %q", v)
 
-			ann = metricsAnnotations()
-			ann["scaledobject.kaito.sh/downthreshold/0"] = v
+			ann = metricsAnn(fmt.Sprintf(`
+- name: vllm:num_requests_waiting
+  type: gauge
+  upthreshold: 2
+  downthreshold: %s
+`, v))
 			_, err = parseMetricsConfig(ann)
 			assert.Error(t, err, "downthreshold %q", v)
 		}
 	})
 
 	t.Run("down greater than up rejected", func(t *testing.T) {
-		ann := metricsAnnotations()
-		ann["scaledobject.kaito.sh/downthreshold/0"] = "20"
+		ann := metricsAnn(`
+- name: vllm:num_requests_waiting
+  type: gauge
+  upthreshold: 10
+  downthreshold: 20
+`)
 		_, err := parseMetricsConfig(ann)
 		assert.Error(t, err)
 	})
 
 	t.Run("NaN quantile rejected", func(t *testing.T) {
-		ann := metricsAnnotations()
-		ann[indexedKey(constants.AnnotationKeyQuantile, 1)] = "NaN"
+		ann := metricsAnn(`
+- name: vllm:request_queue_time_seconds
+  type: histogram
+  upthreshold: 1.5
+  downthreshold: 0.5
+  quantile: NaN
+`)
 		_, err := parseMetricsConfig(ann)
 		assert.Error(t, err)
 	})
@@ -154,7 +193,7 @@ func TestParseMetricsConfig(t *testing.T) {
 	})
 
 	t.Run("no metrics rejected", func(t *testing.T) {
-		_, err := parseMetricsConfig(map[string]string{"scaledobject.kaito.sh/auto-provision": "true"})
+		_, err := parseMetricsConfig(map[string]string{constants.AnnotationKeyAutoProvision: "true"})
 		assert.Error(t, err)
 	})
 }

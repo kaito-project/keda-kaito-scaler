@@ -27,24 +27,14 @@ const (
 
 	// --- Auto-provision annotations ---
 
-	// AnnotationKeyMetricName is the base key for the indexed metric name
-	// (metricName/{i}). Presence of metricName/0 enables auto-provisioning.
-	AnnotationKeyMetricName = "scaledobject.kaito.sh/metricName"
+	// AnnotationKeyMetrics carries the auto-provision metrics as a YAML (or JSON)
+	// list. Each entry configures one metric with the fields: name, type,
+	// source (optional), upthreshold, downthreshold, and quantile (optional).
+	// A non-empty list (together with auto-provision="true") enables
+	// auto-provisioning.
+	AnnotationKeyMetrics = "scaledobject.kaito.sh/metrics"
 
-	// Per-metric keys, indexed with a "/{i}" suffix (e.g. metricstype/0, metricstype/1).
-
-	// AnnotationKeyMetricsType selects the metric aggregation: "gauge" or "histogram".
-	AnnotationKeyMetricsType = "scaledobject.kaito.sh/metricstype"
-	// AnnotationKeyMetricSource selects the metric source (default "modelpod").
-	AnnotationKeyMetricSource = "scaledobject.kaito.sh/metricsource"
-	// AnnotationKeyUpThreshold sets the per-metric scale-up threshold.
-	AnnotationKeyUpThreshold = "scaledobject.kaito.sh/upthreshold"
-	// AnnotationKeyDownThreshold sets the per-metric scale-down threshold.
-	AnnotationKeyDownThreshold = "scaledobject.kaito.sh/downthreshold"
-	// AnnotationKeyQuantile sets the target quantile for histogram metrics.
-	AnnotationKeyQuantile = "scaledobject.kaito.sh/quantile"
-
-	// Global keys (not indexed).
+	// Global keys.
 
 	// AnnotationKeyCombinePolicy selects how metrics are combined (only AND).
 	AnnotationKeyCombinePolicy = "scaledobject.kaito.sh/combinepolicy"
