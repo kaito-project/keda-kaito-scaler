@@ -27,11 +27,11 @@ const (
 
 	// --- Auto-provision annotations ---
 
-	// AnnotationKeyMetrics carries the auto-provision metrics as a YAML (or JSON)
-	// list. Each entry configures one metric with the fields: name, type,
+	// AnnotationKeyMetrics carries the auto-provision metrics as a YAML list.
+	// Each entry configures one metric with the fields: name, type,
 	// source (optional), upthreshold, downthreshold, and quantile (optional).
-	// A non-empty list (together with auto-provision="true") enables
-	// auto-provisioning.
+	// When auto-provision="true", this annotation is required and must contain
+	// at least one metric; otherwise auto-provisioning fails with an error.
 	AnnotationKeyMetrics = "scaledobject.kaito.sh/metrics"
 
 	// Global keys.
