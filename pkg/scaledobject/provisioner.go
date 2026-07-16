@@ -186,7 +186,7 @@ func aggregationForMetricsType(t string) (string, error) {
 	case metricsTypeHistogram:
 		return aggregator.QuantileAggregatorName, nil
 	default:
-		return "", fmt.Errorf("metricstype must be %q or %q, got %q", metricsTypeGauge, metricsTypeHistogram, t)
+		return "", fmt.Errorf("type must be %q or %q, got %q", metricsTypeGauge, metricsTypeHistogram, t)
 	}
 }
 
@@ -199,7 +199,7 @@ func sourceForMetricSource(s string) (string, error) {
 	case metricsource.ModelPodSourceName:
 		return metricsource.ModelPodSourceName, nil
 	default:
-		return "", fmt.Errorf("metricsource must be %q, got %q", metricsource.ModelPodSourceName, s)
+		return "", fmt.Errorf("source must be %q, got %q", metricsource.ModelPodSourceName, s)
 	}
 }
 
@@ -305,6 +305,14 @@ func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
 			return cfg, fmt.Errorf("metric %q (index %d): downthreshold is required", spec.Name, i)
 		}
 		up, down := *spec.UpThreshold, *spec.DownThreshold
+		// YAML values like ".inf"/".nan" decode to non-finite floats; reject them
+		// so they cannot break formula/trigger rendering downstream.
+		if math.IsInf(up, 0) || math.IsNaN(up) {
+			return cfg, fmt.Errorf("metric %q (index %d): upthreshold must be a finite number, got %s", spec.Name, i, strconv.FormatFloat(up, 'f', -1, 64))
+		}
+		if math.IsInf(down, 0) || math.IsNaN(down) {
+			return cfg, fmt.Errorf("metric %q (index %d): downthreshold must be a finite number, got %s", spec.Name, i, strconv.FormatFloat(down, 'f', -1, 64))
+		}
 		if down > up {
 			return cfg, fmt.Errorf("metric %q (index %d): downthreshold (%s) must not exceed upthreshold (%s)", spec.Name, i, strconv.FormatFloat(down, 'f', -1, 64), strconv.FormatFloat(up, 'f', -1, 64))
 		}
@@ -316,7 +324,7 @@ func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
 			quantile = defaultQuantile
 			if spec.Quantile != nil {
 				qv := *spec.Quantile
-				if qv <= 0 || qv > 1 {
+				if math.IsNaN(qv) || math.IsInf(qv, 0) || qv <= 0 || qv > 1 {
 					return cfg, fmt.Errorf("metric %q (index %d): quantile must be in the (0, 1] range, got %s", spec.Name, i, strconv.FormatFloat(qv, 'f', -1, 64))
 				}
 				quantile = strconv.FormatFloat(qv, 'f', -1, 64)
