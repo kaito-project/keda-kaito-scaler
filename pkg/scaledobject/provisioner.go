@@ -88,9 +88,9 @@ const (
 	// of the real metrics rather than opaque indexed placeholders.
 	gateTriggerName = "readiness_gate"
 
-	// defaultQuantile is the target quantile applied to quantile-based metrics
-	// when the per-metric quantile annotation is absent (p95).
-	defaultQuantile = "0.95"
+	// defaultMetricCacheWindow is the cache window (seconds) applied to a
+	// histogram metric when its per-metric metriccachewindow field is absent.
+	defaultMetricCacheWindow = 300
 
 	// Defaults (seconds) when the corresponding annotation is absent.
 	defaultEvaluationWindow  = 60
@@ -167,13 +167,14 @@ type metric struct {
 	// annotation; defaults to "modelpod").
 	source string
 	// aggregation is derived from the metricstype annotation: "service-avg" for
-	// gauge metrics, "quantile" for histogram metrics.
+	// gauge metrics, "windowed-avg" for histogram metrics.
 	aggregation   string
 	upThreshold   string
 	downThreshold string
-	// quantile is the target quantile (as a string, e.g. "0.95") for histogram
-	// metrics using the "quantile" aggregation; empty for gauge metrics.
-	quantile string
+	// metricCacheWindow is the cache window in seconds (as a string, e.g. "300")
+	// for histogram metrics using the windowed-avg aggregation; empty for gauge
+	// metrics.
+	metricCacheWindow string
 }
 
 // aggregationForMetricsType maps a metricstype annotation value to the scaler
@@ -184,7 +185,7 @@ func aggregationForMetricsType(t string) (string, error) {
 	case metricsTypeGauge:
 		return aggregator.ServiceAverageAggregatorName, nil
 	case metricsTypeHistogram:
-		return aggregator.QuantileAggregatorName, nil
+		return constants.AggregationWindowedAvg, nil
 	default:
 		return "", fmt.Errorf("type must be %q or %q, got %q", metricsTypeGauge, metricsTypeHistogram, t)
 	}
@@ -222,8 +223,8 @@ func ValidateConfig(annotations map[string]string) error {
 }
 
 // metricSpec is one entry of the scaledobject.kaito.sh/metrics annotation, a
-// YAML (or JSON) list. Threshold and quantile fields are pointers so a missing
-// key can be told apart from an explicit zero.
+// YAML (or JSON) list. Threshold and metriccachewindow fields are pointers so a
+// missing key can be told apart from an explicit zero.
 type metricSpec struct {
 	// Name is the Prometheus metric name.
 	Name string `json:"name"`
@@ -235,8 +236,9 @@ type metricSpec struct {
 	UpThreshold *float64 `json:"upthreshold"`
 	// DownThreshold is the scale-down threshold (must be <= upthreshold).
 	DownThreshold *float64 `json:"downthreshold"`
-	// Quantile is the target quantile in (0, 1] for histogram metrics (optional).
-	Quantile *float64 `json:"quantile,omitempty"`
+	// MetricCacheWindow is the rolling cache window in seconds for histogram
+	// metrics (optional, default 300). Only valid for histogram metrics.
+	MetricCacheWindow *int `json:"metriccachewindow,omitempty"`
 }
 
 // parseMetricsConfig parses and validates the auto-provision annotations into a
@@ -317,27 +319,30 @@ func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
 			return cfg, fmt.Errorf("metric %q (index %d): downthreshold (%s) must not exceed upthreshold (%s)", spec.Name, i, strconv.FormatFloat(down, 'f', -1, 64), strconv.FormatFloat(up, 'f', -1, 64))
 		}
 
-		// Quantile is only meaningful for histogram metrics (quantile aggregation);
-		// default to p95 and validate the (0, 1] range when provided.
-		quantile := ""
-		if aggregation == aggregator.QuantileAggregatorName {
-			quantile = defaultQuantile
-			if spec.Quantile != nil {
-				qv := *spec.Quantile
-				if math.IsNaN(qv) || math.IsInf(qv, 0) || qv <= 0 || qv > 1 {
-					return cfg, fmt.Errorf("metric %q (index %d): quantile must be in the (0, 1] range, got %s", spec.Name, i, strconv.FormatFloat(qv, 'f', -1, 64))
+		// metriccachewindow is only meaningful for histogram metrics (windowed-avg
+		// aggregation); default to defaultMetricCacheWindow and require a positive
+		// number of seconds. It is rejected on gauge metrics.
+		metricCacheWindow := ""
+		if aggregation == constants.AggregationWindowedAvg {
+			window := defaultMetricCacheWindow
+			if spec.MetricCacheWindow != nil {
+				window = *spec.MetricCacheWindow
+				if window <= 0 {
+					return cfg, fmt.Errorf("metric %q (index %d): metriccachewindow must be a positive number of seconds, got %d", spec.Name, i, window)
 				}
-				quantile = strconv.FormatFloat(qv, 'f', -1, 64)
 			}
+			metricCacheWindow = strconv.Itoa(window)
+		} else if spec.MetricCacheWindow != nil {
+			return cfg, fmt.Errorf("metric %q (index %d): metriccachewindow is only valid for histogram metrics", spec.Name, i)
 		}
 
 		cfg.metrics = append(cfg.metrics, metric{
-			key:           spec.Name,
-			source:        source,
-			aggregation:   aggregation,
-			upThreshold:   strconv.FormatFloat(up, 'f', -1, 64),
-			downThreshold: strconv.FormatFloat(down, 'f', -1, 64),
-			quantile:      quantile,
+			key:               spec.Name,
+			source:            source,
+			aggregation:       aggregation,
+			upThreshold:       strconv.FormatFloat(up, 'f', -1, 64),
+			downThreshold:     strconv.FormatFloat(down, 'f', -1, 64),
+			metricCacheWindow: metricCacheWindow,
 		})
 	}
 
@@ -435,8 +440,8 @@ func (b Builder) buildTriggers(inferenceSetName, inferenceSetNamespace string, c
 			constants.MetricSourceInMetadata:          m.source,
 			constants.AggregationInMetadata:           m.aggregation,
 		}
-		if m.quantile != "" {
-			metadata[constants.QuantileInMetadata] = m.quantile
+		if m.metricCacheWindow != "" {
+			metadata[constants.MetricCacheWindowInMetadata] = m.metricCacheWindow
 		}
 		triggers = append(triggers, v1alpha1.ScaleTriggers{
 			Type:              "external",

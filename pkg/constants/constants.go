@@ -29,7 +29,8 @@ const (
 
 	// AnnotationKeyMetrics carries the auto-provision metrics as a YAML list.
 	// Each entry configures one metric with the fields: name, type,
-	// source (optional), upthreshold, downthreshold, and quantile (optional).
+	// source (optional), upthreshold, downthreshold, and metriccachewindow
+	// (optional, histogram only).
 	// When auto-provision="true", this annotation is required and must contain
 	// at least one metric; otherwise auto-provisioning fails with an error.
 	AnnotationKeyMetrics = "scaledobject.kaito.sh/metrics"
@@ -80,8 +81,16 @@ const (
 	MetricSourceInMetadata = "metricSource"
 	// AggregationInMetadata selects which registered aggregator is used.
 	AggregationInMetadata = "aggregation"
-	// QuantileInMetadata sets the target quantile in (0, 1] for the quantile aggregation.
-	QuantileInMetadata = "quantile"
+	// MetricCacheWindowInMetadata sets the rolling window (bare seconds, e.g.
+	// "300") over which the windowed-avg aggregation averages a histogram
+	// metric's _sum/_count. Only carried by histogram triggers.
+	MetricCacheWindowInMetadata = "metricCacheWindow"
+
+	// AggregationWindowedAvg averages a histogram metric's observations over a
+	// rolling cache window (metricCacheWindow) using _sum/_count deltas instead
+	// of bucket interpolation. The scaler serves it from an in-memory cache that
+	// a background poller keeps fresh, so it needs no per-request scrape.
+	AggregationWindowedAvg = "windowed-avg"
 
 	// AggregationGate is a pseudo-aggregation: instead of scraping, the scaler
 	// reports 1 when every desired replica of the InferenceSet is ready

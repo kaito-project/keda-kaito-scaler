@@ -16,7 +16,6 @@ package scaler
 import (
 	"context"
 	"fmt"
-	"math"
 	"strconv"
 	"time"
 
@@ -25,6 +24,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -46,12 +46,12 @@ const (
 	defaultMetricPath     = "/metrics"
 	defaultScrapeTimeout  = 3 * time.Second
 
-	// defaultQuantile is the target quantile used by the "quantile" aggregation
-	// when the quantile metadata key is omitted (p95).
-	defaultQuantile = 0.95
+	// defaultMetricCacheWindow is the rolling window used by the windowed-avg
+	// aggregation when the metricCacheWindow metadata key is omitted (5 minutes).
+	defaultMetricCacheWindow = 5 * time.Minute
 
 	// defaultThreshold is used when the aggregation does not consume a per-replica
-	// threshold (service-avg/quantile/gate); it is a placeholder KEDA overrides
+	// threshold (service-avg/windowed-avg/gate); it is a placeholder KEDA overrides
 	// via the composite scalingModifiers formula.
 	defaultThreshold = 1.0
 )
@@ -70,8 +70,8 @@ type Config struct {
 	// this trigger. They default to "service"/"sum" for backward compatibility.
 	MetricSource string
 	Aggregation  string
-	// Quantile is the target quantile in (0, 1] for the "quantile" aggregation.
-	Quantile float64
+	// MetricCacheWindow is the rolling window for the "windowed-avg" aggregation.
+	MetricCacheWindow time.Duration
 }
 
 // scrapeConfig projects the subset of Config needed by the metric source.
@@ -84,28 +84,28 @@ func (c *Config) scrapeConfig() metricsource.ScrapeConfig {
 	}
 }
 
-// KaitoScaler implements the KEDA external scaler gRPC contract on top of
-// pluggable metricsource.MetricSources (which fetch raw per-service metrics) and
-// aggregator.Aggregators (which reduce them to the single value KEDA expects).
-// A trigger selects its metric source/aggregator via the metricSource/aggregation
-// metadata keys, letting one scaler serve both the legacy single-metric path
-// and the new composite (queue length + latency + readiness gate) triggers.
+// KaitoScaler implements the KEDA external scaler gRPC contract. Metric values
+// are served from an in-memory MetricCache that a background poller keeps fresh
+// (so every replica can answer from a complete window), and reduced to the
+// single value KEDA expects by pluggable aggregator.Aggregators. A trigger
+// selects its aggregator via the aggregation metadata key; the readiness gate is
+// the only aggregation handled without an aggregators-map entry.
 type KaitoScaler struct {
-	kubeClient    client.Client
-	metricSources map[string]metricsource.MetricSource
-	aggregators   map[string]aggregator.Aggregator
+	kubeClient  client.Client
+	aggregators map[string]aggregator.Aggregator
+	cache       *MetricCache
 	externalscaler.UnimplementedExternalScalerServer
 }
 
-// NewKaitoScaler wires the Kubernetes client, the set of named metric sources
-// and the set of named aggregators used to serve KEDA scaling requests. The
-// maps must at least contain the "modelpod" metric source and the "sum" aggregator so
-// the default single-metric path keeps working.
-func NewKaitoScaler(kubeClient client.Client, metricSources map[string]metricsource.MetricSource, aggregators map[string]aggregator.Aggregator) *KaitoScaler {
+// NewKaitoScaler wires the Kubernetes client, the metric cache, and the set of
+// named aggregators used to serve KEDA scaling requests. The caller registers
+// every aggregation in the aggregators map, including the "windowed-avg"
+// aggregation (served by the cache itself); see cmd/app/manager.go.
+func NewKaitoScaler(kubeClient client.Client, cache *MetricCache, aggregators map[string]aggregator.Aggregator) *KaitoScaler {
 	return &KaitoScaler{
-		kubeClient:    kubeClient,
-		metricSources: metricSources,
-		aggregators:   aggregators,
+		kubeClient:  kubeClient,
+		cache:       cache,
+		aggregators: aggregators,
 	}
 }
 
@@ -168,24 +168,22 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		return nil, err
 	}
 
-	inferenceSet := &kaitov1beta1.InferenceSet{}
-	if err := e.kubeClient.Get(ctx, client.ObjectKey{
-		Namespace: scalerConfig.InferenceSetNamespace,
-		Name:      scalerConfig.InferenceSetName,
-	}, inferenceSet); err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get InferenceSet(%s) in Namespace(%s): %v", scalerConfig.InferenceSetName, scalerConfig.InferenceSetNamespace, err))
-	}
-
 	// The readiness gate needs no scrape; it derives its value from the
 	// InferenceSet's replica readiness.
 	if scalerConfig.Aggregation == constants.AggregationGate {
+		inferenceSet := &kaitov1beta1.InferenceSet{}
+		if err := e.kubeClient.Get(ctx, client.ObjectKey{
+			Namespace: scalerConfig.InferenceSetNamespace,
+			Name:      scalerConfig.InferenceSetName,
+		}, inferenceSet); err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get InferenceSet(%s) in Namespace(%s): %v", scalerConfig.InferenceSetName, scalerConfig.InferenceSetNamespace, err))
+		}
 		value := readinessGateValue(inferenceSet)
 		klog.V(4).Infof("readiness gate for InferenceSet %s/%s: %f", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, value)
 		return newMetricValueResponse(scalerConfig.MetricName, value), nil
 	}
 
-	source, ok := e.metricSources[scalerConfig.MetricSource]
-	if !ok || source == nil {
+	if !e.cache.hasSource(scalerConfig.MetricSource) {
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("unknown metric source %q", scalerConfig.MetricSource))
 	}
 
@@ -194,20 +192,28 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("unknown aggregation %q", scalerConfig.Aggregation))
 	}
 
-	// Take a per-call snapshot of metrics across every service belonging to this
-	// InferenceSet. The snapshot is produced by a pluggable metricsource.MetricSource so
-	// alternative sources (e.g. EndpointPicker, Prometheus queries) can be
-	// swapped in without touching the scaler protocol logic below.
-	snapshot, err := source.Scrape(ctx, inferenceSet, scalerConfig.scrapeConfig())
-	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to scrape metrics for InferenceSet %s/%s: %v", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, err))
+	is := types.NamespacedName{Namespace: scalerConfig.InferenceSetNamespace, Name: scalerConfig.InferenceSetName}
+	scrapeCfg := scalerConfig.scrapeConfig()
+
+	// Every metric is served from the background cache (no live scrape): Current
+	// registers the target so the poller keeps it fresh and returns its newest
+	// snapshot. A cold cache (no snapshot yet) or a stale one (scraping has been
+	// failing) is reported as unavailable so KEDA/HPA holds instead of scaling on
+	// missing or outdated data. The windowed-avg aggregation additionally uses the
+	// target's snapshot window (via the cache, which is registered as its
+	// aggregator).
+	snapshot, ok := e.cache.Current(ctx, is, scrapeCfg, scalerConfig.MetricSource, scalerConfig.MetricCacheWindow)
+	if !ok {
+		return nil, status.Error(codes.Unavailable, fmt.Sprintf("metrics for InferenceSet %s/%s are not available yet (scrape failing or cold)", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName))
 	}
-	klog.V(6).Infof("scraped snapshot for InferenceSet %s/%s with %d service(s)", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, len(snapshot.Services))
 
 	value, err := agg.Aggregate(snapshot, aggregator.AggregateInput{
-		MetricName: scalerConfig.MetricName,
-		Threshold:  scalerConfig.Threshold,
-		Quantile:   scalerConfig.Quantile,
+		MetricName:   scalerConfig.MetricName,
+		Threshold:    scalerConfig.Threshold,
+		InferenceSet: is,
+		MetricSource: scalerConfig.MetricSource,
+		ScrapeConfig: scrapeCfg,
+		Window:       scalerConfig.MetricCacheWindow,
 	})
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
@@ -254,7 +260,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 
 	// Threshold is the per-replica HPA target. It is required for aggregations
 	// that consume it (the single-metric "sum" path, where KEDA uses it as the
-	// AverageValue target). For service-avg/quantile/gate it is optional and
+	// AverageValue target). For service-avg/windowed-avg/gate it is optional and
 	// defaults to defaultThreshold, since those run in composite Value mode where
 	// the per-trigger target is overridden by the scalingModifiers formula. A
 	// supplied value is always validated.
@@ -297,17 +303,18 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		scrapeTimeout = d
 	}
 
-	// Optional target quantile for the "quantile" aggregation (default p95).
-	quantile := defaultQuantile
-	if q := md[constants.QuantileInMetadata]; q != "" {
-		v, err := strconv.ParseFloat(q, 64)
+	// Optional cache window for the "windowed-avg" aggregation (bare seconds,
+	// default 5 minutes). It must be a positive integer number of seconds.
+	metricCacheWindow := defaultMetricCacheWindow
+	if w := md[constants.MetricCacheWindowInMetadata]; w != "" {
+		secs, err := strconv.Atoi(w)
 		if err != nil {
-			return nil, status.Error(codes.InvalidArgument, "quantile must be a valid number")
+			return nil, status.Error(codes.InvalidArgument, "metric cache window must be an integer number of seconds")
 		}
-		if math.IsNaN(v) || v <= 0 || v > 1 {
-			return nil, status.Error(codes.InvalidArgument, "quantile must be in the (0, 1] range")
+		if secs <= 0 {
+			return nil, status.Error(codes.InvalidArgument, "metric cache window must be a positive number of seconds")
 		}
-		quantile = v
+		metricCacheWindow = time.Duration(secs) * time.Second
 	}
 
 	return &Config{
@@ -321,7 +328,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		Threshold:             threshold,
 		MetricSource:          metricSource,
 		Aggregation:           aggregation,
-		Quantile:              quantile,
+		MetricCacheWindow:     metricCacheWindow,
 	}, nil
 }
 
@@ -329,7 +336,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 // threshold, so callers need not supply it in the trigger metadata.
 func thresholdOptional(aggregation string) bool {
 	switch aggregation {
-	case aggregator.ServiceAverageAggregatorName, aggregator.QuantileAggregatorName, constants.AggregationGate:
+	case aggregator.ServiceAverageAggregatorName, constants.AggregationWindowedAvg, constants.AggregationGate:
 		return true
 	default:
 		return false
