@@ -91,18 +91,21 @@ helm upgrade --install keda-kaito-scaler -n keda keda-kaito-scaler/keda-kaito-sc
 
 ### Create a Kaito InferenceSet for running inference workloads
 
-You can drive autoscaling in two ways:
+You can drive autoscaling in two ways — pick the one that matches your scaling
+signal:
 
-1. **Auto-provision (recommended)** — annotate the `InferenceSet` with one
-   or more metrics (waiting-queue length, queue latency, ...) and let
-   keda-kaito-scaler create and reconcile the `ScaledObject` for you. Configuring
-   a single metric is the simplest way to get started; adding more combines them
-   under a conservative AND policy. See
-   [Auto-provision](#option-1-auto-provision-recommended).
-2. **Manual mode** — author the `ScaledObject` yourself and point its `external`
-   trigger at the keda-kaito-scaler service.
+1. **Metrics-based scaling → Auto-provision mode (recommended)** — annotate the
+   `InferenceSet` with one or more metrics (waiting-queue length, queue latency,
+   ...) and let keda-kaito-scaler create and reconcile the `ScaledObject` for you.
+   Configuring a single metric is the simplest way to get started; adding more
+   combines them under a conservative AND policy. See
+   [Auto-provision mode](#option-1-auto-provision-mode-recommended-for-metrics-based-scaling).
+2. **Time-based scaling → Manual mode (recommended)** — author the `ScaledObject`
+   yourself with KEDA's built-in cron trigger to scale on a fixed schedule, no
+   metrics required. See
+   [Manual mode](#option-2-manual-mode-recommended-for-time-based-scaling).
 
-#### Option 1: Auto-provision (recommended)
+#### Option 1: Auto-provision mode (recommended for metrics-based scaling)
 
 Adding the `metrics` annotation (together with `auto-provision: "true"`) enables
 auto-provisioning: keda-kaito-scaler builds and reconciles a `ScaledObject` whose
@@ -469,71 +472,64 @@ spec:
 > **replica-count independent** — that's why `gauge` is averaged per replica and
 > `histogram` is averaged over its metric cache window.
 
-#### Option 2: Manage the ScaledObject yourself
+#### Option 2: Manual mode (recommended for time-based scaling)
 
-If you prefer to author the `ScaledObject` directly (e.g. to plug in custom
-scaling policies or additional triggers), point an `external` trigger at the
-keda-kaito-scaler service and reuse the chart-installed
-`ClusterTriggerAuthentication` for mTLS.
+In manual mode you author the `ScaledObject` yourself. It is the recommended
+choice for **time-based scaling**: when your traffic follows a predictable
+schedule, scale the `InferenceSet` on a time-based
+[cron trigger](https://keda.sh/docs/2.18/scalers/cron/) instead of on live
+metrics. This is ideal when peak hours are known ahead of time, so you can
+provision expensive GPU capacity *before* demand rises and release it afterwards.
+The cron scaler is a built-in KEDA scaler, so this mode does **not** require
+keda-kaito-scaler.
+
+The following `ScaledObject` scales `InferenceSet/phi-4` by business hours:
+
+- Scale up to 5 replicas from 6:00 AM to 8:00 PM on weekdays (peak hours)
+- Scale down to 1 replica otherwise (off-peak hours)
 
 ```yaml
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
-  name: phi-4
+  name: kaito-business-hours-scaler
   namespace: default
 spec:
+  # Target KAITO InferenceSet to scale
   scaleTargetRef:
     apiVersion: kaito.sh/v1beta1
     kind: InferenceSet
     name: phi-4
+  # Scaling boundaries
   minReplicaCount: 1
   maxReplicaCount: 5
+  # Cron-based triggers for time-based scaling
   triggers:
-    - type: external
-      name: keda-kaito-scaler
-      metricType: AverageValue
-      authenticationRef:
-        kind: ClusterTriggerAuthentication
-        name: keda-kaito-scaler-creds
+    # Scale up to 5 replicas at 6:00 AM (start of business hours)
+    - type: cron
       metadata:
-        # Required
-        scalerAddress: "keda-kaito-scaler-svc.keda.svc.cluster.local:10450"
-        inferenceSetName: phi-4
-        inferenceSetNamespace: default
-        metricName: "vllm:num_requests_waiting"
-        threshold: "10"
-
-        # Optional — defaults shown below match Kaito's current vLLM exposure
-        # (Workspace ClusterIP Service on port 80, plain HTTP). Override only
-        # if you have customized the inference server.
-        # metricProtocol: "http"     # http | https
-        # metricPort: "80"
-        # metricPath: "/metrics"
-        # scrapeTimeout: "3s"
+        timezone: "America/New_York"  # Adjust timezone as needed
+        start: "0 6 * * 1-5"          # 6:00 AM Monday to Friday
+        end: "0 20 * * 1-5"           # 8:00 PM Monday to Friday
+        desiredReplicas: "5"          # Scale to 5 replicas during business hours
+    # Scale down to 1 replica at 8:00 PM (end of business hours)
+    - type: cron
+      metadata:
+        timezone: "America/New_York"  # Adjust timezone as needed
+        start: "0 20 * * 1-5"         # 8:00 PM Monday to Friday
+        end: "0 6 * * 1-5"            # 6:00 AM Monday to Friday (next day)
+        desiredReplicas: "1"          # Scale to 1 replica during off-hours
 ```
 
-The trigger metadata fields map 1:1 to the scaler's gRPC payload:
+> **Overlapping cron windows.** Each `cron` trigger is only active between its
+> `start` and `end`; outside that window it reports the target's `minReplicaCount`.
+> KEDA takes the **maximum** desired replicas across all active triggers, so keep
+> the peak-hours and off-hours windows contiguous (as above) to avoid gaps. Cron
+> expressions follow the standard five-field format and are evaluated in the
+> trigger's `timezone`.
 
-| Field | Required | Default | Notes |
-| --- | --- | --- | --- |
-| `scalerAddress` | yes | – | Used by KEDA to dial the scaler. Format: `keda-kaito-scaler-svc.<scaler-namespace>.svc.cluster.local:10450`. |
-| `inferenceSetName` | yes | – | Target `InferenceSet` name. |
-| `inferenceSetNamespace` | yes | – | Target `InferenceSet` namespace. May differ from the `ScaledObject` namespace; a single keda-kaito-scaler instance serves all namespaces in the cluster. |
-| `metricName` | yes | – | Prometheus metric family name exposed by each workspace pod. |
-| `threshold` | yes | – | Per-replica target (float). HPA: `desired = ceil(sum / threshold)`. |
-| `metricProtocol` | no | `http` | `http` or `https`. |
-| `metricPort` | no | `80` | Workspace `Service` port. |
-| `metricPath` | no | `/metrics` | HTTP path of the Prometheus endpoint. |
-| `scrapeTimeout` | no | `3s` | Per-service scrape timeout (Go duration). |
-
-> **metricType must be `AverageValue`.** The scaler returns the cluster-wide
-> sum of the metric, so HPA divides by `threshold` (per-replica target) to get
-> the desired replica count. Using `Value` would couple desired replicas to the
-> current replica count and break scale-from/to-1 transitions.
-
-That's it! Your KAITO workloads will now automatically scale based on the
-configured metric (default: `vllm:num_requests_waiting`).
+That's it! Your KAITO workloads will now scale on the configured schedule,
+independent of live request metrics.
 
 ## Release Process
 
