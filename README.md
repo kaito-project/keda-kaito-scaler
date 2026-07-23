@@ -533,7 +533,7 @@ independent of live request metrics.
 
 ## Release Process
 
-Releases are driven by two manual GitHub Actions workflows. A release produces a multi-arch container image (`ghcr.io/kaito-project/keda-kaito-scaler:<X.Y.Z>`), a Helm chart (`https://kaito-project.github.io/keda-kaito-scaler/charts/kaito-project`), and a GitHub Release with binaries and changelog.
+Releases are driven by a single manual GitHub Actions workflow. A release produces a multi-arch container image (`ghcr.io/kaito-project/keda-kaito-scaler:<X.Y.Z>`), a Helm chart (`https://kaito-project.github.io/keda-kaito-scaler/charts/kaito-project`), and a GitHub Release with binaries and changelog.
 
 To publish `vX.Y.Z`:
 
@@ -542,16 +542,14 @@ To publish `vX.Y.Z`:
    - [`charts/keda-kaito-scaler/values.yaml`](charts/keda-kaito-scaler/values.yaml) — `image.tag`
    - [`Makefile`](Makefile) — `VERSION ?=` (optional, keeps local-build default aligned)
 
-2. After the PR is merged, run **Actions → "Publish Keda-Kaito-Scaler image(manually)"** with `release_version=vX.Y.Z`. This creates the Git tag, pushes the image, and auto-publishes the Helm chart to `gh-pages`.
-
-3. Run **Actions → "Create release(manually)"** with the same `release_version`. This runs GoReleaser against the tag and publishes the GitHub Release.
+2. After the PR is merged, run **Actions → "Release Keda-Kaito-Scaler(manually)"** with `release_version=vX.Y.Z`. This single workflow creates the Git tag, pushes the image, auto-publishes the Helm chart to `gh-pages`, and then runs GoReleaser against the tag to publish the GitHub Release.
 
 Notes:
 
-- Use the same `vX.Y.Z` value for both workflows. Git tags / Release names are prefixed with `v`; image tags are not (`0.3.0`).
-- Step 2 must finish before Step 3 (Step 3 checks out the tag created by Step 2).
-- The image workflow runs in the `preset-env` environment and may require approval.
-- Release branches are not needed for normal releases. Only cut a `release-vX.Y` branch (e.g. `release-v0.3`) when `main` has moved on to the next minor and you still need to ship patch releases for the older line; then run the publish workflows against that branch.
+- Git tags / Release names are prefixed with `v`; image tags are not (`0.3.0`).
+- The workflow orders its jobs so the tag and image are published before GoReleaser runs; the tag, image push, chart dispatch, and GitHub Release each skip cleanly if they already exist.
+- The image jobs run in the `preset-env` environment and may require approval.
+- Release branches are not needed for normal releases. Only cut a `release-vX.Y` branch (e.g. `release-v0.3`) when `main` has moved on to the next minor and you still need to ship patch releases for the older line; then run the publish workflow against that branch.
 
 ## License
 
