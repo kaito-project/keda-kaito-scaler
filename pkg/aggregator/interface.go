@@ -13,7 +13,13 @@
 
 package aggregator
 
-import "github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
+import (
+	"time"
+
+	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
+)
 
 // AggregateInput carries the per-request metric metadata an Aggregator needs to
 // reduce a snapshot to a single value.
@@ -23,9 +29,13 @@ type AggregateInput struct {
 	// Threshold is the per-replica scale threshold; used by sum-style aggregators
 	// to compensate for services that could not be scraped. Ignored by others.
 	Threshold float64
-	// Quantile is the target quantile in (0, 1] for the quantile aggregation.
-	// Ignored by non-quantile aggregators.
-	Quantile float64
+	// InferenceSet, MetricSource, ScrapeConfig and Window let the windowed-average
+	// aggregation locate the target's cached snapshot window (by the same key the
+	// cache is registered under) and pick the baseline. Ignored by other aggregators.
+	InferenceSet types.NamespacedName
+	MetricSource string
+	ScrapeConfig metricsource.ScrapeConfig
+	Window       time.Duration
 }
 
 // Aggregator reduces the per-service values inside a metricsource.MetricSnapshot

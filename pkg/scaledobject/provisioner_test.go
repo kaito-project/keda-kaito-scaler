@@ -55,9 +55,9 @@ func TestParseMetricsConfig(t *testing.T) {
 		assert.Equal(t, "10", cfg.metrics[0].upThreshold)
 		assert.Equal(t, "2", cfg.metrics[0].downThreshold)
 		assert.Equal(t, "vllm:request_queue_time_seconds", cfg.metrics[1].key)
-		assert.Equal(t, "quantile", cfg.metrics[1].aggregation)
-		// Quantile defaults to p95 for quantile-aggregated metrics.
-		assert.Equal(t, "0.95", cfg.metrics[1].quantile)
+		assert.Equal(t, "windowed-avg", cfg.metrics[1].aggregation)
+		// Metric cache window defaults to 300 seconds for histogram metrics.
+		assert.Equal(t, "300", cfg.metrics[1].metricCacheWindow)
 		// Defaults applied.
 		assert.Equal(t, int32(defaultEvaluationWindow), cfg.evaluationWindow)
 		assert.Equal(t, int32(defaultScaleUpCooldown), cfg.scaleUpCooldown)
@@ -166,13 +166,38 @@ func TestParseMetricsConfig(t *testing.T) {
 		assert.Error(t, err)
 	})
 
-	t.Run("NaN quantile rejected", func(t *testing.T) {
+	t.Run("custom metriccachewindow accepted", func(t *testing.T) {
 		ann := metricsAnn(`
 - name: vllm:request_queue_time_seconds
   type: histogram
   upthreshold: 1.5
   downthreshold: 0.5
-  quantile: NaN
+  metriccachewindow: 120
+`)
+		cfg, err := parseMetricsConfig(ann)
+		assert.NoError(t, err)
+		assert.Equal(t, "120", cfg.metrics[0].metricCacheWindow)
+	})
+
+	t.Run("non-positive metriccachewindow rejected", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: vllm:request_queue_time_seconds
+  type: histogram
+  upthreshold: 1.5
+  downthreshold: 0.5
+  metriccachewindow: 0
+`)
+		_, err := parseMetricsConfig(ann)
+		assert.Error(t, err)
+	})
+
+	t.Run("metriccachewindow on gauge rejected", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: vllm:num_requests_waiting
+  type: gauge
+  upthreshold: 5
+  downthreshold: 1
+  metriccachewindow: 60
 `)
 		_, err := parseMetricsConfig(ann)
 		assert.Error(t, err)
@@ -242,10 +267,10 @@ func TestBuildScaledObject(t *testing.T) {
 	assert.Equal(t, "vllm:num_requests_waiting", m0[constants.MetricNameInMetadata])
 	assert.NotContains(t, m0, "threshold", "triggers omit the per-replica threshold")
 
-	// metric_1 -> vllm:request_queue_time_seconds via modelpod + quantile, carrying the default p95 quantile.
+	// metric_1 -> vllm:request_queue_time_seconds via modelpod + windowed-avg, carrying the default 300s cache window.
 	m1 := so.Spec.Triggers[1].Metadata
-	assert.Equal(t, "quantile", m1[constants.AggregationInMetadata])
-	assert.Equal(t, "0.95", m1[constants.QuantileInMetadata])
+	assert.Equal(t, "windowed-avg", m1[constants.AggregationInMetadata])
+	assert.Equal(t, "300", m1[constants.MetricCacheWindowInMetadata])
 
 	// gate trigger uses the gate aggregation.
 	gate := so.Spec.Triggers[2].Metadata

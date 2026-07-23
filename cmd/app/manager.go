@@ -59,6 +59,7 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/cert"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/profile"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/util/runnable"
 )
 
 const (
@@ -199,6 +200,17 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		lo.Must0(c.Register(ctx, mgr))
 	}
 
+	// The metric cache poller runs on every replica (no leader election) and
+	// continuously scrapes each tracked InferenceSet into an in-memory window, so
+	// any replica can serve KEDA's GetMetrics from a complete local window.
+	metricCache := scaler.NewMetricCache(
+		mgr.GetClient(),
+		map[string]metricsource.MetricSource{
+			metricsource.ModelPodSourceName: metricsource.NewModelPodSource(mgr.GetClient()),
+		},
+	)
+	lo.Must0(mgr.Add(runnable.NoLeaderElection(metricCache)))
+
 	// register the KEDA external scaler gRPC server (mTLS) as a manager Runnable.
 	// The runnable waits for the mTLS certificates to be ready before it starts
 	// listening, so the manager alone drives the full lifecycle.
@@ -206,16 +218,13 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		Port: opts.GrpcPort,
 		Service: scaler.NewKaitoScaler(
 			mgr.GetClient(),
-			map[string]metricsource.MetricSource{
-				// Wrap the model-pod source in a short-lived cache so the several
-				// triggers of a composite ScaledObject share a single per-cycle
-				// scrape instead of each re-scraping every pod.
-				metricsource.ModelPodSourceName: metricsource.NewCachingSource(metricsource.NewModelPodSource(mgr.GetClient())),
-			},
+			metricCache,
 			map[string]aggregator.Aggregator{
 				aggregator.SumAggregatorName:            aggregator.NewSumAggregator(),
 				aggregator.ServiceAverageAggregatorName: aggregator.NewServiceAverageAggregator(),
-				aggregator.QuantileAggregatorName:       aggregator.NewQuantileAggregator(),
+				// The windowed-average aggregation is served by the metric cache
+				// itself (it holds the rolling snapshot window).
+				constants.AggregationWindowedAvg: metricCache,
 			},
 		),
 		GetServerCertificate: cert.NewServerCertLoader(secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName, ServerCert, ServerKey),

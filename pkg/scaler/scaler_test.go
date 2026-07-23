@@ -80,14 +80,12 @@ func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 }
 
-// newTestScaler wraps a single metric source/aggregator into the default
-// "modelpod"/"sum" routing maps so existing single-metric tests keep working
-// unchanged.
+// newTestScaler wraps a single metric source/aggregator into a metric cache and
+// the default "modelpod"/"sum" routing so existing single-metric tests keep
+// working. The cache and scaler share the same kube client.
 func newTestScaler(c client.Client, sc metricsource.MetricSource, ag aggregator.Aggregator) *KaitoScaler {
-	return NewKaitoScaler(c,
-		map[string]metricsource.MetricSource{metricsource.ModelPodSourceName: sc},
-		map[string]aggregator.Aggregator{aggregator.SumAggregatorName: ag},
-	)
+	cache := NewMetricCache(c, map[string]metricsource.MetricSource{metricsource.ModelPodSourceName: sc})
+	return NewKaitoScaler(c, cache, map[string]aggregator.Aggregator{aggregator.SumAggregatorName: ag})
 }
 
 func newValidScalerMetadata() map[string]string {
@@ -123,15 +121,14 @@ func TestNewKaitoScaler(t *testing.T) {
 	c := fake.NewClientBuilder().Build()
 	sc := &stubSource{}
 	ag := &stubAggregator{}
+	cache := NewMetricCache(c, map[string]metricsource.MetricSource{"modelpod": sc})
 
-	s := NewKaitoScaler(c,
-		map[string]metricsource.MetricSource{"modelpod": sc},
-		map[string]aggregator.Aggregator{"sum": ag},
-	)
+	s := NewKaitoScaler(c, cache, map[string]aggregator.Aggregator{"sum": ag})
 
 	assert.NotNil(t, s)
 	assert.Equal(t, c, s.kubeClient)
-	assert.Equal(t, metricsource.MetricSource(sc), s.metricSources["modelpod"])
+	assert.Equal(t, cache, s.cache)
+	assert.True(t, s.cache.hasSource("modelpod"))
 	assert.Equal(t, aggregator.Aggregator(ag), s.aggregators["sum"])
 }
 
@@ -149,10 +146,8 @@ func TestParseScalerMetadata(t *testing.T) {
 		{name: "invalid protocol", mutate: func(m map[string]string) { m[constants.MetricProtocolInMetadata] = "ftp" }, wantErr: true},
 		{name: "invalid timeout", mutate: func(m map[string]string) { m[constants.ScrapeTimeoutInMetadata] = "abc" }, wantErr: true},
 		{name: "invalid threshold", mutate: func(m map[string]string) { m[constants.ThresholdInMetadata] = "abc" }, wantErr: true},
-		{name: "invalid quantile", mutate: func(m map[string]string) { m[constants.QuantileInMetadata] = "abc" }, wantErr: true},
-		{name: "quantile out of range high", mutate: func(m map[string]string) { m[constants.QuantileInMetadata] = "1.5" }, wantErr: true},
-		{name: "quantile out of range low", mutate: func(m map[string]string) { m[constants.QuantileInMetadata] = "0" }, wantErr: true},
-		{name: "quantile NaN", mutate: func(m map[string]string) { m[constants.QuantileInMetadata] = "NaN" }, wantErr: true},
+		{name: "invalid metric cache window", mutate: func(m map[string]string) { m[constants.MetricCacheWindowInMetadata] = "abc" }, wantErr: true},
+		{name: "non-positive metric cache window", mutate: func(m map[string]string) { m[constants.MetricCacheWindowInMetadata] = "0" }, wantErr: true},
 		{name: "metric name override", mutate: func(m map[string]string) { delete(m, constants.MetricNameInMetadata) }, metricName: "override:metric"},
 		{name: "optional fields default when omitted", mutate: func(m map[string]string) {
 			delete(m, constants.MetricProtocolInMetadata)
@@ -179,7 +174,7 @@ func TestParseScalerMetadata(t *testing.T) {
 			assert.Equal(t, "ns1", cfg.InferenceSetNamespace)
 			assert.Equal(t, float64(10), cfg.Threshold)
 			assert.Equal(t, 3*time.Second, cfg.ScrapeTimeout)
-			assert.Equal(t, defaultQuantile, cfg.Quantile)
+			assert.Equal(t, defaultMetricCacheWindow, cfg.MetricCacheWindow)
 			if tt.metricName != "" {
 				assert.Equal(t, tt.metricName, cfg.MetricName)
 			}
@@ -196,7 +191,7 @@ func TestParseScalerMetadata_ThresholdOnDemand(t *testing.T) {
 		{name: "required for default sum", aggregation: "", wantErr: true},
 		{name: "required for sum", aggregation: aggregator.SumAggregatorName, wantErr: true},
 		{name: "optional for service-avg", aggregation: aggregator.ServiceAverageAggregatorName},
-		{name: "optional for quantile", aggregation: aggregator.QuantileAggregatorName},
+		{name: "optional for windowed-avg", aggregation: constants.AggregationWindowedAvg},
 		{name: "optional for gate", aggregation: constants.AggregationGate},
 	}
 
@@ -330,8 +325,9 @@ func TestKaitoScaler_GetMetrics_Routing(t *testing.T) {
 	sumAgg := &stubAggregator{value: 1}
 	serviceAvgAgg := &stubAggregator{value: 2}
 
-	s := NewKaitoScaler(newFakeClient(t, is),
-		map[string]metricsource.MetricSource{"service": serviceSource, "epp": eppSource},
+	c := newFakeClient(t, is)
+	cache := NewMetricCache(c, map[string]metricsource.MetricSource{"service": serviceSource, "epp": eppSource})
+	s := NewKaitoScaler(c, cache,
 		map[string]aggregator.Aggregator{"sum": sumAgg, "service-avg": serviceAvgAgg},
 	)
 
@@ -353,64 +349,31 @@ func TestKaitoScaler_GetMetrics_Routing(t *testing.T) {
 	assert.Equal(t, 0, sumAgg.callCount)
 }
 
-func TestKaitoScaler_GetMetrics_Quantile(t *testing.T) {
+func TestKaitoScaler_GetMetrics_WindowedAvg(t *testing.T) {
 	is := newReadyInferenceSet("is1", "ns1", true)
 
-	// A histogram with all 100 observations in the (1, 2] bucket, so any quantile
-	// falls in that bucket and is interpolated between 1 and 2.
-	snap := &metricsource.MetricSnapshot{
-		Services: []metricsource.ServiceMetrics{{
-			Name:      "epp0",
-			Namespace: "ns1",
-			Histograms: map[string]metricsource.Histogram{
-				"inference_objective_request_duration_seconds": {
-					Buckets: []metricsource.Bucket{
-						{Le: 1, CumulativeCount: 0},
-						{Le: 2, CumulativeCount: 100},
-					},
-					Count: 100,
-				},
-			},
-		}},
-	}
-
-	newMeta := func(quantile string) map[string]string {
-		meta := newValidScalerMetadata()
-		meta[constants.MetricSourceInMetadata] = "epp"
-		meta[constants.AggregationInMetadata] = aggregator.QuantileAggregatorName
-		meta[constants.MetricNameInMetadata] = "inference_objective_request_duration_seconds"
-		if quantile != "" {
-			meta[constants.QuantileInMetadata] = quantile
-		}
-		return meta
-	}
-
-	newScaler := func() *KaitoScaler {
-		return NewKaitoScaler(newFakeClient(t, is),
-			map[string]metricsource.MetricSource{"epp": &stubSource{snapshot: snap}},
-			map[string]aggregator.Aggregator{
-				aggregator.QuantileAggregatorName: aggregator.NewQuantileAggregator(),
-			},
-		)
-	}
-
-	t.Run("default p95", func(t *testing.T) {
-		resp, err := newScaler().GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
-			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: newMeta("")},
-			MetricName:      "inference_objective_request_duration_seconds",
-		})
-		assert.NoError(t, err)
-		assert.InDelta(t, 1.95, resp.MetricValues[0].MetricValueFloat, 1e-9)
+	// On a cold cache the windowed-avg aggregation has not accumulated a full
+	// window yet, so it holds (error) and KEDA holds the replica count. The full
+	// windowed math is covered by TestMetricCache_WindowedAverage.
+	c := newFakeClient(t, is)
+	cache := NewMetricCache(c, map[string]metricsource.MetricSource{
+		metricsource.ModelPodSourceName: &stubSource{snapshot: histSnapshot(100, 50)},
+	})
+	s := NewKaitoScaler(c, cache, map[string]aggregator.Aggregator{
+		constants.AggregationWindowedAvg: cache,
 	})
 
-	t.Run("custom p50", func(t *testing.T) {
-		resp, err := newScaler().GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
-			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: newMeta("0.5")},
-			MetricName:      "inference_objective_request_duration_seconds",
-		})
-		assert.NoError(t, err)
-		assert.InDelta(t, 1.5, resp.MetricValues[0].MetricValueFloat, 1e-9)
+	meta := newValidScalerMetadata()
+	meta[constants.AggregationInMetadata] = constants.AggregationWindowedAvg
+	meta[constants.MetricNameInMetadata] = cacheTestMetric
+	meta[constants.MetricCacheWindowInMetadata] = "120"
+	delete(meta, constants.ThresholdInMetadata)
+
+	_, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+		ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: meta},
+		MetricName:      cacheTestMetric,
 	})
+	assert.Error(t, err)
 }
 
 func TestKaitoScaler_GetMetrics_UnknownSourceOrAggregation(t *testing.T) {
@@ -464,10 +427,9 @@ func TestKaitoScaler_GetMetrics_Gate(t *testing.T) {
 			// A metric source that would fail if called, to prove the gate path never scrapes.
 			sc := &stubSource{err: errors.New("should not scrape")}
 			ag := &stubAggregator{}
-			s := NewKaitoScaler(newFakeClient(t, is),
-				map[string]metricsource.MetricSource{"service": sc},
-				map[string]aggregator.Aggregator{"sum": ag},
-			)
+			c := newFakeClient(t, is)
+			cache := NewMetricCache(c, map[string]metricsource.MetricSource{"service": sc})
+			s := NewKaitoScaler(c, cache, map[string]aggregator.Aggregator{"sum": ag})
 
 			meta := newValidScalerMetadata()
 			meta[constants.AggregationInMetadata] = constants.AggregationGate

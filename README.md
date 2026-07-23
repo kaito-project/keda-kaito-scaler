@@ -119,16 +119,23 @@ annotation, whose value is a YAML (or JSON) list — one entry per metric. Globa
 settings stay as their own `scaledobject.kaito.sh/` annotations. Any Prometheus
 metric name is accepted.
 
+Metric values are served from an in-memory cache that a background poller keeps
+fresh: every scaler replica continuously scrapes each tracked `InferenceSet`, so
+any replica can answer KEDA from a complete local window without scraping on the
+request path. Histogram metrics are reduced to the **average observation over a
+rolling cache window** (`ΔSum / ΔCount`), which stays responsive to sudden
+changes instead of being diluted by the full cumulative history.
+
 Each entry in the `metrics` list accepts the following fields:
 
 | Field | Required | Default | Description |
 | --- | --- | --- | --- |
 | `name` | yes | – | Prometheus metric name. |
-| `type` | yes | – | Aggregation: `gauge` → per-replica average across pods; `histogram` → per-pod quantile. Both are replica-count independent. |
+| `type` | yes | – | Aggregation: `gauge` → per-replica average across pods; `histogram` → average over the metric cache window. Both are replica-count independent. |
 | `source` | no | `modelpod` | Where the metric is scraped. Only `modelpod` (the model-serving pods behind the `InferenceSet`'s workspace `Service`s) is supported. |
 | `upthreshold` | yes | – | Scale-up threshold (float). |
 | `downthreshold` | yes | – | Scale-down threshold (float). Must be `<= upthreshold`. |
-| `quantile` | no | `0.95` | Target quantile in `(0, 1]` for `histogram` metrics; ignored for `gauge`. |
+| `metriccachewindow` | no | `300` | Rolling cache window in **seconds** over which a `histogram` metric is averaged. Each histogram metric may set its own; rejected on `gauge` metrics. |
 
 The remaining global annotations:
 
@@ -161,7 +168,7 @@ metadata:
     scaledobject.kaito.sh/metrics: |
       - name: vllm:num_requests_waiting
         type: gauge
-        upthreshold: 5
+        upthreshold: 10
         downthreshold: 1
   name: phi-4
   namespace: default
@@ -240,7 +247,7 @@ spec:
       target: "1"
       metricType: Value
       formula: >-
-        (readiness_gate == 1 && vllm_num_requests_waiting > 5) ? 2.0 :
+        (readiness_gate == 1 && vllm_num_requests_waiting > 10) ? 2.0 :
         ((vllm_num_requests_waiting < 1) ? 0.5 : 1.0)
   triggers:
     # Metric 0: gauge -> service-avg
@@ -289,18 +296,18 @@ metadata:
     scaledobject.kaito.sh/auto-provision: "true"
 
     # Two metrics combined under the conservative AND policy:
-    #   - vLLM waiting-queue length (modelpod, gauge -> per-replica average)
-    #   - p95 request queue time     (modelpod, histogram -> quantile)
+    #   - vLLM waiting-queue length      (modelpod, gauge -> per-replica average)
+    #   - avg request queue time (window) (modelpod, histogram -> windowed average)
     scaledobject.kaito.sh/metrics: |
       - name: vllm:num_requests_waiting
         type: gauge
-        upthreshold: 5
+        upthreshold: 10
         downthreshold: 1
       - name: vllm:request_queue_time_seconds
         type: histogram
-        upthreshold: 2.0
-        downthreshold: 0.5
-        quantile: 0.95
+        upthreshold: 30.0
+        downthreshold: 1.0
+        metriccachewindow: 300
 
     # Optional global tuning (defaults shown)
     scaledobject.kaito.sh/combinepolicy: "AND"
@@ -386,8 +393,8 @@ spec:
       target: "1"
       metricType: Value
       formula: >-
-        (readiness_gate == 1 && vllm_num_requests_waiting > 5 && vllm_request_queue_time_seconds > 2) ? 2.0 :
-        ((vllm_num_requests_waiting < 1 && vllm_request_queue_time_seconds < 0.5) ? 0.5 : 1.0)
+        (readiness_gate == 1 && vllm_num_requests_waiting > 10 && vllm_request_queue_time_seconds > 30) ? 2.0 :
+        ((vllm_num_requests_waiting < 1 && vllm_request_queue_time_seconds < 1) ? 0.5 : 1.0)
   triggers:
     # Metric 0: gauge -> service-avg
     - type: external
@@ -403,7 +410,7 @@ spec:
         metricName: vllm:num_requests_waiting
         metricSource: modelpod
         aggregation: service-avg
-    # Metric 1: histogram -> quantile (p95)
+    # Metric 1: histogram -> windowed-avg (average over the metric cache window)
     - type: external
       name: vllm_request_queue_time_seconds
       metricType: Value
@@ -416,8 +423,8 @@ spec:
         scalerAddress: keda-kaito-scaler.keda-kaito-scaler.svc.cluster.local:9443
         metricName: vllm:request_queue_time_seconds
         metricSource: modelpod
-        aggregation: quantile
-        quantile: "0.95"
+        aggregation: windowed-avg
+        metricCacheWindow: "300"
     # Readiness gate: no scrape, reports 1 once all replicas are ready, 0 otherwise
     - type: external
       name: readiness_gate
@@ -460,7 +467,7 @@ spec:
 > up-threshold) or a scale down (if it's above its down-threshold). Because each
 > metric is compared against a *fixed* threshold, its value must be
 > **replica-count independent** — that's why `gauge` is averaged per replica and
-> `histogram` is reduced to a per-pod quantile.
+> `histogram` is averaged over its metric cache window.
 
 #### Option 2: Manage the ScaledObject yourself
 
