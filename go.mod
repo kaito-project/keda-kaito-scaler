@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/kaito-project/kaito v0.11.0
-	github.com/kedacore/keda/v2 v2.20.1
+	github.com/kedacore/keda/v2 v2.20.2
 	github.com/open-policy-agent/cert-controller v0.16.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
