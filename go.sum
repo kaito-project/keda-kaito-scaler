@@ -90,8 +90,8 @@ github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnr
 github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=
 github.com/kaito-project/kaito v0.11.0 h1:Y8wS9ng4HXr6V1+Wj/dFBEAsLoaiP8mgAedcyUoLZu0=
 github.com/kaito-project/kaito v0.11.0/go.mod h1:WM/XCHYy2z+cKZ5XVq+AAjUIIIlFds4e3Z/CU8N23As=
-github.com/kedacore/keda/v2 v2.20.1 h1:0Bb2zX/s+RSPtU2W+/Jk24A/aFl8MO79UuU0C4lA8ts=
-github.com/kedacore/keda/v2 v2.20.1/go.mod h1:wrV1MP6buZQ1S5/J/R7UyBeJr857x92E43LADVoSajs=
+github.com/kedacore/keda/v2 v2.20.2 h1:SR60v8uIcelbveS8n/1jcl8tLdBBIbHMxmdOHw8tKqA=
+github.com/kedacore/keda/v2 v2.20.2/go.mod h1:wrV1MP6buZQ1S5/J/R7UyBeJr857x92E43LADVoSajs=
 github.com/klauspost/compress v1.19.1 h1:VsB4HPswih7mmZ8WleSFQ75c/Ui1M4trX5oAsJnhSlk=
 github.com/klauspost/compress v1.19.1/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
 github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
