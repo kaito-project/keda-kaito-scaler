@@ -148,7 +148,7 @@ jobs:
           disable-telemetry: true
 
       - name: Set up Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.4.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v5.4.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
