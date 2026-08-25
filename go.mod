@@ -1,9 +1,9 @@
 module github.com/kaito-project/keda-kaito-scaler
 
-go 1.26.4
+go 1.26.6
 
 require (
-	github.com/kaito-project/kaito v0.11.0
+	github.com/kaito-project/kaito v0.12.0
 	github.com/kedacore/keda/v2 v2.20.2
 	github.com/open-policy-agent/cert-controller v0.16.0
 	github.com/prometheus/client_golang v1.24.1
