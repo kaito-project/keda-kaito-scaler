@@ -699,16 +699,9 @@ func buildScaleToZeroFormula(cfg metricsConfig, maxReplicas int) string {
 	nonZeroBranch := fmt.Sprintf("(%s) ? %s : %s",
 		joinPredicate(deactivationConds, "&&"), deactivateMultiplier, holdMultiplier)
 	if maxReplicas > 1 {
-		// The gate is prepended inside scaleUpExpr, so an empty condition set
-		// would leave "readiness_gate == 1" as the whole predicate and grow the
-		// workload on every ready evaluation. Collapse before the prepend.
-		scaleUp := "false"
-		if len(upConds) > 0 {
-			scaleUp = cfg.policy.scaleUpExpr(gateTriggerName, upConds)
-		}
 		nonZeroBranch = fmt.Sprintf("(%s) ? %s : ((%s) ? %s : ((%s) ? %s : %s))",
 			joinPredicate(deactivationConds, "&&"), deactivateMultiplier,
-			scaleUp, scaleUpMultiplier,
+			cfg.policy.scaleUpExpr(gateTriggerName, upConds), scaleUpMultiplier,
 			joinPredicate(downConds, "&&"), scaleDownMultiplier,
 			holdMultiplier)
 	}
