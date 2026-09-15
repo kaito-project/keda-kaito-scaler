@@ -278,14 +278,6 @@ func sourceForMetricSource(s string) (string, error) {
 	}
 }
 
-// observableAtZeroReplicas reports whether a source still produces readings
-// while the InferenceSet is parked at zero. Only such a source can carry an
-// activation threshold: the model pods are gone at zero, so a modelpod metric
-// could never rise above one.
-func observableAtZeroReplicas(source string) bool {
-	return source == metricsource.EPPSourceName
-}
-
 // metricsConfig is the fully parsed auto-provision configuration.
 type metricsConfig struct {
 	metrics           []metric
@@ -437,7 +429,7 @@ func parseMetricsConfig(annotations map[string]string, minReplicas int) (metrics
 			return cfg, fmt.Errorf("metric %q (index %d): upthreshold and downthreshold must be declared together", spec.Name, i)
 		}
 
-		if spec.ActivationThreshold != nil && !observableAtZeroReplicas(source) {
+		if spec.ActivationThreshold != nil && source != metricsource.EPPSourceName {
 			return cfg, fmt.Errorf("metric %q (index %d): activationthreshold requires a source observable at zero replicas (%q), got %q", spec.Name, i, metricsource.EPPSourceName, source)
 		}
 
