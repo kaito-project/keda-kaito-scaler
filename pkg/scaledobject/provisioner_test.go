@@ -46,7 +46,7 @@ func metricsAnnotations() map[string]string {
 
 func TestParseMetricsConfig(t *testing.T) {
 	t.Run("valid two-metric config", func(t *testing.T) {
-		cfg, err := parseMetricsConfig(metricsAnnotations())
+		cfg, err := parseMetricsConfig(metricsAnnotations(), 1)
 		assert.NoError(t, err)
 		assert.Len(t, cfg.metrics, 2)
 		assert.Equal(t, "vllm:num_requests_waiting", cfg.metrics[0].key)
@@ -71,7 +71,7 @@ func TestParseMetricsConfig(t *testing.T) {
   upthreshold: 5
   downthreshold: 1
 `)
-		cfg, err := parseMetricsConfig(ann)
+		cfg, err := parseMetricsConfig(ann, 1)
 		assert.NoError(t, err)
 		assert.Len(t, cfg.metrics, 1)
 		assert.Equal(t, "service-avg", cfg.metrics[0].aggregation)
@@ -82,7 +82,7 @@ func TestParseMetricsConfig(t *testing.T) {
 		ann[constants.AnnotationKeyEvaluationWindow] = "30"
 		ann[constants.AnnotationKeyScaleUpCooldown] = "120"
 		ann[constants.AnnotationKeyScaleDownCooldown] = "240"
-		cfg, err := parseMetricsConfig(ann)
+		cfg, err := parseMetricsConfig(ann, 1)
 		assert.NoError(t, err)
 		assert.Equal(t, int32(30), cfg.evaluationWindow)
 		assert.Equal(t, int32(120), cfg.scaleUpCooldown)
@@ -95,7 +95,7 @@ func TestParseMetricsConfig(t *testing.T) {
   upthreshold: 10
   downthreshold: 2
 `)
-		_, err := parseMetricsConfig(ann)
+		_, err := parseMetricsConfig(ann, 1)
 		assert.Error(t, err)
 	})
 
@@ -106,7 +106,7 @@ func TestParseMetricsConfig(t *testing.T) {
   upthreshold: 10
   downthreshold: 2
 `)
-		_, err := parseMetricsConfig(ann)
+		_, err := parseMetricsConfig(ann, 1)
 		assert.Error(t, err)
 	})
 
@@ -118,7 +118,7 @@ func TestParseMetricsConfig(t *testing.T) {
   upthreshold: 10
   downthreshold: 2
 `)
-		_, err := parseMetricsConfig(ann)
+		_, err := parseMetricsConfig(ann, 1)
 		assert.Error(t, err)
 	})
 
@@ -129,7 +129,7 @@ func TestParseMetricsConfig(t *testing.T) {
   upthreshold: abc
   downthreshold: 2
 `)
-		_, err := parseMetricsConfig(ann)
+		_, err := parseMetricsConfig(ann, 1)
 		assert.Error(t, err)
 	})
 
@@ -141,7 +141,7 @@ func TestParseMetricsConfig(t *testing.T) {
   upthreshold: %s
   downthreshold: 2
 `, v))
-			_, err := parseMetricsConfig(ann)
+			_, err := parseMetricsConfig(ann, 1)
 			assert.Error(t, err, "upthreshold %q", v)
 
 			ann = metricsAnn(fmt.Sprintf(`
@@ -150,7 +150,7 @@ func TestParseMetricsConfig(t *testing.T) {
   upthreshold: 2
   downthreshold: %s
 `, v))
-			_, err = parseMetricsConfig(ann)
+			_, err = parseMetricsConfig(ann, 1)
 			assert.Error(t, err, "downthreshold %q", v)
 		}
 	})
@@ -162,7 +162,7 @@ func TestParseMetricsConfig(t *testing.T) {
   upthreshold: 10
   downthreshold: 20
 `)
-		_, err := parseMetricsConfig(ann)
+		_, err := parseMetricsConfig(ann, 1)
 		assert.Error(t, err)
 	})
 
@@ -174,7 +174,7 @@ func TestParseMetricsConfig(t *testing.T) {
   downthreshold: 0.5
   metriccachewindow: 120
 `)
-		cfg, err := parseMetricsConfig(ann)
+		cfg, err := parseMetricsConfig(ann, 1)
 		assert.NoError(t, err)
 		assert.Equal(t, "120", cfg.metrics[0].metricCacheWindow)
 	})
@@ -187,7 +187,7 @@ func TestParseMetricsConfig(t *testing.T) {
   downthreshold: 0.5
   metriccachewindow: 0
 `)
-		_, err := parseMetricsConfig(ann)
+		_, err := parseMetricsConfig(ann, 1)
 		assert.Error(t, err)
 	})
 
@@ -199,34 +199,34 @@ func TestParseMetricsConfig(t *testing.T) {
   downthreshold: 1
   metriccachewindow: 60
 `)
-		_, err := parseMetricsConfig(ann)
+		_, err := parseMetricsConfig(ann, 1)
 		assert.Error(t, err)
 	})
 
 	t.Run("non-AND combine policy rejected", func(t *testing.T) {
 		ann := metricsAnnotations()
 		ann[constants.AnnotationKeyCombinePolicy] = "OR"
-		_, err := parseMetricsConfig(ann)
+		_, err := parseMetricsConfig(ann, 1)
 		assert.Error(t, err)
 	})
 
 	t.Run("explicit AND accepted", func(t *testing.T) {
 		ann := metricsAnnotations()
 		ann[constants.AnnotationKeyCombinePolicy] = "AND"
-		_, err := parseMetricsConfig(ann)
+		_, err := parseMetricsConfig(ann, 1)
 		assert.NoError(t, err)
 	})
 
 	t.Run("no metrics rejected", func(t *testing.T) {
-		_, err := parseMetricsConfig(map[string]string{constants.AnnotationKeyAutoProvision: "true"})
+		_, err := parseMetricsConfig(map[string]string{constants.AnnotationKeyAutoProvision: "true"}, 1)
 		assert.Error(t, err)
 	})
 }
 
 func TestBuildFormula(t *testing.T) {
-	cfg, err := parseMetricsConfig(metricsAnnotations())
+	cfg, err := parseMetricsConfig(metricsAnnotations(), 1)
 	assert.NoError(t, err)
-	got := buildFormula(cfg)
+	got := buildFormula(cfg, 1, 5)
 	want := "(readiness_gate == 1 && vllm_num_requests_waiting > 10 && vllm_request_queue_time_seconds > 1.5) ? 2.0 : ((vllm_num_requests_waiting < 2 && vllm_request_queue_time_seconds < 0.5) ? 0.5 : 1.0)"
 	assert.Equal(t, want, got)
 }
@@ -241,7 +241,7 @@ func TestBuildScaledObject(t *testing.T) {
 	}
 	b := Builder{ScalerNamespace: "kaito-workspace", ScalerServiceName: "kaito-scaler", ScalerGRPCPort: 9443}
 
-	cfg, err := parseMetricsConfig(metricsAnnotations())
+	cfg, err := parseMetricsConfig(metricsAnnotations(), 1)
 	assert.NoError(t, err)
 
 	so := b.buildScaledObject(is, 1, 5, cfg)
@@ -286,7 +286,7 @@ func TestBuildScaledObject(t *testing.T) {
 	sm := so.Spec.Advanced.ScalingModifiers
 	assert.Equal(t, "1", sm.Target)
 	assert.Equal(t, autoscalingv2.ValueMetricType, sm.MetricType)
-	assert.Equal(t, buildFormula(cfg), sm.Formula)
+	assert.Equal(t, buildFormula(cfg, 1, 5), sm.Formula)
 
 	// HPA behaviour tolerances tightened to 0.1 in both directions.
 	behavior := so.Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior
@@ -296,4 +296,418 @@ func TestBuildScaledObject(t *testing.T) {
 	assert.Equal(t, int32(defaultScaleDownCooldown), *behavior.ScaleDown.StabilizationWindowSeconds)
 	assert.Equal(t, int32(1), behavior.ScaleUp.Policies[0].Value)
 	assert.Equal(t, int32(1), behavior.ScaleDown.Policies[0].Value)
+}
+
+// scaleToZeroAnnotations returns a minimal configuration that satisfies every
+// scale-to-zero rule: an EPP-observed activation signal so the workload can
+// wake, a backend-observed deactivation signal so it can be parked safely, and
+// an up/down band so the 1..N range still scales.
+func scaleToZeroAnnotations() map[string]string {
+	return metricsAnn(`
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  activationthreshold: 0
+- name: vllm:num_requests_running
+  type: gauge
+  deactivationthreshold: 0
+  upthreshold: 10
+  downthreshold: 2
+`)
+}
+
+func TestParseMetricsConfig_ScaleToZero(t *testing.T) {
+	t.Run("valid config", func(t *testing.T) {
+		cfg, err := parseMetricsConfig(scaleToZeroAnnotations(), 0)
+		assert.NoError(t, err)
+		assert.Len(t, cfg.metrics, 2)
+
+		// An EPP gauge is summed across router replicas rather than averaged.
+		assert.Equal(t, "epp", cfg.metrics[0].source)
+		assert.Equal(t, "service-sum", cfg.metrics[0].aggregation)
+		assert.Equal(t, "0", cfg.metrics[0].activationThreshold)
+		assert.False(t, cfg.metrics[0].hasUpDownBand())
+
+		assert.Equal(t, "modelpod", cfg.metrics[1].source)
+		assert.Equal(t, "0", cfg.metrics[1].deactivationThreshold)
+		assert.True(t, cfg.metrics[1].hasUpDownBand())
+	})
+
+	// The up/down band is what drives the 1..N range, so it stays mandatory
+	// whenever the minimum is not 0. Relaxing it for scale-to-zero must not
+	// relax it for the existing configurations.
+	t.Run("up and down stay required when the minimum is not zero", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: vllm:num_requests_running
+  type: gauge
+  upthreshold: 10
+`)
+		_, err := parseMetricsConfig(ann, 1)
+		assert.ErrorContains(t, err, "downthreshold is required")
+
+		ann = metricsAnn(`
+- name: vllm:num_requests_running
+  type: gauge
+  downthreshold: 2
+`)
+		_, err = parseMetricsConfig(ann, 1)
+		assert.ErrorContains(t, err, "upthreshold is required")
+	})
+
+	// Activation and deactivation only mean anything on the 0 <-> 1 edge, so
+	// accepting them at a non-zero minimum would silently ignore them.
+	t.Run("activation thresholds are rejected when the minimum is not zero", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  upthreshold: 10
+  downthreshold: 2
+  activationthreshold: 0
+`)
+		_, err := parseMetricsConfig(ann, 1)
+		assert.ErrorContains(t, err, constants.AnnotationKeyMinReplicas)
+		assert.ErrorContains(t, err, "activationthreshold")
+	})
+
+	t.Run("a metric may declare only an activation band when the minimum is zero", func(t *testing.T) {
+		cfg, err := parseMetricsConfig(scaleToZeroAnnotations(), 0)
+		assert.NoError(t, err)
+		assert.Empty(t, cfg.metrics[0].upThreshold)
+		assert.Empty(t, cfg.metrics[0].downThreshold)
+	})
+
+	// A half-declared band would compare against a threshold the other
+	// direction never sets, so it is rejected in both modes.
+	t.Run("a partial up/down band is always rejected", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  activationthreshold: 0
+  upthreshold: 10
+`)
+		_, err := parseMetricsConfig(ann, 0)
+		assert.ErrorContains(t, err, "must be declared together")
+	})
+
+	// Only the EPP keeps reporting while the workload is parked, so an
+	// activation threshold on a backend metric could never be observed.
+	t.Run("activation requires a source observable at zero replicas", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: vllm:num_requests_running
+  type: gauge
+  activationthreshold: 0
+  deactivationthreshold: 0
+`)
+		_, err := parseMetricsConfig(ann, 0)
+		assert.ErrorContains(t, err, "observable at zero replicas")
+	})
+
+	t.Run("a config that can never wake is rejected", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: vllm:num_requests_running
+  type: gauge
+  deactivationthreshold: 0
+  upthreshold: 10
+  downthreshold: 2
+`)
+		_, err := parseMetricsConfig(ann, 0)
+		assert.ErrorContains(t, err, "activationthreshold")
+	})
+
+	// Parking on the router's view alone could stop a replica that is still
+	// generating tokens for an in-flight request.
+	t.Run("a config that parks without observing the backend is rejected", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  activationthreshold: 0
+  deactivationthreshold: 0
+`)
+		_, err := parseMetricsConfig(ann, 0)
+		assert.ErrorContains(t, err, "backend occupancy")
+	})
+
+	t.Run("deactivation must not exceed activation", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  activationthreshold: 1
+  deactivationthreshold: 5
+`)
+		_, err := parseMetricsConfig(ann, 0)
+		assert.ErrorContains(t, err, "must not exceed")
+	})
+
+	// replica_count is a synthetic trigger the formula branches on, so a user
+	// metric of the same name would shadow it.
+	t.Run("the replica_count name is reserved when the minimum is zero", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: replica_count
+  type: gauge
+  source: epp
+  activationthreshold: 0
+`)
+		_, err := parseMetricsConfig(ann, 0)
+		assert.ErrorContains(t, err, "reserved")
+
+		// The trigger does not exist at a non-zero minimum, so the same name
+		// stays usable there and existing configurations keep working.
+		ann = metricsAnn(`
+- name: replica_count
+  type: gauge
+  upthreshold: 10
+  downthreshold: 2
+`)
+		_, err = parseMetricsConfig(ann, 1)
+		assert.NoError(t, err)
+	})
+
+	t.Run("cooldownperiod", func(t *testing.T) {
+		ann := scaleToZeroAnnotations()
+		ann[constants.AnnotationKeyCooldownPeriod] = "60"
+		cfg, err := parseMetricsConfig(ann, 0)
+		assert.NoError(t, err)
+		assert.Equal(t, int32(60), *cfg.cooldownPeriod)
+
+		// It only governs the wait before parking, so it is meaningless when
+		// the workload never reaches zero.
+		ann = metricsAnnotations()
+		ann[constants.AnnotationKeyCooldownPeriod] = "60"
+		_, err = parseMetricsConfig(ann, 1)
+		assert.ErrorContains(t, err, constants.AnnotationKeyMinReplicas)
+	})
+
+	t.Run("an explicit aggregation override is honoured", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  aggregation: service-avg
+  activationthreshold: 0
+- name: vllm:num_requests_running
+  type: gauge
+  deactivationthreshold: 0
+  upthreshold: 10
+  downthreshold: 2
+`)
+		cfg, err := parseMetricsConfig(ann, 0)
+		assert.NoError(t, err)
+		assert.Equal(t, "service-avg", cfg.metrics[0].aggregation)
+	})
+
+	// windowed-avg reads a histogram's _sum/_count pair, so pointing it at a
+	// gauge would read fields the source never populates.
+	t.Run("an aggregation incompatible with the metric type is rejected", func(t *testing.T) {
+		ann := metricsAnn(`
+- name: vllm:num_requests_running
+  type: gauge
+  aggregation: windowed-avg
+  upthreshold: 10
+  downthreshold: 2
+`)
+		_, err := parseMetricsConfig(ann, 1)
+		assert.ErrorContains(t, err, "not compatible")
+	})
+}
+
+func TestValidateReplicaRange(t *testing.T) {
+	withBand, err := parseMetricsConfig(scaleToZeroAnnotations(), 0)
+	assert.NoError(t, err)
+
+	noBand, err := parseMetricsConfig(metricsAnn(`
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  activationthreshold: 0
+- name: vllm:num_requests_running
+  type: gauge
+  deactivationthreshold: 0
+`), 0)
+	assert.NoError(t, err)
+
+	t.Run("a 0..N range needs a band to scale over", func(t *testing.T) {
+		assert.NoError(t, validateReplicaRange(withBand, 0, 5))
+		assert.ErrorContains(t, validateReplicaRange(noBand, 0, 5), "at least one metric")
+	})
+
+	// With a maximum of 1 the only transitions are 0 <-> 1, which the
+	// activation band drives; an up/down band would never be consulted.
+	t.Run("a 0..1 range must not declare a band", func(t *testing.T) {
+		assert.NoError(t, validateReplicaRange(noBand, 0, 1))
+		assert.ErrorContains(t, validateReplicaRange(withBand, 0, 1), "not allowed")
+	})
+
+	// A NodeCountLimit-derived min=1,max=1 is provisioned today with a band on
+	// every metric. The rule must not reach it.
+	t.Run("a non-zero minimum is never constrained", func(t *testing.T) {
+		alwaysOn, err := parseMetricsConfig(metricsAnnotations(), 1)
+		assert.NoError(t, err)
+		assert.NoError(t, validateReplicaRange(alwaysOn, 1, 1))
+		assert.NoError(t, validateReplicaRange(alwaysOn, 1, 5))
+	})
+}
+
+func TestBuildScaleToZeroFormula(t *testing.T) {
+	t.Run("0..N branches on replica_count then on the band", func(t *testing.T) {
+		cfg, err := parseMetricsConfig(scaleToZeroAnnotations(), 0)
+		assert.NoError(t, err)
+
+		got := buildFormula(cfg, 0, 5)
+		want := "(replica_count == 0) ? " +
+			"((inference_pool_per_pod_queue_size > 0) ? 1.0 : 0.0) : " +
+			"((inference_pool_per_pod_queue_size <= 0 && vllm_num_requests_running <= 0) ? 0.0 : " +
+			"((readiness_gate == 1 && vllm_num_requests_running > 10) ? 2.0 : " +
+			"((vllm_num_requests_running < 2) ? 0.5 : 1.0)))"
+		assert.Equal(t, want, got)
+	})
+
+	t.Run("0..1 collapses to deactivate or hold", func(t *testing.T) {
+		cfg, err := parseMetricsConfig(metricsAnn(`
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  activationthreshold: 0
+- name: vllm:num_requests_running
+  type: gauge
+  deactivationthreshold: 0
+`), 0)
+		assert.NoError(t, err)
+
+		got := buildFormula(cfg, 0, 1)
+		want := "(replica_count == 0) ? " +
+			"((inference_pool_per_pod_queue_size > 0) ? 1.0 : 0.0) : " +
+			"((inference_pool_per_pod_queue_size <= 0 && vllm_num_requests_running <= 0) ? 0.0 : 1.0)"
+		assert.Equal(t, want, got)
+	})
+
+	// Any one signal crossing its threshold should wake the workload, while
+	// every signal must agree before it is parked.
+	t.Run("activation ORs and deactivation ANDs", func(t *testing.T) {
+		cfg, err := parseMetricsConfig(metricsAnn(`
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  activationthreshold: 0
+  deactivationthreshold: 0
+- name: kv_cache_utilization
+  type: gauge
+  source: epp
+  activationthreshold: 1
+- name: vllm:num_requests_running
+  type: gauge
+  deactivationthreshold: 0
+`), 0)
+		assert.NoError(t, err)
+
+		got := buildFormula(cfg, 0, 1)
+		assert.Contains(t, got, "(inference_pool_per_pod_queue_size > 0 || kv_cache_utilization > 1) ? 1.0 : 0.0")
+		assert.Contains(t, got, "(inference_pool_per_pod_queue_size <= 0 && kv_cache_utilization <= 1 && vllm_num_requests_running <= 0) ? 0.0 : 1.0")
+	})
+}
+
+// An empty predicate must never collapse into something that fires. expr-lang
+// reads an empty AND as vacuously true, which would park or shrink the workload
+// on every evaluation.
+func TestJoinPredicate(t *testing.T) {
+	assert.Equal(t, "false", joinPredicate(nil, "&&"))
+	assert.Equal(t, "false", joinPredicate([]string{}, "||"))
+	assert.Equal(t, "a > 1", joinPredicate([]string{"a > 1"}, "&&"))
+	assert.Equal(t, "a > 1 && b < 2", joinPredicate([]string{"a > 1", "b < 2"}, "&&"))
+}
+
+func TestBuildScaledObject_ScaleToZero(t *testing.T) {
+	is := &kaitov1beta1.InferenceSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-is", Namespace: "default", UID: "uid"},
+	}
+	b := Builder{ScalerNamespace: "kaito-workspace", ScalerServiceName: "kaito-scaler", ScalerGRPCPort: 9443}
+
+	ann := scaleToZeroAnnotations()
+	ann[constants.AnnotationKeyCooldownPeriod] = "60"
+	cfg, err := parseMetricsConfig(ann, 0)
+	assert.NoError(t, err)
+
+	so := b.buildScaledObject(is, 0, 5, cfg)
+
+	assert.Equal(t, int32(0), *so.Spec.MinReplicaCount)
+	assert.Equal(t, int32(5), *so.Spec.MaxReplicaCount)
+	assert.Equal(t, int32(60), *so.Spec.CooldownPeriod)
+
+	// KEDA compares the composite value against activationTarget to decide
+	// 0 -> 1, so it has to be 0 for the activation branch's 1.0 to wake it.
+	assert.Equal(t, "0", so.Spec.Advanced.ScalingModifiers.ActivationTarget)
+
+	// One trigger per metric, plus the readiness gate and the replica_count
+	// selector the formula branches on.
+	byName := map[string]map[string]string{}
+	for _, tr := range so.Spec.Triggers {
+		byName[tr.Name] = tr.Metadata
+	}
+	assert.Len(t, so.Spec.Triggers, 4)
+	assert.Contains(t, byName, "replica_count")
+	assert.Contains(t, byName, "readiness_gate")
+	assert.Equal(t, constants.AggregationReplicas, byName["replica_count"][constants.AggregationInMetadata])
+
+	// The EPP exposes its own Prometheus endpoint, so the trigger cannot rely
+	// on the scaler's Service-oriented defaults.
+	epp := byName["inference_pool_per_pod_queue_size"]
+	assert.Equal(t, "epp", epp[constants.MetricSourceInMetadata])
+	assert.Equal(t, "9090", epp[constants.MetricPortInMetadata])
+	assert.Equal(t, "/metrics", epp[constants.MetricPathInMetadata])
+	assert.NotContains(t, epp, constants.ZeroReplicaFallbackInMetadata)
+
+	// A backend metric cannot be scraped while parked, so it opts into
+	// reporting 0 rather than erroring on every poll.
+	backend := byName["vllm_num_requests_running"]
+	assert.Equal(t, "modelpod", backend[constants.MetricSourceInMetadata])
+	assert.Equal(t, "true", backend[constants.ZeroReplicaFallbackInMetadata])
+}
+
+// The scale-to-zero work must be inert for the configurations already running.
+func TestBuildScaledObject_NonZeroMinimumUnchanged(t *testing.T) {
+	is := &kaitov1beta1.InferenceSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-is", Namespace: "default", UID: "uid"},
+	}
+	b := Builder{ScalerNamespace: "kaito-workspace", ScalerServiceName: "kaito-scaler", ScalerGRPCPort: 9443}
+
+	cfg, err := parseMetricsConfig(metricsAnnotations(), 1)
+	assert.NoError(t, err)
+	so := b.buildScaledObject(is, 1, 5, cfg)
+
+	assert.Nil(t, so.Spec.CooldownPeriod)
+	assert.Empty(t, so.Spec.Advanced.ScalingModifiers.ActivationTarget)
+	assert.Len(t, so.Spec.Triggers, 3)
+	for _, tr := range so.Spec.Triggers {
+		assert.NotEqual(t, "replica_count", tr.Name)
+		assert.NotContains(t, tr.Metadata, constants.ZeroReplicaFallbackInMetadata)
+	}
+	assert.NotContains(t, so.Spec.Advanced.ScalingModifiers.Formula, "replica_count")
+}
+
+func TestBuildDesired_EqualPositiveReplicaBounds(t *testing.T) {
+	b := Builder{ScalerNamespace: "kaito-workspace", ScalerServiceName: "kaito-scaler", ScalerGRPCPort: 9443}
+
+	for _, replicas := range []int{1, 2} {
+		t.Run(fmt.Sprintf("fixed at %d", replicas), func(t *testing.T) {
+			is := &kaitov1beta1.InferenceSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-is",
+					Namespace:   "default",
+					UID:         "uid",
+					Annotations: metricsAnnotations(),
+				},
+			}
+
+			so, err := b.BuildDesired(is, replicas, replicas)
+			assert.NoError(t, err)
+			assert.Equal(t, int32(replicas), *so.Spec.MinReplicaCount)
+			assert.Equal(t, int32(replicas), *so.Spec.MaxReplicaCount)
+			assert.Equal(t,
+				"(readiness_gate == 1 && vllm_num_requests_waiting > 10 && vllm_request_queue_time_seconds > 1.5) ? 2.0 : ((vllm_num_requests_waiting < 2 && vllm_request_queue_time_seconds < 0.5) ? 0.5 : 1.0)",
+				so.Spec.Advanced.ScalingModifiers.Formula)
+		})
+	}
 }

@@ -207,6 +207,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		mgr.GetClient(),
 		map[string]metricsource.MetricSource{
 			metricsource.ModelPodSourceName: metricsource.NewModelPodSource(mgr.GetClient()),
+			metricsource.EPPSourceName:      metricsource.NewEPPSource(mgr.GetClient()),
 		},
 	)
 	lo.Must0(mgr.Add(runnable.NoLeaderElection(metricCache)))
@@ -216,12 +217,14 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	// listening, so the manager alone drives the full lifecycle.
 	lo.Must0(mgr.Add(scaler.NewRunnable(scaler.ServerConfig{
 		Port: opts.GrpcPort,
-		Service: scaler.NewKaitoScaler(
+		Service: scaler.NewKaitoScalerWithAPIReader(
 			mgr.GetClient(),
+			mgr.GetAPIReader(),
 			metricCache,
 			map[string]aggregator.Aggregator{
 				aggregator.SumAggregatorName:            aggregator.NewSumAggregator(),
 				aggregator.ServiceAverageAggregatorName: aggregator.NewServiceAverageAggregator(),
+				aggregator.ServiceSumAggregatorName:     aggregator.NewServiceSumAggregator(),
 				// The windowed-average aggregation is served by the metric cache
 				// itself (it holds the rolling snapshot window).
 				constants.AggregationWindowedAvg: metricCache,

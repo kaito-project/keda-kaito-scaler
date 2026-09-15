@@ -23,12 +23,8 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
 )
 
-func TestServiceSumAggregator_Name(t *testing.T) {
-	assert.Equal(t, ServiceSumAggregatorName, NewServiceSumAggregator().Name())
-}
-
-func TestServiceSumAggregator_Aggregate(t *testing.T) {
-	agg := NewServiceSumAggregator()
+func TestSumAggregator_Aggregate(t *testing.T) {
+	agg := NewSumAggregator()
 
 	tests := []struct {
 		name       string
@@ -47,11 +43,12 @@ func TestServiceSumAggregator_Aggregate(t *testing.T) {
 			name: "empty services errors",
 			snapshot: &metricsource.MetricSnapshot{
 				InferenceSet: types.NamespacedName{Namespace: "ns", Name: "is"},
+				Services:     nil,
 			},
 			wantErr: true,
 		},
 		{
-			name: "sums across services",
+			name: "sum over all successful services",
 			snapshot: &metricsource.MetricSnapshot{
 				Services: []metricsource.ServiceMetrics{
 					{Name: "a", Metrics: map[string]float64{"m": 10}},
@@ -63,77 +60,80 @@ func TestServiceSumAggregator_Aggregate(t *testing.T) {
 			wantValue:  40,
 		},
 		{
-			// Unlike the compensating sum aggregator, a service that could not
-			// be scraped must not be imputed from the threshold: the EPP set is
-			// the source of truth for demand, and inventing load for a missing
-			// replica would wake or hold a workload that has no work queued.
-			name: "failed service is skipped, not imputed",
+			name: "scale-down missing service compensated with threshold",
 			snapshot: &metricsource.MetricSnapshot{
 				Services: []metricsource.ServiceMetrics{
-					{Name: "a", Metrics: map[string]float64{"m": 3}},
-					{Name: "b", Err: errors.New("connection refused")},
+					{Name: "a", Metrics: map[string]float64{"m": 2}},
+					{Name: "b", Err: errors.New("scrape failed")},
 				},
 			},
 			metricName: "m",
-			threshold:  100,
-			wantValue:  3,
+			threshold:  10,
+			// success avg=2 (< threshold 10 => scale-down). sum becomes 2+10=12.
+			wantValue: 12,
 		},
 		{
-			// A Prometheus GaugeVec omits its series entirely until the first
-			// observation, so an idle EPP reports success with no sample. That
-			// is genuinely zero demand and must not be treated as an error, or
-			// a parked workload would poll a permanent TriggerError.
-			name: "scraped but metric absent counts as zero",
+			name: "scale-up missing service not compensated",
 			snapshot: &metricsource.MetricSnapshot{
 				Services: []metricsource.ServiceMetrics{
-					{Name: "a", Metrics: map[string]float64{"other": 7}},
-					{Name: "b", Metrics: map[string]float64{}},
+					{Name: "a", Metrics: map[string]float64{"m": 20}},
+					{Name: "b", Err: errors.New("scrape failed")},
 				},
 			},
 			metricName: "m",
-			threshold:  5,
-			wantValue:  0,
+			threshold:  10,
+			// success avg=20 (>= threshold 10 => scale-up). sum stays 20.
+			wantValue: 20,
 		},
 		{
-			// Nothing was scraped at all, which is an observability failure
-			// rather than an observation of zero, so it must surface as an error
-			// and let KEDA hold the current replica count.
-			name: "all services failed errors",
+			name: "metric name missing on a scraped service counts as zero",
 			snapshot: &metricsource.MetricSnapshot{
 				Services: []metricsource.ServiceMetrics{
-					{Name: "a", Err: errors.New("boom")},
-					{Name: "b", Err: errors.New("boom")},
+					{Name: "a", Metrics: map[string]float64{"m": 4}},
+					{Name: "b", Metrics: map[string]float64{"other": 99}},
 				},
 			},
 			metricName: "m",
-			wantErr:    true,
+			threshold:  10,
+			// Both services scraped OK; "b" lacks "m" so it contributes 0 and still
+			// counts as a real replica. successCount=2=total => no compensation.
+			wantValue: 4,
 		},
 		{
-			// Negative demand is meaningless and would corrupt the comparison
-			// against the activation threshold.
-			name: "negative total is clamped to zero",
+			name: "negative aggregated value is clamped to zero",
 			snapshot: &metricsource.MetricSnapshot{
 				Services: []metricsource.ServiceMetrics{
 					{Name: "a", Metrics: map[string]float64{"m": -5}},
+					{Name: "b", Metrics: map[string]float64{"m": -3}},
 				},
 			},
 			metricName: "m",
+			threshold:  10,
 			wantValue:  0,
+		},
+		{
+			name: "all services failed returns error",
+			snapshot: &metricsource.MetricSnapshot{
+				Services: []metricsource.ServiceMetrics{
+					{Name: "a", Err: errors.New("x")},
+					{Name: "b", Err: errors.New("y")},
+				},
+			},
+			metricName: "m",
+			threshold:  10,
+			wantErr:    true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := agg.Aggregate(tt.snapshot, AggregateInput{
-				MetricName: tt.metricName,
-				Threshold:  tt.threshold,
-			})
+			val, err := agg.Aggregate(tt.snapshot, AggregateInput{MetricName: tt.metricName, Threshold: tt.threshold})
 			if tt.wantErr {
 				assert.Error(t, err)
 				return
 			}
 			assert.NoError(t, err)
-			assert.Equal(t, tt.wantValue, got)
+			assert.InDelta(t, tt.wantValue, val, 1e-9)
 		})
 	}
 }

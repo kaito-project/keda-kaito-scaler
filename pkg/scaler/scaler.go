@@ -23,6 +23,8 @@ import (
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
@@ -31,6 +33,7 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/aggregator"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
+	inferencesetutil "github.com/kaito-project/keda-kaito-scaler/pkg/util/inferenceset"
 )
 
 const (
@@ -72,6 +75,10 @@ type Config struct {
 	Aggregation  string
 	// MetricCacheWindow is the rolling window for the "windowed-avg" aggregation.
 	MetricCacheWindow time.Duration
+	// ZeroReplicaFallback makes this trigger report 0 instead of scraping while
+	// the InferenceSet is parked or provisioning without a model Service. Set
+	// only on modelpod triggers of a ScaledObject whose minimum is 0.
+	ZeroReplicaFallback bool
 }
 
 // scrapeConfig projects the subset of Config needed by the metric source.
@@ -91,9 +98,10 @@ func (c *Config) scrapeConfig() metricsource.ScrapeConfig {
 // selects its aggregator via the aggregation metadata key; the readiness gate is
 // the only aggregation handled without an aggregators-map entry.
 type KaitoScaler struct {
-	kubeClient  client.Client
-	aggregators map[string]aggregator.Aggregator
-	cache       *MetricCache
+	kubeClient    client.Client
+	serviceReader client.Reader
+	aggregators   map[string]aggregator.Aggregator
+	cache         *MetricCache
 	externalscaler.UnimplementedExternalScalerServer
 }
 
@@ -102,10 +110,17 @@ type KaitoScaler struct {
 // every aggregation in the aggregators map, including the "windowed-avg"
 // aggregation (served by the cache itself); see cmd/app/manager.go.
 func NewKaitoScaler(kubeClient client.Client, cache *MetricCache, aggregators map[string]aggregator.Aggregator) *KaitoScaler {
+	return NewKaitoScalerWithAPIReader(kubeClient, kubeClient, cache, aggregators)
+}
+
+// NewKaitoScalerWithAPIReader uses apiReader for uncached Service lookups. This
+// avoids starting a Service informer for a point lookup that only needs get RBAC.
+func NewKaitoScalerWithAPIReader(kubeClient client.Client, apiReader client.Reader, cache *MetricCache, aggregators map[string]aggregator.Aggregator) *KaitoScaler {
 	return &KaitoScaler{
-		kubeClient:  kubeClient,
-		cache:       cache,
-		aggregators: aggregators,
+		kubeClient:    kubeClient,
+		serviceReader: apiReader,
+		cache:         cache,
+		aggregators:   aggregators,
 	}
 }
 
@@ -168,19 +183,51 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		return nil, err
 	}
 
-	// The readiness gate needs no scrape; it derives its value from the
-	// InferenceSet's replica readiness.
-	if scalerConfig.Aggregation == constants.AggregationGate {
-		inferenceSet := &kaitov1beta1.InferenceSet{}
-		if err := e.kubeClient.Get(ctx, client.ObjectKey{
-			Namespace: scalerConfig.InferenceSetNamespace,
-			Name:      scalerConfig.InferenceSetName,
-		}, inferenceSet); err != nil {
-			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get InferenceSet(%s) in Namespace(%s): %v", scalerConfig.InferenceSetName, scalerConfig.InferenceSetNamespace, err))
+	// The readiness gate and replica count need no scrape; both derive their
+	// value from the InferenceSet object itself.
+	if scalerConfig.Aggregation == constants.AggregationGate || scalerConfig.Aggregation == constants.AggregationReplicas {
+		inferenceSet, err := e.getInferenceSet(ctx, scalerConfig)
+		if err != nil {
+			return nil, err
 		}
-		value := readinessGateValue(inferenceSet)
-		klog.V(4).Infof("readiness gate for InferenceSet %s/%s: %f", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, value)
+		var value float64
+		if scalerConfig.Aggregation == constants.AggregationGate {
+			value = readinessGateValue(inferenceSet)
+			klog.V(4).Infof("readiness gate for InferenceSet %s/%s: %f", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, value)
+		} else {
+			value = float64(desiredReplicas(inferenceSet))
+			klog.V(4).Infof("replica count for InferenceSet %s/%s: %f", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, value)
+		}
 		return newMetricValueResponse(scalerConfig.MetricName, value), nil
+	}
+
+	// A parked or still-provisioning InferenceSet has no model Service to scrape,
+	// so a modelpod metric would otherwise report a scrape failure and freeze the
+	// composite formula. Report 0 until the Service exists. The scale-to-zero
+	// formula separately requires every activation signal to be idle, so queued
+	// EPP work vetoes parking while the backend is provisioning.
+	//
+	// Gated on the trigger's own opt-in rather than inferred, so a ScaledObject
+	// that cannot reach zero keeps treating a failed scrape as an error.
+	if scalerConfig.ZeroReplicaFallback && scalerConfig.MetricSource == metricsource.ModelPodSourceName {
+		inferenceSet, err := e.getInferenceSet(ctx, scalerConfig)
+		if err != nil {
+			return nil, err
+		}
+		if desiredReplicas(inferenceSet) == 0 {
+			klog.V(4).Infof("InferenceSet %s/%s is at zero replicas; reporting 0 for metric %q without scraping",
+				scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, scalerConfig.MetricName)
+			return newMetricValueResponse(scalerConfig.MetricName, 0), nil
+		}
+		hasService, err := e.hasModelService(ctx, inferenceSet)
+		if err != nil {
+			return nil, err
+		}
+		if !hasService {
+			klog.V(4).Infof("InferenceSet %s/%s has no model Service yet; reporting 0 for metric %q without scraping",
+				scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, scalerConfig.MetricName)
+			return newMetricValueResponse(scalerConfig.MetricName, 0), nil
+		}
 	}
 
 	if !e.cache.hasSource(scalerConfig.MetricSource) {
@@ -221,6 +268,25 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 	klog.V(4).Infof("aggregated metric %q for InferenceSet %s/%s: %f", scalerConfig.MetricName, scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, value)
 
 	return newMetricValueResponse(scalerConfig.MetricName, value), nil
+}
+
+func (e *KaitoScaler) hasModelService(ctx context.Context, inferenceSet *kaitov1beta1.InferenceSet) (bool, error) {
+	workspaces, err := inferencesetutil.ListWorkspaces(ctx, inferenceSet, e.kubeClient)
+	if err != nil {
+		return false, fmt.Errorf("failed to list workspaces for InferenceSet %s/%s: %w", inferenceSet.Namespace, inferenceSet.Name, err)
+	}
+	for i := range workspaces.Items {
+		workspace := &workspaces.Items[i]
+		service := &corev1.Service{}
+		err := e.serviceReader.Get(ctx, types.NamespacedName{Namespace: workspace.Namespace, Name: workspace.Name}, service)
+		if err == nil {
+			return true, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("failed to get model Service %s/%s: %w", workspace.Namespace, workspace.Name, err)
+		}
+	}
+	return false, nil
 }
 
 func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string) (*Config, error) {
@@ -317,6 +383,10 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		metricCacheWindow = time.Duration(secs) * time.Second
 	}
 
+	// Internal opt-in emitted by the provisioner for modelpod triggers that can
+	// reach zero replicas. Only the literal "true" enables the fallback.
+	zeroReplicaFallback := md[constants.ZeroReplicaFallbackInMetadata] == "true"
+
 	return &Config{
 		InferenceSetName:      inferenceSetName,
 		InferenceSetNamespace: inferenceSetNamespace,
@@ -329,6 +399,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		MetricSource:          metricSource,
 		Aggregation:           aggregation,
 		MetricCacheWindow:     metricCacheWindow,
+		ZeroReplicaFallback:   zeroReplicaFallback,
 	}, nil
 }
 
@@ -336,11 +407,40 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 // threshold, so callers need not supply it in the trigger metadata.
 func thresholdOptional(aggregation string) bool {
 	switch aggregation {
-	case aggregator.ServiceAverageAggregatorName, constants.AggregationWindowedAvg, constants.AggregationGate:
+	case aggregator.ServiceAverageAggregatorName, aggregator.ServiceSumAggregatorName,
+		constants.AggregationWindowedAvg, constants.AggregationGate, constants.AggregationReplicas:
 		return true
 	default:
 		return false
 	}
+}
+
+// getInferenceSet fetches the InferenceSet a trigger refers to. Shared by the
+// status-derived aggregations and the zero-replica short-circuit, all of which
+// answer from the object rather than a scrape.
+func (e *KaitoScaler) getInferenceSet(ctx context.Context, cfg *Config) (*kaitov1beta1.InferenceSet, error) {
+	inferenceSet := &kaitov1beta1.InferenceSet{}
+	if err := e.kubeClient.Get(ctx, client.ObjectKey{
+		Namespace: cfg.InferenceSetNamespace,
+		Name:      cfg.InferenceSetName,
+	}, inferenceSet); err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get InferenceSet(%s) in Namespace(%s): %v", cfg.InferenceSetName, cfg.InferenceSetNamespace, err))
+	}
+	return inferenceSet, nil
+}
+
+// desiredReplicas returns the InferenceSet's desired replica count.
+//
+// It reads spec.replicas rather than status.readyReplicas deliberately: a
+// mid-scale-up state (replicas=1, ready=0) must not look like zero replicas, or
+// the formula would route back into the activation branch. spec.replicas is also
+// what KEDA itself reads.
+func desiredReplicas(is *kaitov1beta1.InferenceSet) int {
+	// Defensive only: the field carries a server-side default of 1.
+	if is.Spec.Replicas == nil {
+		return 1
+	}
+	return int(*is.Spec.Replicas)
 }
 
 // readinessGateValue returns 1 when every desired replica is ready

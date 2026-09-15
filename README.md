@@ -11,7 +11,8 @@ The KEDA Kaito Scaler provides intelligent autoscaling for vLLM inference worklo
 - **🚀 Zero Dependencies**: No Prometheus stack required - directly scrapes metrics from inference pods
 - **⚡ Simple Configuration**: Minimal YAML configuration with intelligent defaults
 - **🎯 GPU-Optimized**: Conservative scaling policies designed for expensive GPU resources
-- **🔒 Secure by Default**: Built-in TLS authentication between components
+- **� Scale to Zero**: Optionally release GPU capacity entirely while idle and reacquire it on the next request
+- **�🔒 Secure by Default**: Built-in TLS authentication between components
 - **📊 Smart Fallback**: Intelligent handling of missing metrics to prevent scaling flapping
 - **🔧 Minimal Maintenance**: Self-managing certificates and authentication
 
@@ -135,10 +136,19 @@ Each entry in the `metrics` list accepts the following fields:
 | --- | --- | --- | --- |
 | `name` | yes | – | Prometheus metric name. |
 | `type` | yes | – | Aggregation: `gauge` → per-replica average across pods; `histogram` → average over the metric cache window. Both are replica-count independent. |
-| `source` | no | `modelpod` | Where the metric is scraped. Only `modelpod` (the model-serving pods behind the `InferenceSet`'s workspace `Service`s) is supported. |
-| `upthreshold` | yes | – | Scale-up threshold (float). |
-| `downthreshold` | yes | – | Scale-down threshold (float). Must be `<= upthreshold`. |
+| `source` | no | `modelpod` | Where the metric is scraped. `modelpod` reads the model-serving pods behind the `InferenceSet`'s workspace `Service`s. `epp` reads the Endpoint Picker, which keeps reporting while the workload is parked at zero replicas — see [Scale to zero](#scale-to-zero). |
+| `aggregation` | no | derived from `type` and `source` | Overrides the derived reduction. One of `sum`, `service-avg`, `service-sum`, `windowed-avg`. `windowed-avg` is only valid for `histogram`; the others only for `gauge`. |
+| `upthreshold` | yes¹ | – | Scale-up threshold (float) for the 1..N range. |
+| `downthreshold` | yes¹ | – | Scale-down threshold (float) for the 1..N range. Must be `<= upthreshold`. |
+| `activationthreshold` | no² | – | Wake threshold for the 0 → 1 transition. Requires `min-replicas: "0"` and `source: epp`. |
+| `deactivationthreshold` | no² | – | Park threshold for the 1 → 0 transition. Requires `min-replicas: "0"`. Must be `<= activationthreshold` when both are set on the same metric. |
 | `metriccachewindow` | no | `300` | Rolling cache window in **seconds** over which a `histogram` metric is averaged. Each histogram metric may set its own; rejected on `gauge` metrics. |
+
+¹ Required unless `min-replicas` is `"0"`, where a metric may carry only an
+activation/deactivation band. They must still be declared together, and at least
+one metric must declare them whenever `max-replicas` is greater than 1.
+
+² Only accepted when `min-replicas` is `"0"`.
 
 The remaining global annotations:
 
@@ -150,8 +160,9 @@ The remaining global annotations:
 | `evaluationwindow` | no | `60` | Scale-up stabilization window (seconds). |
 | `scaleupcooldown` | no | `300` | Minimum seconds between scale-up steps. |
 | `scaledowncooldown` | no | `300` | Minimum seconds between scale-down steps. |
-| `min-replicas` | no | `1` | Minimum replica count. Values `<= 1` collapse to `1`. |
-| `max-replicas` | no | derived from `spec.nodeCountLimit` | Maximum replica count. Must be `> 1` and `>= min-replicas`; if absent, `spec.nodeCountLimit` must be set. |
+| `min-replicas` | no | `1` | Minimum replica count. `0` enables [scale to zero](#scale-to-zero); any other value below `1`, or a non-numeric value, collapses to `1`. |
+| `max-replicas` | no | derived from `spec.nodeCountLimit` | Maximum replica count. Must be at least `1` and `>= min-replicas`; if absent, `spec.nodeCountLimit` must be set. |
+| `cooldownperiod` | no | `300` | Seconds KEDA waits after the last active trigger reading before parking the workload at zero. Requires `min-replicas: "0"`. |
 
 ##### Single-metric example
 
@@ -471,6 +482,152 @@ spec:
 > metric is compared against a *fixed* threshold, its value must be
 > **replica-count independent** — that's why `gauge` is averaged per replica and
 > `histogram` is averaged over its metric cache window.
+
+##### Scale to zero
+
+Setting `scaledobject.kaito.sh/min-replicas: "0"` lets the `InferenceSet` release
+its GPU capacity entirely while idle and reacquire it on the next request.
+
+The 1..N range keeps working exactly as described above. Scale to zero adds the
+0 ↔ 1 edge, which is driven by a separate pair of thresholds:
+
+- **`activationthreshold`** wakes the workload. Any single metric crossing it is
+  enough (an **OR**), because a request that cannot be served is reason enough to
+  start.
+- **`deactivationthreshold`** parks it. *Every* metric that declares one must
+  agree the workload is idle (an **AND**), and the wait before parking is
+  governed by `cooldownperiod`.
+
+###### Why activation has to come from the Endpoint Picker
+
+At zero replicas there are no model pods left to scrape, so a `modelpod` metric
+cannot report the demand that should wake the workload. The **Endpoint Picker**
+(EPP) — the inference gateway's router — keeps running regardless of the replica
+count and observes requests as they arrive, so it is the only source that can
+carry an `activationthreshold`. Set `source: epp` on that metric.
+
+The EPP is scraped **per pod** (port `9090`, path `/metrics`) and its gauges are
+**summed** across router replicas, since queue depth is only meaningful as a
+total. That is why `epp` gauges default to the `service-sum` aggregation instead
+of `service-avg`.
+
+Deactivation, by contrast, must include at least one `modelpod`-sourced metric.
+The router's own view can go quiet while a replica is still generating tokens for
+an in-flight request, so parking on the router's signal alone risks stopping work
+that is still in progress.
+
+###### Prerequisites
+
+Scale to zero depends on the EPP, which KAITO only creates when **all** of the
+following hold:
+
+1. KAITO is installed with the Gateway API Inference Extension feature gate
+   enabled.
+2. The `InferenceSet` uses the **vLLM** runtime with a **preset** inference
+   template.
+3. At least one `Workspace` exists for the `InferenceSet` — KAITO does not
+   reconcile the EPP before then, so a freshly created `InferenceSet` has no EPP
+   for its first few reconciles.
+
+If no EPP pod is found, the controller still provisions the `ScaledObject` but
+emits an `EPPNotFound` warning `Event` naming the label selector it looked for.
+Condition 3 resolves on its own; conditions 1 and 2 do not.
+
+`InferenceSet`s owned by a `MultiRoleInference` are **rejected** for scale to
+zero (`UnsupportedTopology` warning `Event`): KAITO gives the group a single
+shared EPP, so a child has none of its own and could be parked but never woken.
+
+###### What waking actually depends on
+
+The EPP reports **buffered** demand, not rejected demand. A request only shows up
+in the metrics once it has reached the router and is waiting for a backend, so
+the activation contract is:
+
+- A request that arrives while the workload is parked is what triggers the wake.
+  Whether that request survives the cold start depends on the client's timeout
+  and on the gateway's request-buffering configuration.
+- Traffic that sits persistently *below* the activation threshold never wakes the
+  workload. Choose an `activationthreshold` of `0` unless you deliberately want a
+  minimum demand level before paying for a GPU.
+- Cold start is not instant: the workload has to acquire a node, pull the model
+  and become Ready. Size `cooldownperiod` against how often you are willing to
+  pay that cost.
+
+###### Example
+
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: kaito.sh/v1beta1
+kind: InferenceSet
+metadata:
+  annotations:
+    scaledobject.kaito.sh/auto-provision: "true"
+    scaledobject.kaito.sh/min-replicas: "0"
+    scaledobject.kaito.sh/max-replicas: "5"
+
+    # Wait 10 minutes of idleness before releasing the GPU.
+    scaledobject.kaito.sh/cooldownperiod: "600"
+
+    scaledobject.kaito.sh/metrics: |
+      # 0 -> 1: any request queued at the router wakes the workload.
+      - name: inference_pool_per_pod_queue_size
+        type: gauge
+        source: epp
+        activationthreshold: 0
+      # 1 -> 0: park only once the backend itself is idle.
+      # 1 <-> N: the usual up/down band.
+      - name: vllm:num_requests_running
+        type: gauge
+        deactivationthreshold: 0
+        upthreshold: 10
+        downthreshold: 2
+  name: phi-4
+  namespace: default
+spec:
+  labelSelector:
+    matchLabels:
+      apps: phi-4
+  replicas: 1
+  nodeCountLimit: 5
+  template:
+    inference:
+      preset:
+        accessMode: public
+        name: phi-4-mini-instruct
+    resource:
+      instanceType: Standard_NC24ads_A100_v4
+EOF
+```
+
+This renders a formula that branches on the current replica count before
+applying either decision:
+
+```text
+(replica_count == 0)
+  ? ((inference_pool_per_pod_queue_size > 0) ? 1.0 : 0.0)   // 0 -> 1
+  : ((vllm_num_requests_running <= 0)        ? 0.0          // 1 -> 0
+     : ((readiness_gate == 1 && vllm_num_requests_running > 10) ? 2.0   // scale up
+        : ((vllm_num_requests_running < 2)                      ? 0.5   // scale down
+           : 1.0)))                                                     // hold
+```
+
+`replica_count` is a synthetic trigger the scaler serves from the
+`InferenceSet`'s desired replica count; it is reserved as a metric name while
+`min-replicas` is `"0"`. Backend (`modelpod`) triggers report `0` instead of
+failing while the workload is parked, so KEDA sees a clean reading rather than a
+`TriggerError` on every poll.
+
+When `max-replicas` is `1` there is no 1..N range, so the up/down band must be
+omitted entirely and the formula collapses to the 0 ↔ 1 decision.
+
+###### Limitations
+
+- Removing `min-replicas: "0"` from a running `InferenceSet` that is currently
+  parked leaves it at zero until something wakes it; KEDA raises the floor but
+  does not itself scale the workload back up.
+- Every metric carrying an `activationthreshold` must use `source: epp`; there is
+  no way to supply a custom EPP selector, as the name is derived from the
+  `InferenceSet` name.
 
 #### Option 2: Manual mode (recommended for time-based scaling)
 

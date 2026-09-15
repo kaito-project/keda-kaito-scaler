@@ -17,20 +17,26 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"testing"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
 )
 
 func TestResolveMinReplicas(t *testing.T) {
@@ -50,9 +56,9 @@ func TestResolveMinReplicas(t *testing.T) {
 			expected:    1,
 		},
 		{
-			name:        "annotation value less than 1 is clamped to 1",
+			name:        "explicit zero requests scale-to-zero",
 			annotations: map[string]string{constants.AnnotationKeyMinReplicas: "0"},
-			expected:    1,
+			expected:    0,
 		},
 		{
 			name:        "annotation value equal to 1 returns 1",
@@ -220,10 +226,12 @@ func compositeAnnotations() map[string]string {
 	}
 }
 
-func TestAutoscalingConfigValid_Composite(t *testing.T) {
+func TestAutoscalingConfigError_Composite(t *testing.T) {
 	t.Run("valid composite enabled", func(t *testing.T) {
 		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: compositeAnnotations()}}
-		assert.True(t, autoscalingConfigValid(is))
+		reason, err := autoscalingConfigError(is, 1)
+		assert.NoError(t, err)
+		assert.Empty(t, reason)
 	})
 
 	t.Run("invalid composite disabled", func(t *testing.T) {
@@ -235,7 +243,9 @@ func TestAutoscalingConfigValid_Composite(t *testing.T) {
   downthreshold: 2
 `
 		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}
-		assert.False(t, autoscalingConfigValid(is))
+		reason, err := autoscalingConfigError(is, 1)
+		assert.Error(t, err)
+		assert.Equal(t, reasonInvalidConfig, reason)
 	})
 
 	t.Run("single metric config accepted", func(t *testing.T) {
@@ -249,7 +259,9 @@ func TestAutoscalingConfigValid_Composite(t *testing.T) {
   downthreshold: 1
 `,
 		}}}
-		assert.True(t, autoscalingConfigValid(is))
+		reason, err := autoscalingConfigError(is, 1)
+		assert.NoError(t, err)
+		assert.Empty(t, reason)
 	})
 
 	t.Run("no metrics rejected", func(t *testing.T) {
@@ -257,7 +269,47 @@ func TestAutoscalingConfigValid_Composite(t *testing.T) {
 			constants.AnnotationKeyAutoProvision: "true",
 			constants.AnnotationKeyMaxReplicas:   "5",
 		}}}
-		assert.False(t, autoscalingConfigValid(is))
+		reason, err := autoscalingConfigError(is, 1)
+		assert.Error(t, err)
+		assert.Equal(t, reasonInvalidConfig, reason)
+	})
+
+	t.Run("unparseable max-replicas rejected as replica range", func(t *testing.T) {
+		ann := compositeAnnotations()
+		ann[constants.AnnotationKeyMaxReplicas] = "abc"
+		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}
+		reason, err := autoscalingConfigError(is, 1)
+		assert.Error(t, err)
+		assert.Equal(t, reasonInvalidReplicaRange, reason)
+	})
+
+	for _, replicas := range []int{1, 2} {
+		t.Run(fmt.Sprintf("max-replicas equal to min accepted at %d", replicas), func(t *testing.T) {
+			ann := compositeAnnotations()
+			ann[constants.AnnotationKeyMaxReplicas] = strconv.Itoa(replicas)
+			is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}
+			reason, err := autoscalingConfigError(is, replicas)
+			assert.NoError(t, err)
+			assert.Empty(t, reason)
+		})
+	}
+
+	t.Run("zero max-replicas rejected as replica range", func(t *testing.T) {
+		ann := compositeAnnotations()
+		ann[constants.AnnotationKeyMaxReplicas] = "0"
+		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}
+		reason, err := autoscalingConfigError(is, 0)
+		assert.ErrorContains(t, err, "must be at least 1")
+		assert.Equal(t, reasonInvalidReplicaRange, reason)
+	})
+
+	t.Run("no max-replicas and no node count limit rejected as replica range", func(t *testing.T) {
+		ann := compositeAnnotations()
+		delete(ann, constants.AnnotationKeyMaxReplicas)
+		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}
+		reason, err := autoscalingConfigError(is, 1)
+		assert.Error(t, err)
+		assert.Equal(t, reasonInvalidReplicaRange, reason)
 	})
 }
 
@@ -282,6 +334,7 @@ func newReconcileFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	scheme := runtime.NewScheme()
 	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
 	assert.NoError(t, v1alpha1.AddToScheme(scheme))
+	assert.NoError(t, corev1.AddToScheme(scheme))
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 }
 
@@ -374,5 +427,306 @@ func TestReconcile_CleanupWhenAutoProvisionDisabled(t *testing.T) {
 		var got v1alpha1.ScaledObject
 		err = c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "user-so"}, &got)
 		assert.NoError(t, err, "user-managed ScaledObject should be preserved")
+	})
+}
+
+// The CooldownPeriod is only set for scale-to-zero, so it is the one managed
+// field that can legitimately go from unset to set (and back) on an existing
+// ScaledObject. It has to be reconciled or a user toggling the annotation would
+// keep KEDA's old idle delay forever.
+func TestReconcileTo_CooldownPeriod(t *testing.T) {
+	is := &kaitov1beta1.InferenceSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-is", Namespace: "default", UID: types.UID("is-uid")},
+	}
+
+	tests := []struct {
+		name     string
+		existing *int32
+		desired  *int32
+		want     *int32
+	}{
+		{name: "adopts a newly set cooldown", existing: nil, desired: ptr.To(int32(60)), want: ptr.To(int32(60))},
+		{name: "clears a removed cooldown", existing: ptr.To(int32(60)), desired: nil, want: nil},
+		{name: "follows a changed cooldown", existing: ptr.To(int32(60)), desired: ptr.To(int32(120)), want: ptr.To(int32(120))},
+		{name: "leaves an unchanged cooldown alone", existing: ptr.To(int32(60)), desired: ptr.To(int32(60)), want: ptr.To(int32(60))},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			existing := newManagedScaledObject("test-is-so", is)
+			existing.Spec.CooldownPeriod = tt.existing
+			desired := newManagedScaledObject("test-is-so", is)
+			desired.Spec.CooldownPeriod = tt.desired
+
+			c := newReconcileFakeClient(t, is, existing)
+			ctrl := &Controller{Client: c}
+			assert.NoError(t, ctrl.reconcileTo(context.Background(), existing, desired))
+
+			var got v1alpha1.ScaledObject
+			assert.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-is-so"}, &got))
+			assert.Equal(t, tt.want, got.Spec.CooldownPeriod)
+		})
+	}
+}
+
+// scaleToZeroIS builds an InferenceSet whose annotations request scale-to-zero
+// with an otherwise valid metric configuration.
+func scaleToZeroIS(name, namespace string) *kaitov1beta1.InferenceSet {
+	return &kaitov1beta1.InferenceSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			UID:       types.UID(name + "-uid"),
+			Annotations: map[string]string{
+				constants.AnnotationKeyAutoProvision: "true",
+				constants.AnnotationKeyMinReplicas:   "0",
+				constants.AnnotationKeyMaxReplicas:   "3",
+				constants.AnnotationKeyMetrics: `
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  activationthreshold: 0
+- name: vllm:num_requests_running
+  type: gauge
+  deactivationthreshold: 0
+  upthreshold: 10
+  downthreshold: 2
+`,
+			},
+		},
+	}
+}
+
+func eventsFrom(t *testing.T, recorder *record.FakeRecorder) []string {
+	t.Helper()
+	var events []string
+	for {
+		select {
+		case e := <-recorder.Events:
+			events = append(events, e)
+		default:
+			return events
+		}
+	}
+}
+
+func containsEvent(events []string, reason string) bool {
+	for _, e := range events {
+		if strings.Contains(e, reason) {
+			return true
+		}
+	}
+	return false
+}
+
+// A rejected configuration must tell the user why. Without an Event the only
+// symptom is a ScaledObject that never appears, which is indistinguishable from
+// the controller not running at all.
+func TestReconcile_InvalidConfigIsReported(t *testing.T) {
+	tests := []struct {
+		name           string
+		mutate         func(is *kaitov1beta1.InferenceSet)
+		expectedReason string
+	}{
+		{
+			name: "unknown metric type",
+			mutate: func(is *kaitov1beta1.InferenceSet) {
+				is.Annotations[constants.AnnotationKeyMetrics] = `
+- name: vllm:num_requests_running
+  type: bogus
+  upthreshold: 10
+  downthreshold: 2
+`
+			},
+			expectedReason: reasonInvalidConfig,
+		},
+		{
+			name: "metrics annotation absent",
+			mutate: func(is *kaitov1beta1.InferenceSet) {
+				delete(is.Annotations, constants.AnnotationKeyMetrics)
+			},
+			expectedReason: reasonInvalidConfig,
+		},
+		{
+			name: "max-replicas not an integer",
+			mutate: func(is *kaitov1beta1.InferenceSet) {
+				is.Annotations[constants.AnnotationKeyMaxReplicas] = "abc"
+			},
+			expectedReason: reasonInvalidReplicaRange,
+		},
+		{
+			name: "max-replicas below min-replicas",
+			mutate: func(is *kaitov1beta1.InferenceSet) {
+				is.Annotations[constants.AnnotationKeyMinReplicas] = "3"
+				is.Annotations[constants.AnnotationKeyMaxReplicas] = "2"
+			},
+			expectedReason: reasonInvalidReplicaRange,
+		},
+		{
+			name: "no max-replicas and no node count limit",
+			mutate: func(is *kaitov1beta1.InferenceSet) {
+				delete(is.Annotations, constants.AnnotationKeyMaxReplicas)
+			},
+			expectedReason: reasonInvalidReplicaRange,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			is := scaleToZeroIS("test-is", "default")
+			tt.mutate(is)
+
+			c := newReconcileFakeClient(t, is)
+			recorder := record.NewFakeRecorder(10)
+			ctrl := &Controller{Client: c, Recorder: recorder}
+
+			_, err := ctrl.Reconcile(context.Background(), is)
+			assert.NoError(t, err)
+
+			var sos v1alpha1.ScaledObjectList
+			assert.NoError(t, c.List(context.Background(), &sos))
+			assert.Empty(t, sos.Items, "no ScaledObject should be provisioned")
+			assert.True(t, containsEvent(eventsFrom(t, recorder), tt.expectedReason),
+				"expected a %s Event", tt.expectedReason)
+
+			// The watch predicate must not filter the object out, or Reconcile
+			// would never run to emit the Event in a real cluster.
+			assert.True(t, generateInferenceSetPredicateFunc().Create(event.CreateEvent{Object: is}))
+		})
+	}
+}
+
+func TestReconcile_EqualPositiveReplicaBounds(t *testing.T) {
+	for _, replicas := range []int{1, 2} {
+		t.Run(fmt.Sprintf("fixed at %d", replicas), func(t *testing.T) {
+			is := scaleToZeroIS("test-is", "default")
+			is.Annotations[constants.AnnotationKeyMinReplicas] = strconv.Itoa(replicas)
+			is.Annotations[constants.AnnotationKeyMaxReplicas] = strconv.Itoa(replicas)
+			is.Annotations[constants.AnnotationKeyMetrics] = `
+- name: vllm:num_requests_running
+  type: gauge
+  upthreshold: 10
+  downthreshold: 2
+`
+
+			c := newReconcileFakeClient(t, is)
+			recorder := record.NewFakeRecorder(10)
+			ctrl := &Controller{Client: c, Recorder: recorder}
+
+			_, err := ctrl.Reconcile(context.Background(), is)
+			assert.NoError(t, err)
+
+			var sos v1alpha1.ScaledObjectList
+			assert.NoError(t, c.List(context.Background(), &sos))
+			if assert.Len(t, sos.Items, 1) {
+				assert.Equal(t, int32(replicas), *sos.Items[0].Spec.MinReplicaCount)
+				assert.Equal(t, int32(replicas), *sos.Items[0].Spec.MaxReplicaCount)
+			}
+			assert.Empty(t, eventsFrom(t, recorder))
+		})
+	}
+}
+
+// KAITO gives a MultiRoleInference a single Endpoint Picker shared by all of its
+// children, so a child InferenceSet has no EPP of its own and could never
+// observe an activation signal. Provisioning one anyway would leave a workload
+// that can be parked but never woken.
+func TestReconcile_ScaleToZeroRejectedForMultiRoleInference(t *testing.T) {
+	is := scaleToZeroIS("test-is", "default")
+	is.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "kaito.sh/v1beta1",
+		Kind:       constants.MultiRoleInference,
+		Name:       "mri-1",
+		UID:        types.UID("mri-uid"),
+		Controller: ptr.To(true),
+	}}
+
+	c := newReconcileFakeClient(t, is)
+	recorder := record.NewFakeRecorder(10)
+	ctrl := &Controller{Client: c, Recorder: recorder}
+
+	_, err := ctrl.Reconcile(context.Background(), is)
+	assert.NoError(t, err)
+
+	var sos v1alpha1.ScaledObjectList
+	assert.NoError(t, c.List(context.Background(), &sos))
+	assert.Empty(t, sos.Items, "no ScaledObject should be provisioned")
+	assert.True(t, containsEvent(eventsFrom(t, recorder), "UnsupportedTopology"))
+
+	// A MultiRoleInference child is only rejected for scale-to-zero; the
+	// ordinary 1..N configuration keeps working.
+	is2 := scaleToZeroIS("test-is-2", "default")
+	is2.OwnerReferences = is.OwnerReferences
+	is2.Annotations[constants.AnnotationKeyMinReplicas] = "1"
+	is2.Annotations[constants.AnnotationKeyMetrics] = `
+- name: vllm:num_requests_running
+  type: gauge
+  upthreshold: 10
+  downthreshold: 2
+`
+	c2 := newReconcileFakeClient(t, is2)
+	ctrl2 := &Controller{Client: c2, Recorder: record.NewFakeRecorder(10)}
+	_, err = ctrl2.Reconcile(context.Background(), is2)
+	assert.NoError(t, err)
+
+	assert.NoError(t, c2.List(context.Background(), &sos))
+	assert.Len(t, sos.Items, 1)
+}
+
+// A missing EPP means nothing can observe the activation threshold, but KAITO
+// does not create one until the first Workspace exists. Warning rather than
+// rejecting keeps ordinary startup from being blocked.
+func TestReconcile_ScaleToZeroWarnsWhenEPPMissing(t *testing.T) {
+	t.Run("warns and still provisions", func(t *testing.T) {
+		is := scaleToZeroIS("test-is", "default")
+		c := newReconcileFakeClient(t, is)
+		recorder := record.NewFakeRecorder(10)
+		ctrl := &Controller{Client: c, Recorder: recorder}
+
+		_, err := ctrl.Reconcile(context.Background(), is)
+		assert.NoError(t, err)
+
+		var sos v1alpha1.ScaledObjectList
+		assert.NoError(t, c.List(context.Background(), &sos))
+		assert.Len(t, sos.Items, 1, "provisioning must not be blocked on the EPP")
+		assert.True(t, containsEvent(eventsFrom(t, recorder), "EPPNotFound"))
+	})
+
+	t.Run("stays quiet once the EPP exists", func(t *testing.T) {
+		is := scaleToZeroIS("test-is", "default")
+		epp := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "epp-1",
+				Namespace: "default",
+				Labels:    map[string]string{metricsource.EPPNameLabel: metricsource.EPPName(is.Name)},
+			},
+		}
+		c := newReconcileFakeClient(t, is, epp)
+		recorder := record.NewFakeRecorder(10)
+		ctrl := &Controller{Client: c, Recorder: recorder}
+
+		_, err := ctrl.Reconcile(context.Background(), is)
+		assert.NoError(t, err)
+		assert.False(t, containsEvent(eventsFrom(t, recorder), "EPPNotFound"))
+	})
+
+	// The EPP is irrelevant when the workload never reaches zero, so the check
+	// must not fire for existing configurations.
+	t.Run("not evaluated for a non-zero minimum", func(t *testing.T) {
+		is := scaleToZeroIS("test-is", "default")
+		is.Annotations[constants.AnnotationKeyMinReplicas] = "1"
+		is.Annotations[constants.AnnotationKeyMetrics] = `
+- name: vllm:num_requests_running
+  type: gauge
+  upthreshold: 10
+  downthreshold: 2
+`
+		c := newReconcileFakeClient(t, is)
+		recorder := record.NewFakeRecorder(10)
+		ctrl := &Controller{Client: c, Recorder: recorder}
+
+		_, err := ctrl.Reconcile(context.Background(), is)
+		assert.NoError(t, err)
+		assert.False(t, containsEvent(eventsFrom(t, recorder), "EPPNotFound"))
 	})
 }

@@ -77,10 +77,24 @@ const (
 	scaleDownMultiplier = "0.5"
 	holdMultiplier      = "1.0"
 
+	// activateMultiplier and deactivateMultiplier drive the 0 <-> 1 transitions.
+	// KEDA evaluates those against ScalingModifiers.ActivationTarget on the
+	// scaleFromZeroOrIdle path, which bypasses the HPA entirely: only "strictly
+	// greater than the target" is compared, so the magnitude is discarded and
+	// 1.0 is used rather than scaleUpMultiplier.
+	activateMultiplier   = "1.0"
+	deactivateMultiplier = "0.0"
+
 	// scalingTarget is the scalingModifiers target. It must stay "1" so the
 	// formula output maps directly to the desired-to-current replica ratio; it
 	// also has to be > 0 for KEDA to create the scaler at all.
 	scalingTarget = "1"
+
+	// activationTarget is the scalingModifiers activation target. The formula's
+	// activate/deactivate multipliers are compared against it on KEDA's
+	// scale-from-zero path, so it must stay "0": activateMultiplier is strictly
+	// above it and deactivateMultiplier is equal to it.
+	activationTarget = "0"
 
 	// gateTriggerName is the reserved trigger/variable name for the readiness
 	// gate in the scalingModifiers formula. Metric triggers instead use their
@@ -88,14 +102,31 @@ const (
 	// of the real metrics rather than opaque indexed placeholders.
 	gateTriggerName = "readiness_gate"
 
+	// replicaCountTriggerName is the reserved trigger/variable name carrying the
+	// InferenceSet's desired replica count. A scale-to-zero formula needs it to
+	// tell the 0 -> 1 branch apart from the 1 <-> N branches, since the formula
+	// itself has no other view of the current scale.
+	replicaCountTriggerName = "replica_count"
+
 	// defaultMetricCacheWindow is the cache window (seconds) applied to a
 	// histogram metric when its per-metric metriccachewindow field is absent.
 	defaultMetricCacheWindow = 300
+
+	// eppMetricsPort and eppMetricsPath address the Endpoint Picker's Prometheus
+	// endpoint. Emitted explicitly on epp triggers because the scaler's defaults
+	// describe the workspace Service instead.
+	eppMetricsPort = "9090"
+	eppMetricsPath = "/metrics"
 
 	// Defaults (seconds) when the corresponding annotation is absent.
 	defaultEvaluationWindow  = 60
 	defaultScaleUpCooldown   = 300
 	defaultScaleDownCooldown = 300
+
+	// defaultCooldownPeriod is KEDA's own default for the delay before scaling
+	// to zero. Set explicitly so the rendered ScaledObject states the value it
+	// is actually running with.
+	defaultCooldownPeriod = 300
 
 	// scalingTolerance must be strictly below the scale-down multiplier's
 	// distance from 1 (|0.5 - 1| = 0.5) so a 0.5 ratio still triggers a
@@ -116,8 +147,11 @@ type Builder struct {
 // and returns the desired ScaledObject, or an error when the configuration is
 // invalid.
 func (b Builder) BuildDesired(is *kaitov1beta1.InferenceSet, minReplicas, maxReplicas int) (*v1alpha1.ScaledObject, error) {
-	cfg, err := parseMetricsConfig(is.Annotations)
+	cfg, err := parseMetricsConfig(is.Annotations, minReplicas)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateReplicaRange(cfg, minReplicas, maxReplicas); err != nil {
 		return nil, err
 	}
 	return b.buildScaledObject(is, minReplicas, maxReplicas, cfg), nil
@@ -166,42 +200,90 @@ type metric struct {
 	// source is the metric source name that produces this metric (from the metricsource
 	// annotation; defaults to "modelpod").
 	source string
-	// aggregation is derived from the metricstype annotation: "service-avg" for
-	// gauge metrics, "windowed-avg" for histogram metrics.
+	// aggregation is derived from the metricstype annotation ("service-avg" for
+	// gauge metrics, "windowed-avg" for histogram metrics) unless the entry
+	// overrides it explicitly.
 	aggregation   string
 	upThreshold   string
 	downThreshold string
+	// activationThreshold and deactivationThreshold drive the 0 -> 1 and 1 -> 0
+	// branches respectively. Both are empty unless the ScaledObject's minimum is
+	// 0, where at least one metric must supply each side.
+	activationThreshold   string
+	deactivationThreshold string
 	// metricCacheWindow is the cache window in seconds (as a string, e.g. "300")
 	// for histogram metrics using the windowed-avg aggregation; empty for gauge
 	// metrics.
 	metricCacheWindow string
 }
 
-// aggregationForMetricsType maps a metricstype annotation value to the scaler
-// aggregation used to reduce the scraped snapshot. metricstype is required, so an
-// empty or unknown value is rejected.
-func aggregationForMetricsType(t string) (string, error) {
-	switch t {
+// hasUpDownBand reports whether the entry participates in the 1 <-> N range.
+func (m metric) hasUpDownBand() bool { return m.upThreshold != "" && m.downThreshold != "" }
+
+// userSelectableAggregations are the aggregations an entry may name explicitly
+// via the aggregation field. The pseudo-aggregations backing the readiness gate
+// and the replica-count trigger are deliberately excluded: they report from the
+// InferenceSet's status rather than a scrape
+var userSelectableAggregations = map[string]struct{}{
+	aggregator.SumAggregatorName:            {},
+	aggregator.ServiceAverageAggregatorName: {},
+	aggregator.ServiceSumAggregatorName:     {},
+	constants.AggregationWindowedAvg:        {},
+}
+
+// aggregationForSpec resolves the aggregation for one entry, preferring an
+// explicit override over the source- or type-derived default.
+func aggregationForSpec(spec metricSpec, source string) (string, error) {
+	var derived string
+	switch spec.Type {
 	case metricsTypeGauge:
-		return aggregator.ServiceAverageAggregatorName, nil
+		derived = aggregator.ServiceAverageAggregatorName
 	case metricsTypeHistogram:
-		return constants.AggregationWindowedAvg, nil
+		derived = constants.AggregationWindowedAvg
 	default:
-		return "", fmt.Errorf("type must be %q or %q, got %q", metricsTypeGauge, metricsTypeHistogram, t)
+		return "", fmt.Errorf("type must be %q or %q, got %q", metricsTypeGauge, metricsTypeHistogram, spec.Type)
 	}
+	// EPP gauges describe the router as a whole, not any one replica, so the
+	// meaningful reduction across its pods is a sum rather than an average.
+	if source == metricsource.EPPSourceName && spec.Type == metricsTypeGauge {
+		derived = aggregator.ServiceSumAggregatorName
+	}
+	if spec.Aggregation == "" {
+		return derived, nil
+	}
+	if _, ok := userSelectableAggregations[spec.Aggregation]; !ok {
+		return "", fmt.Errorf("unsupported aggregation %q", spec.Aggregation)
+	}
+	// windowed-avg reads a histogram's _sum/_count pair out of the rolling
+	// cache; pointing it at a gauge, or a gauge aggregation at a histogram,
+	// would read fields the source never populates.
+	if (spec.Aggregation == constants.AggregationWindowedAvg) != (spec.Type == metricsTypeHistogram) {
+		return "", fmt.Errorf("aggregation %q is not compatible with type %q", spec.Aggregation, spec.Type)
+	}
+	return spec.Aggregation, nil
 }
 
 // sourceForMetricSource validates the metricsource annotation value, defaulting
-// to "modelpod" when empty. "modelpod" is currently the only supported source.
+// to "modelpod" when empty.
 func sourceForMetricSource(s string) (string, error) {
 	switch s {
 	case "":
 		return metricsource.ModelPodSourceName, nil
 	case metricsource.ModelPodSourceName:
 		return metricsource.ModelPodSourceName, nil
+	case metricsource.EPPSourceName:
+		return metricsource.EPPSourceName, nil
 	default:
-		return "", fmt.Errorf("source must be %q, got %q", metricsource.ModelPodSourceName, s)
+		return "", fmt.Errorf("source must be %q or %q, got %q", metricsource.ModelPodSourceName, metricsource.EPPSourceName, s)
 	}
+}
+
+// observableAtZeroReplicas reports whether a source still produces readings
+// while the InferenceSet is parked at zero. Only such a source can carry an
+// activation threshold: the model pods are gone at zero, so a modelpod metric
+// could never rise above one.
+func observableAtZeroReplicas(source string) bool {
+	return source == metricsource.EPPSourceName
 }
 
 // metricsConfig is the fully parsed auto-provision configuration.
@@ -211,14 +293,19 @@ type metricsConfig struct {
 	evaluationWindow  int32
 	scaleUpCooldown   int32
 	scaleDownCooldown int32
+	cooldownPeriod    *int32
 }
 
 // ValidateConfig validates the auto-provision annotations, returning an
 // error describing the first invalid field. It lets the controller admit or
 // reject an InferenceSet's configuration without exposing the internal parsed
 // representation.
-func ValidateConfig(annotations map[string]string) error {
-	_, err := parseMetricsConfig(annotations)
+//
+// minReplicas selects the rule set: scale-to-zero configurations make the
+// up/down band optional and add the activation rules, so the same annotations
+// can be valid under one minimum and invalid under another.
+func ValidateConfig(annotations map[string]string, minReplicas int) error {
+	_, err := parseMetricsConfig(annotations, minReplicas)
 	return err
 }
 
@@ -232,10 +319,21 @@ type metricSpec struct {
 	Type string `json:"type"`
 	// Source selects the metric source (optional, default "modelpod").
 	Source string `json:"source,omitempty"`
-	// UpThreshold is the scale-up threshold.
+	// UpThreshold is the scale-up threshold for the 1 -> N range. Required
+	// unless the ScaledObject's minimum is 0, in which case it is optional but
+	// must be paired with DownThreshold.
 	UpThreshold *float64 `json:"upthreshold"`
 	// DownThreshold is the scale-down threshold (must be <= upthreshold).
 	DownThreshold *float64 `json:"downthreshold"`
+	// ActivationThreshold wakes the workload (0 -> 1) when exceeded. Only valid
+	// when the ScaledObject's minimum is 0, and only on a source observable
+	// while the workload is parked.
+	ActivationThreshold *float64 `json:"activationthreshold,omitempty"`
+	// DeactivationThreshold parks the workload (1 -> 0) when every metric that
+	// declares one falls below it. Only valid when the minimum is 0.
+	DeactivationThreshold *float64 `json:"deactivationthreshold,omitempty"`
+	// Aggregation overrides the aggregation otherwise derived from Type.
+	Aggregation string `json:"aggregation,omitempty"`
 	// MetricCacheWindow is the rolling cache window in seconds for histogram
 	// metrics (optional, default 300). Only valid for histogram metrics.
 	MetricCacheWindow *int `json:"metriccachewindow,omitempty"`
@@ -246,8 +344,17 @@ type metricSpec struct {
 // scaledobject.kaito.sh/metrics annotation (a YAML list); the remaining global
 // settings come from their own annotations. It returns an error describing the
 // first invalid or missing field encountered.
-func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
+//
+// Only annotation-derived rules live here, so every caller can reach them --
+// including the watch predicates, which have no API client and therefore cannot
+// resolve the maximum. Rules that need the replica range are enforced
+// separately by validateReplicaRange.
+func parseMetricsConfig(annotations map[string]string, minReplicas int) (metricsConfig, error) {
 	var cfg metricsConfig
+
+	// Scale-to-zero is the only mode with a 0 <-> 1 range, so it is what makes
+	// the activation thresholds meaningful and the up/down band optional.
+	scaleToZero := minReplicas == 0
 
 	// Resolve the combine policy (default AND). Only registered policies are
 	// accepted.
@@ -280,13 +387,13 @@ func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
 			return cfg, fmt.Errorf("metric index %d: name is required", i)
 		}
 
-		// type is required and decides the aggregation; source is optional and
-		// selects the metric source (default "modelpod").
-		aggregation, err := aggregationForMetricsType(spec.Type)
+		// type is required and decides the aggregation unless overridden; source
+		// is optional and selects the metric source (default "modelpod").
+		source, err := sourceForMetricSource(spec.Source)
 		if err != nil {
 			return cfg, fmt.Errorf("metric %q (index %d): %w", spec.Name, i, err)
 		}
-		source, err := sourceForMetricSource(spec.Source)
+		aggregation, err := aggregationForSpec(spec, source)
 		if err != nil {
 			return cfg, fmt.Errorf("metric %q (index %d): %w", spec.Name, i, err)
 		}
@@ -300,23 +407,64 @@ func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
 		}
 		seenVars[varName] = spec.Name
 
-		if spec.UpThreshold == nil {
-			return cfg, fmt.Errorf("metric %q (index %d): upthreshold is required", spec.Name, i)
+		// The readiness gate trigger is emitted on every ScaledObject, so a
+		// metric sanitizing to its name has always been a live collision.
+		if varName == gateTriggerName {
+			return cfg, fmt.Errorf("metric %q (index %d) is reserved: it collides with the %q trigger", spec.Name, i, gateTriggerName)
 		}
-		if spec.DownThreshold == nil {
-			return cfg, fmt.Errorf("metric %q (index %d): downthreshold is required", spec.Name, i)
+		// The replica-count trigger is only emitted under scale-to-zero, so the
+		// name stays available to configurations that do not use it.
+		if scaleToZero && varName == replicaCountTriggerName {
+			return cfg, fmt.Errorf("metric %q (index %d) is reserved when min-replicas is 0: it collides with the %q trigger", spec.Name, i, replicaCountTriggerName)
 		}
-		up, down := *spec.UpThreshold, *spec.DownThreshold
-		// YAML values like ".inf"/".nan" decode to non-finite floats; reject them
-		// so they cannot break formula/trigger rendering downstream.
-		if math.IsInf(up, 0) || math.IsNaN(up) {
-			return cfg, fmt.Errorf("metric %q (index %d): upthreshold must be a finite number, got %s", spec.Name, i, strconv.FormatFloat(up, 'f', -1, 64))
+
+		// The up/down band is only optional under scale-to-zero.
+		if !scaleToZero {
+			if spec.UpThreshold == nil {
+				return cfg, fmt.Errorf("metric %q (index %d): upthreshold is required", spec.Name, i)
+			}
+			if spec.DownThreshold == nil {
+				return cfg, fmt.Errorf("metric %q (index %d): downthreshold is required", spec.Name, i)
+			}
+			if spec.ActivationThreshold != nil || spec.DeactivationThreshold != nil {
+				return cfg, fmt.Errorf("metric %q (index %d): activationthreshold and deactivationthreshold require %s=\"0\"", spec.Name, i, constants.AnnotationKeyMinReplicas)
+			}
 		}
-		if math.IsInf(down, 0) || math.IsNaN(down) {
-			return cfg, fmt.Errorf("metric %q (index %d): downthreshold must be a finite number, got %s", spec.Name, i, strconv.FormatFloat(down, 'f', -1, 64))
+
+		// An unpaired bound describes half a band: the formula would grow without
+		// ever shrinking, or the reverse.
+		if (spec.UpThreshold == nil) != (spec.DownThreshold == nil) {
+			return cfg, fmt.Errorf("metric %q (index %d): upthreshold and downthreshold must be declared together", spec.Name, i)
 		}
-		if down > up {
-			return cfg, fmt.Errorf("metric %q (index %d): downthreshold (%s) must not exceed upthreshold (%s)", spec.Name, i, strconv.FormatFloat(down, 'f', -1, 64), strconv.FormatFloat(up, 'f', -1, 64))
+
+		if spec.ActivationThreshold != nil && !observableAtZeroReplicas(source) {
+			return cfg, fmt.Errorf("metric %q (index %d): activationthreshold requires a source observable at zero replicas (%q), got %q", spec.Name, i, metricsource.EPPSourceName, source)
+		}
+
+		up, err := finiteThreshold(spec.UpThreshold, "upthreshold", spec.Name, i)
+		if err != nil {
+			return cfg, err
+		}
+		down, err := finiteThreshold(spec.DownThreshold, "downthreshold", spec.Name, i)
+		if err != nil {
+			return cfg, err
+		}
+		activation, err := finiteThreshold(spec.ActivationThreshold, "activationthreshold", spec.Name, i)
+		if err != nil {
+			return cfg, err
+		}
+		deactivation, err := finiteThreshold(spec.DeactivationThreshold, "deactivationthreshold", spec.Name, i)
+		if err != nil {
+			return cfg, err
+		}
+		if spec.UpThreshold != nil && spec.DownThreshold != nil && *spec.DownThreshold > *spec.UpThreshold {
+			return cfg, fmt.Errorf("metric %q (index %d): downthreshold (%s) must not exceed upthreshold (%s)", spec.Name, i, down, up)
+		}
+		if spec.ActivationThreshold != nil && spec.DeactivationThreshold != nil && *spec.DeactivationThreshold > *spec.ActivationThreshold {
+			return cfg, fmt.Errorf("metric %q (index %d): deactivationthreshold (%s) must not exceed activationthreshold (%s)", spec.Name, i, deactivation, activation)
+		}
+		if up == "" && down == "" && activation == "" && deactivation == "" {
+			return cfg, fmt.Errorf("metric %q (index %d): at least one of upthreshold, downthreshold, activationthreshold, or deactivationthreshold is required", spec.Name, i)
 		}
 
 		// metriccachewindow is only meaningful for histogram metrics (windowed-avg
@@ -337,12 +485,14 @@ func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
 		}
 
 		cfg.metrics = append(cfg.metrics, metric{
-			key:               spec.Name,
-			source:            source,
-			aggregation:       aggregation,
-			upThreshold:       strconv.FormatFloat(up, 'f', -1, 64),
-			downThreshold:     strconv.FormatFloat(down, 'f', -1, 64),
-			metricCacheWindow: metricCacheWindow,
+			key:                   spec.Name,
+			source:                source,
+			aggregation:           aggregation,
+			upThreshold:           up,
+			downThreshold:         down,
+			activationThreshold:   activation,
+			deactivationThreshold: deactivation,
+			metricCacheWindow:     metricCacheWindow,
 		})
 	}
 
@@ -357,7 +507,94 @@ func parseMetricsConfig(annotations map[string]string) (metricsConfig, error) {
 		return cfg, err
 	}
 
+	if scaleToZero {
+		if err := validateActivationRules(cfg.metrics); err != nil {
+			return cfg, err
+		}
+		cooldown, err := parseSecondsAnnotation(annotations, constants.AnnotationKeyCooldownPeriod, defaultCooldownPeriod)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.cooldownPeriod = &cooldown
+	} else if _, ok := annotations[constants.AnnotationKeyCooldownPeriod]; ok {
+		return cfg, fmt.Errorf("%s requires %s=%q", constants.AnnotationKeyCooldownPeriod, constants.AnnotationKeyMinReplicas, "0")
+	}
+
 	return cfg, nil
+}
+
+// validateActivationRules enforces the cross-entry rules that only apply under
+// scale-to-zero: the configuration must be able to both wake and park the
+// workload.
+func validateActivationRules(metrics []metric) error {
+	var hasActivation, hasBackendDeactivation bool
+	for _, m := range metrics {
+		if m.activationThreshold != "" {
+			hasActivation = true
+		}
+		if m.deactivationThreshold != "" && m.source == metricsource.ModelPodSourceName {
+			hasBackendDeactivation = true
+		}
+	}
+	if !hasActivation {
+		return fmt.Errorf("%s=%q requires at least one metric with an activationthreshold, otherwise the workload can never wake",
+			constants.AnnotationKeyMinReplicas, "0")
+	}
+	// A deactivation predicate built only from the router's own view could park
+	// a replica that is still generating tokens. Requiring at least one
+	// backend-observed signal captures that intent.
+	if !hasBackendDeactivation {
+		return fmt.Errorf("%s=%q requires at least one %q-sourced metric with a deactivationthreshold, so scale-down observes backend occupancy",
+			constants.AnnotationKeyMinReplicas, "0", metricsource.ModelPodSourceName)
+	}
+	return nil
+}
+
+// validateReplicaRange enforces the one rule that needs the resolved maximum,
+// so it cannot live in parseMetricsConfig: the watch predicates validate an
+// InferenceSet without an API client and therefore cannot resolve a maximum
+// derived from NodeCountLimit.
+//
+// It is scoped to scale-to-zero. A NodeCountLimit-derived min=1,max=1 range is
+// provisioned with an up/down band on every metric, and rejecting it here
+// would break a live configuration.
+func validateReplicaRange(cfg metricsConfig, minReplicas, maxReplicas int) error {
+	if minReplicas != 0 {
+		return nil
+	}
+	var withBand int
+	for _, m := range cfg.metrics {
+		if m.hasUpDownBand() {
+			withBand++
+		}
+	}
+	if maxReplicas == 1 {
+		if withBand > 0 {
+			return fmt.Errorf("upthreshold/downthreshold are not allowed when %s is 1: there is no 1 to N range to scale over",
+				constants.AnnotationKeyMaxReplicas)
+		}
+		return nil
+	}
+	if withBand == 0 {
+		return fmt.Errorf("at least one metric must declare upthreshold and downthreshold when %s is greater than 1, otherwise the 1 to N range never scales",
+			constants.AnnotationKeyMaxReplicas)
+	}
+	return nil
+}
+
+// finiteThreshold renders an optional threshold as the decimal string used in
+// the formula and trigger metadata, returning "" when unset. YAML values like
+// ".inf"/".nan" decode to non-finite floats; they are rejected here so they
+// cannot break formula or trigger rendering downstream.
+func finiteThreshold(v *float64, field, metricName string, index int) (string, error) {
+	if v == nil {
+		return "", nil
+	}
+	if math.IsInf(*v, 0) || math.IsNaN(*v) {
+		return "", fmt.Errorf("metric %q (index %d): %s must be a finite number, got %s",
+			metricName, index, field, strconv.FormatFloat(*v, 'f', -1, 64))
+	}
+	return strconv.FormatFloat(*v, 'f', -1, 64), nil
 }
 
 // parseSecondsAnnotation parses a non-negative seconds value from the given
@@ -400,12 +637,22 @@ func formulaVarName(metricName string) string {
 	return b.String()
 }
 
-// buildFormula assembles the scalingModifiers expression implementing the
-// conservative AND policy: scale up (multiplier 2.0) only when the readiness
-// gate reports ready (== 1) AND every metric exceeds its up-threshold; scale
-// down (multiplier 0.5) only when every metric is below its down-threshold;
-// otherwise hold (1.0).
-func buildFormula(cfg metricsConfig) string {
+// buildFormula assembles the scalingModifiers expression for the given replica
+// range, dispatching to the scale-to-zero shape only when the minimum is 0.
+func buildFormula(cfg metricsConfig, minReplicas, maxReplicas int) string {
+	if minReplicas == 0 {
+		return buildScaleToZeroFormula(cfg, maxReplicas)
+	}
+	return buildAlwaysOnFormula(cfg)
+}
+
+// buildAlwaysOnFormula assembles the scalingModifiers expression used when the
+// minimum is at least 1, so the workload never parks and the formula only has
+// to cover the 1 <-> N range. It implements the conservative AND policy: scale
+// up (multiplier 2.0) only when the readiness gate reports ready (== 1) AND
+// every metric exceeds its up-threshold; scale down (multiplier 0.5) only when
+// every metric is below its down-threshold; otherwise hold (1.0).
+func buildAlwaysOnFormula(cfg metricsConfig) string {
 	upConds := make([]string, 0, len(cfg.metrics))
 	downConds := make([]string, 0, len(cfg.metrics))
 	for _, m := range cfg.metrics {
@@ -419,18 +666,92 @@ func buildFormula(cfg metricsConfig) string {
 		holdMultiplier)
 }
 
+// buildScaleToZeroFormula assembles the four-branch expression used when the
+// minimum is 0. replica_count selects the range first, because the 0 -> 1
+// decision is evaluated by KEDA's scaleFromZeroOrIdle path (which bypasses the
+// HPA and only compares against activationTarget) while the 1 <-> N decision
+// goes through the HPA ratio.
+//
+// The activation branch therefore emits 1.0 rather than scaleUpMultiplier: only
+// "greater than the activation target" matters there, and the magnitude is
+// discarded.
+//
+// Activation is an OR: any single metric crossing its threshold should wake the
+// workload. Deactivation is an AND: every metric that declares a threshold must
+// agree the workload is idle before it is parked.
+func buildScaleToZeroFormula(cfg metricsConfig, maxReplicas int) string {
+	var activationConds, deactivationConds, upConds, downConds []string
+	for _, m := range cfg.metrics {
+		v := formulaVarName(m.key)
+		if m.activationThreshold != "" {
+			activationConds = append(activationConds, fmt.Sprintf("%s > %s", v, m.activationThreshold))
+		}
+		if m.deactivationThreshold != "" {
+			deactivationConds = append(deactivationConds, fmt.Sprintf("%s <= %s", v, m.deactivationThreshold))
+		} else if m.activationThreshold != "" {
+			// An activation signal must also be idle before a running workload can
+			// park. This keeps queued work alive while its backend is provisioning.
+			deactivationConds = append(deactivationConds, fmt.Sprintf("%s <= %s", v, m.activationThreshold))
+		}
+		if m.hasUpDownBand() {
+			upConds = append(upConds, fmt.Sprintf("%s > %s", v, m.upThreshold))
+			downConds = append(downConds, fmt.Sprintf("%s < %s", v, m.downThreshold))
+		}
+	}
+
+	zeroBranch := fmt.Sprintf("(%s) ? %s : %s",
+		joinPredicate(activationConds, "||"), activateMultiplier, deactivateMultiplier)
+
+	// With no 1 <-> N range there is nothing between "parked" and "running",
+	// so the sub-tree collapses to deactivate-or-hold.
+	nonZeroBranch := fmt.Sprintf("(%s) ? %s : %s",
+		joinPredicate(deactivationConds, "&&"), deactivateMultiplier, holdMultiplier)
+	if maxReplicas > 1 {
+		// The gate is prepended inside scaleUpExpr, so an empty condition set
+		// would leave "readiness_gate == 1" as the whole predicate and grow the
+		// workload on every ready evaluation. Collapse before the prepend.
+		scaleUp := "false"
+		if len(upConds) > 0 {
+			scaleUp = cfg.policy.scaleUpExpr(gateTriggerName, upConds)
+		}
+		nonZeroBranch = fmt.Sprintf("(%s) ? %s : ((%s) ? %s : ((%s) ? %s : %s))",
+			joinPredicate(deactivationConds, "&&"), deactivateMultiplier,
+			scaleUp, scaleUpMultiplier,
+			joinPredicate(downConds, "&&"), scaleDownMultiplier,
+			holdMultiplier)
+	}
+
+	return fmt.Sprintf("(%s == 0) ? (%s) : (%s)", replicaCountTriggerName, zeroBranch, nonZeroBranch)
+}
+
+// joinPredicate combines conditions with the given operator, collapsing an
+// empty set to the literal "false".
+//
+// The zero value matters: expr-lang treats an empty AND as vacuously true, so an
+// empty deactivation or scale-down branch would fire unconditionally and park or
+// shrink the workload on every evaluation. "false" makes an unpopulated branch
+// inert instead, which is the safe reading of "the user configured nothing here".
+func joinPredicate(conds []string, op string) string {
+	if len(conds) == 0 {
+		return "false"
+	}
+	return strings.Join(conds, " "+op+" ")
+}
+
 // buildTriggers builds one external trigger per metric (named after the
-// sanitized metric name) plus the readiness gate trigger. All triggers use
-// metricType Value; KEDA replaces their individual specs with a single composite
-// spec derived from the scalingModifiers formula.
-func (b Builder) buildTriggers(inferenceSetName, inferenceSetNamespace string, cfg metricsConfig) []v1alpha1.ScaleTriggers {
+// sanitized metric name) plus the readiness gate trigger, and -- under
+// scale-to-zero -- the replica-count trigger. All triggers use metricType Value;
+// KEDA replaces their individual specs with a single composite spec derived from
+// the scalingModifiers formula.
+func (b Builder) buildTriggers(inferenceSetName, inferenceSetNamespace string, minReplicas int, cfg metricsConfig) []v1alpha1.ScaleTriggers {
+	scaleToZero := minReplicas == 0
 	scalerAddress := fmt.Sprintf("%s.%s.svc.cluster.local:%d", b.ScalerServiceName, b.ScalerNamespace, b.ScalerGRPCPort)
 	authRef := &v1alpha1.AuthenticationRef{
 		Name: constants.ClusterTriggerAuthName,
 		Kind: constants.ClusterTriggerAuthKind,
 	}
 
-	triggers := make([]v1alpha1.ScaleTriggers, 0, len(cfg.metrics)+1)
+	triggers := make([]v1alpha1.ScaleTriggers, 0, len(cfg.metrics)+2)
 	for _, m := range cfg.metrics {
 		metadata := map[string]string{
 			constants.InferenceSetNameInMetadata:      inferenceSetName,
@@ -442,6 +763,18 @@ func (b Builder) buildTriggers(inferenceSetName, inferenceSetNamespace string, c
 		}
 		if m.metricCacheWindow != "" {
 			metadata[constants.MetricCacheWindowInMetadata] = m.metricCacheWindow
+		}
+		// The scaler's scrape defaults describe the workspace Service (port 80).
+		// The EPP exposes its own endpoint, so it has to be stated explicitly.
+		if m.source == metricsource.EPPSourceName {
+			metadata[constants.MetricPortInMetadata] = eppMetricsPort
+			metadata[constants.MetricPathInMetadata] = eppMetricsPath
+		}
+		// Opt-in rather than inferred by the scaler: a modelpod metric has
+		// nothing to scrape at zero replicas, but only a ScaledObject that can
+		// actually reach zero should read that as 0 instead of an error.
+		if scaleToZero && m.source == metricsource.ModelPodSourceName {
+			metadata[constants.ZeroReplicaFallbackInMetadata] = "true"
 		}
 		triggers = append(triggers, v1alpha1.ScaleTriggers{
 			Type:              "external",
@@ -466,6 +799,25 @@ func (b Builder) buildTriggers(inferenceSetName, inferenceSetNamespace string, c
 		AuthenticationRef: authRef,
 		MetricType:        autoscalingv2.ValueMetricType,
 	})
+
+	// Replica-count trigger: emitted only under scale-to-zero, where the formula
+	// needs it to pick between the 0 -> 1 and 1 <-> N ranges. Omitting it
+	// otherwise keeps the metric name available to existing configurations.
+	if scaleToZero {
+		triggers = append(triggers, v1alpha1.ScaleTriggers{
+			Type: "external",
+			Name: replicaCountTriggerName,
+			Metadata: map[string]string{
+				constants.InferenceSetNameInMetadata:      inferenceSetName,
+				constants.InferenceSetNamespaceInMetadata: inferenceSetNamespace,
+				constants.ScalerAddressInMetadata:         scalerAddress,
+				constants.MetricNameInMetadata:            replicaCountTriggerName,
+				constants.AggregationInMetadata:           constants.AggregationReplicas,
+			},
+			AuthenticationRef: authRef,
+			MetricType:        autoscalingv2.ValueMetricType,
+		})
+	}
 
 	return triggers
 }
@@ -510,7 +862,21 @@ func buildHPAConfig(cfg metricsConfig) *v1alpha1.HorizontalPodAutoscalerConfig {
 }
 
 func (b Builder) buildScaledObject(is *kaitov1beta1.InferenceSet, minReplicas, maxReplicas int, cfg metricsConfig) *v1alpha1.ScaledObject {
-	return &v1alpha1.ScaledObject{
+	scaleToZero := minReplicas == 0
+
+	modifiers := v1alpha1.ScalingModifiers{
+		Formula:    buildFormula(cfg, minReplicas, maxReplicas),
+		Target:     scalingTarget,
+		MetricType: autoscalingv2.ValueMetricType,
+	}
+	if scaleToZero {
+		// Stated explicitly rather than relying on KEDA's implicit default, so
+		// the 0 <-> 1 contract is visible in the rendered object: the formula's
+		// activate/deactivate multipliers only mean anything relative to it.
+		modifiers.ActivationTarget = activationTarget
+	}
+
+	so := &v1alpha1.ScaledObject{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      is.Name,
 			Namespace: is.Namespace,
@@ -531,11 +897,7 @@ func (b Builder) buildScaledObject(is *kaitov1beta1.InferenceSet, minReplicas, m
 		Spec: v1alpha1.ScaledObjectSpec{
 			Advanced: &v1alpha1.AdvancedConfig{
 				HorizontalPodAutoscalerConfig: buildHPAConfig(cfg),
-				ScalingModifiers: v1alpha1.ScalingModifiers{
-					Formula:    buildFormula(cfg),
-					Target:     scalingTarget,
-					MetricType: autoscalingv2.ValueMetricType,
-				},
+				ScalingModifiers:              modifiers,
 			},
 			ScaleTargetRef: &v1alpha1.ScaleTarget{
 				Name:       is.Name,
@@ -545,7 +907,11 @@ func (b Builder) buildScaledObject(is *kaitov1beta1.InferenceSet, minReplicas, m
 			PollingInterval: ptr.To(int32(defaultPollingInterval)),
 			MinReplicaCount: ptr.To(int32(minReplicas)),
 			MaxReplicaCount: ptr.To(int32(maxReplicas)),
-			Triggers:        b.buildTriggers(is.Name, is.Namespace, cfg),
+			Triggers:        b.buildTriggers(is.Name, is.Namespace, minReplicas, cfg),
 		},
 	}
+	if scaleToZero {
+		so.Spec.CooldownPeriod = cfg.cooldownPeriod
+	}
+	return so
 }

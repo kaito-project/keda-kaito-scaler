@@ -22,6 +22,7 @@ import (
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -77,6 +78,7 @@ func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
+	assert.NoError(t, corev1.AddToScheme(scheme))
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 }
 
@@ -445,6 +447,181 @@ func TestKaitoScaler_GetMetrics_Gate(t *testing.T) {
 			assert.Equal(t, types.NamespacedName{}, sc.gotIS)
 		})
 	}
+}
+
+// zeroReplicaInferenceSet builds an InferenceSet parked at zero replicas, which
+// is what the scale-to-zero paths have to cope with: nothing is running, so it
+// reports neither ready replicas nor a Ready condition.
+func zeroReplicaInferenceSet(name, namespace string) *kaitov1beta1.InferenceSet {
+	return &kaitov1beta1.InferenceSet{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec:       kaitov1beta1.InferenceSetSpec{Replicas: ptr.To(int32(0))},
+		Status: kaitov1beta1.InferenceSetStatus{
+			Conditions: []metav1.Condition{{
+				Type:   string(kaitov1beta1.InferenceSetConditionTypeReady),
+				Status: metav1.ConditionFalse,
+			}},
+		},
+	}
+}
+
+// A scale-to-zero InferenceSet is never Ready while it sits at zero, and the
+// scaler must report that as a plain inactive result. Returning an error here
+// would surface as a KEDA TriggerError and could keep the ScaledObject from
+// settling, so the "not ready" and "broken" cases must stay distinguishable.
+func TestKaitoScaler_IsActive_ZeroReplicas(t *testing.T) {
+	is := zeroReplicaInferenceSet("is1", "ns1")
+	s := newTestScaler(newFakeClient(t, is), &stubSource{}, &stubAggregator{})
+
+	resp, err := s.IsActive(context.Background(), &externalscaler.ScaledObjectRef{
+		ScalerMetadata: newValidScalerMetadata(),
+	})
+	assert.NoError(t, err)
+	assert.False(t, resp.Result)
+}
+
+// The replicas pseudo-aggregation feeds the formula the branch selector that
+// tells scale-from-zero apart from scale-up, so it must read the desired
+// replica count off the InferenceSet without scraping anything.
+func TestKaitoScaler_GetMetrics_Replicas(t *testing.T) {
+	tests := []struct {
+		name     string
+		replicas *int32
+		want     float64
+	}{
+		{name: "parked at zero", replicas: ptr.To(int32(0)), want: 0},
+		{name: "scaled out", replicas: ptr.To(int32(4)), want: 4},
+		// An unset spec means the InferenceSet defaults to a single replica, so
+		// the formula must see the non-zero branch rather than a spurious zero.
+		{name: "unset defaults to one", replicas: nil, want: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			is := &kaitov1beta1.InferenceSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "is1", Namespace: "ns1"},
+				Spec:       kaitov1beta1.InferenceSetSpec{Replicas: tt.replicas},
+			}
+			sc := &stubSource{err: errors.New("should not scrape")}
+			ag := &stubAggregator{}
+			c := newFakeClient(t, is)
+			cache := NewMetricCache(c, map[string]metricsource.MetricSource{metricsource.ModelPodSourceName: sc})
+			s := NewKaitoScaler(c, cache, map[string]aggregator.Aggregator{aggregator.SumAggregatorName: ag})
+
+			meta := newValidScalerMetadata()
+			meta[constants.AggregationInMetadata] = constants.AggregationReplicas
+			meta[constants.MetricNameInMetadata] = "replica_count"
+			delete(meta, constants.ThresholdInMetadata)
+
+			resp, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+				ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: meta},
+				MetricName:      "replica_count",
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, resp.MetricValues[0].MetricValueFloat)
+			assert.Equal(t, "replica_count", resp.MetricValues[0].MetricName)
+			// Neither the source nor the aggregator should have been consulted.
+			assert.Equal(t, 0, ag.callCount)
+			assert.Equal(t, types.NamespacedName{}, sc.gotIS)
+		})
+	}
+}
+
+// At zero replicas there is no model pod to scrape, so an opted-in trigger has
+// to report 0 instead of failing. Without this KEDA would see a TriggerError on
+// every poll while the workload is parked.
+func TestKaitoScaler_GetMetrics_ZeroReplicaFallback(t *testing.T) {
+	newScaler := func(t *testing.T, is *kaitov1beta1.InferenceSet, sc metricsource.MetricSource) *KaitoScaler {
+		t.Helper()
+		c := newFakeClient(t, is)
+		cache := NewMetricCache(c, map[string]metricsource.MetricSource{metricsource.ModelPodSourceName: sc})
+		return NewKaitoScaler(c, cache, map[string]aggregator.Aggregator{aggregator.SumAggregatorName: &stubAggregator{value: 42}})
+	}
+
+	fallbackMetadata := func() map[string]string {
+		meta := newValidScalerMetadata()
+		meta[constants.ZeroReplicaFallbackInMetadata] = "true"
+		return meta
+	}
+
+	getMetrics := func(s *KaitoScaler, meta map[string]string) (*externalscaler.GetMetricsResponse, error) {
+		return s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: meta},
+			MetricName:      "vllm:num_requests_waiting",
+		})
+	}
+
+	t.Run("reports zero without scraping while parked", func(t *testing.T) {
+		sc := &stubSource{err: errors.New("should not scrape")}
+		s := newScaler(t, zeroReplicaInferenceSet("is1", "ns1"), sc)
+
+		resp, err := getMetrics(s, fallbackMetadata())
+		assert.NoError(t, err)
+		assert.Equal(t, float64(0), resp.MetricValues[0].MetricValueFloat)
+		assert.Equal(t, types.NamespacedName{}, sc.gotIS)
+	})
+
+	t.Run("reports zero without scraping while provisioning has no service", func(t *testing.T) {
+		is := newReadyInferenceSet("is1", "ns1", false)
+		is.Spec.Replicas = ptr.To(int32(1))
+		workspace := &kaitov1beta1.Workspace{ObjectMeta: metav1.ObjectMeta{
+			Name:      "ws1",
+			Namespace: "ns1",
+			Labels:    map[string]string{"inferenceset.kaito.sh/created-by": "is1"},
+		}}
+		sc := &stubSource{err: errors.New("should not scrape")}
+		s := newTestScaler(newFakeClient(t, is, workspace), sc, &stubAggregator{value: 42})
+
+		resp, err := getMetrics(s, fallbackMetadata())
+		assert.NoError(t, err)
+		assert.Equal(t, float64(0), resp.MetricValues[0].MetricValueFloat)
+		assert.Equal(t, types.NamespacedName{}, sc.gotIS)
+	})
+
+	t.Run("preserves scrape errors once a model service exists", func(t *testing.T) {
+		is := newReadyInferenceSet("is1", "ns1", false)
+		is.Spec.Replicas = ptr.To(int32(1))
+		workspace := &kaitov1beta1.Workspace{ObjectMeta: metav1.ObjectMeta{
+			Name:      "ws1",
+			Namespace: "ns1",
+			Labels:    map[string]string{"inferenceset.kaito.sh/created-by": "is1"},
+		}}
+		service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "ws1", Namespace: "ns1"}}
+		sc := &stubSource{err: errors.New("connection refused")}
+		s := newTestScaler(newFakeClient(t, is, workspace, service), sc, &stubAggregator{value: 42})
+
+		_, err := getMetrics(s, fallbackMetadata())
+		assert.Error(t, err)
+		assert.Equal(t, types.NamespacedName{Namespace: "ns1", Name: "is1"}, sc.gotIS)
+	})
+
+	t.Run("scrapes normally once replicas exist", func(t *testing.T) {
+		is := newReadyInferenceSet("is1", "ns1", true)
+		is.Spec.Replicas = ptr.To(int32(2))
+		workspace := &kaitov1beta1.Workspace{ObjectMeta: metav1.ObjectMeta{
+			Name:      "ws1",
+			Namespace: "ns1",
+			Labels:    map[string]string{"inferenceset.kaito.sh/created-by": "is1"},
+		}}
+		service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "ws1", Namespace: "ns1"}}
+		sc := &stubSource{snapshot: &metricsource.MetricSnapshot{}}
+		s := newTestScaler(newFakeClient(t, is, workspace, service), sc, &stubAggregator{value: 42})
+
+		resp, err := getMetrics(s, fallbackMetadata())
+		assert.NoError(t, err)
+		assert.Equal(t, float64(42), resp.MetricValues[0].MetricValueFloat)
+		assert.Equal(t, types.NamespacedName{Namespace: "ns1", Name: "is1"}, sc.gotIS)
+	})
+
+	// Triggers that did not opt in keep their existing behaviour, so an
+	// unreachable workload still surfaces as an error rather than a silent 0.
+	t.Run("without opt-in a parked workload still errors", func(t *testing.T) {
+		sc := &stubSource{err: errors.New("connection refused")}
+		s := newScaler(t, zeroReplicaInferenceSet("is1", "ns1"), sc)
+
+		_, err := getMetrics(s, newValidScalerMetadata())
+		assert.Error(t, err)
+	})
 }
 
 func TestReadinessGateValue(t *testing.T) {
