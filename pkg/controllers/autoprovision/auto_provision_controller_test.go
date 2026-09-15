@@ -36,7 +36,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
-	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
 )
 
 func TestResolveMinReplicas(t *testing.T) {
@@ -671,62 +670,4 @@ func TestReconcile_ScaleToZeroRejectedForMultiRoleInference(t *testing.T) {
 
 	assert.NoError(t, c2.List(context.Background(), &sos))
 	assert.Len(t, sos.Items, 1)
-}
-
-// A missing EPP means nothing can observe the activation threshold, but KAITO
-// does not create one until the first Workspace exists. Warning rather than
-// rejecting keeps ordinary startup from being blocked.
-func TestReconcile_ScaleToZeroWarnsWhenEPPMissing(t *testing.T) {
-	t.Run("warns and still provisions", func(t *testing.T) {
-		is := scaleToZeroIS("test-is", "default")
-		c := newReconcileFakeClient(t, is)
-		recorder := record.NewFakeRecorder(10)
-		ctrl := &Controller{Client: c, Recorder: recorder}
-
-		_, err := ctrl.Reconcile(context.Background(), is)
-		assert.NoError(t, err)
-
-		var sos v1alpha1.ScaledObjectList
-		assert.NoError(t, c.List(context.Background(), &sos))
-		assert.Len(t, sos.Items, 1, "provisioning must not be blocked on the EPP")
-		assert.True(t, containsEvent(eventsFrom(t, recorder), "EPPNotFound"))
-	})
-
-	t.Run("stays quiet once the EPP exists", func(t *testing.T) {
-		is := scaleToZeroIS("test-is", "default")
-		epp := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "epp-1",
-				Namespace: "default",
-				Labels:    map[string]string{metricsource.EPPNameLabel: metricsource.EPPName(is.Name)},
-			},
-		}
-		c := newReconcileFakeClient(t, is, epp)
-		recorder := record.NewFakeRecorder(10)
-		ctrl := &Controller{Client: c, Recorder: recorder}
-
-		_, err := ctrl.Reconcile(context.Background(), is)
-		assert.NoError(t, err)
-		assert.False(t, containsEvent(eventsFrom(t, recorder), "EPPNotFound"))
-	})
-
-	// The EPP is irrelevant when the workload never reaches zero, so the check
-	// must not fire for existing configurations.
-	t.Run("not evaluated for a non-zero minimum", func(t *testing.T) {
-		is := scaleToZeroIS("test-is", "default")
-		is.Annotations[constants.AnnotationKeyMinReplicas] = "1"
-		is.Annotations[constants.AnnotationKeyMetrics] = `
-- name: vllm:num_requests_running
-  type: gauge
-  upthreshold: 10
-  downthreshold: 2
-`
-		c := newReconcileFakeClient(t, is)
-		recorder := record.NewFakeRecorder(10)
-		ctrl := &Controller{Client: c, Recorder: recorder}
-
-		_, err := ctrl.Reconcile(context.Background(), is)
-		assert.NoError(t, err)
-		assert.False(t, containsEvent(eventsFrom(t, recorder), "EPPNotFound"))
-	})
 }

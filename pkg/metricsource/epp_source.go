@@ -54,8 +54,8 @@ const (
 )
 
 // EPPNameLabel is the label the chart stamps on the EPP Pods with the derived
-// name as its value. Exported so the controller can name the same selector in a
-// diagnostic when no EPP is found.
+// name as its value. Exported so downstream diagnostics can name the selector
+// used during discovery.
 const EPPNameLabel = eppNameLabel
 
 // EPPSource scrapes the Prometheus /metrics endpoint of every Endpoint Picker

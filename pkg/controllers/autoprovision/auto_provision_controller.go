@@ -46,7 +46,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
-	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaledobject"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/inferenceset"
 )
@@ -169,48 +168,7 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSe
 		return reconcile.Result{}, nil
 	}
 
-	if minReplicas == 0 {
-		c.warnIfEPPMissing(ctx, is)
-	}
-
 	return reconcile.Result{}, c.syncDesired(ctx, managedScaledObjects, desired)
-}
-
-// warnIfEPPMissing emits a warning Event when a scale-to-zero InferenceSet has
-// no Endpoint Picker pod, since nothing would then observe its activation
-// threshold and the workload could never wake.
-//
-// It warns rather than rejects on purpose. KAITO skips EPP reconciliation until
-// the InferenceSet has at least one Workspace, so a freshly created InferenceSet
-// legitimately has no EPP for its first few reconciles; rejecting would block
-// provisioning during ordinary startup. The warning self-heals without a
-// re-reconcile because the epp metric source resolves pods at scrape time.
-//
-// A missing EPP can also be permanent: KAITO only creates one for a vLLM,
-// preset-based InferenceSet with the Gateway API Inference Extension feature
-// gate enabled. The Event names the selector so that case is diagnosable.
-func (c *Controller) warnIfEPPMissing(ctx context.Context, is *kaitov1beta1.InferenceSet) {
-	if c.Recorder == nil {
-		return
-	}
-	logger := log.FromContext(ctx).WithName("auto-provision-controller")
-	eppName := metricsource.EPPName(is.Name)
-
-	podList := &corev1.PodList{}
-	if err := c.List(ctx, podList,
-		client.InNamespace(is.Namespace),
-		client.MatchingLabels{metricsource.EPPNameLabel: eppName},
-	); err != nil {
-		logger.Info("failed to list Endpoint Picker pods", "namespace", is.Namespace, "name", is.Name, "error", err.Error())
-		return
-	}
-	if len(podList.Items) > 0 {
-		return
-	}
-
-	c.Recorder.Eventf(is, corev1.EventTypeWarning, "EPPNotFound",
-		"No Endpoint Picker pod matches %s=%s in namespace %s; %s=%q cannot wake the workload until one exists. KAITO creates it only for a vLLM, preset-based InferenceSet with the Gateway API Inference Extension feature gate enabled, and not before the first Workspace exists.",
-		metricsource.EPPNameLabel, eppName, is.Namespace, constants.AnnotationKeyMinReplicas, "0")
 }
 
 // resolveMaxReplicas computes the max replicas for the ScaledObject. When

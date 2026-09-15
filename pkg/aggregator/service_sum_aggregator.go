@@ -67,6 +67,13 @@ func (a *ServiceSumAggregator) Aggregate(snapshot *metricsource.MetricSnapshot, 
 		return 0, fmt.Errorf("metric snapshot is nil")
 	}
 	if len(snapshot.Services) == 0 {
+		if input.MetricSource == metricsource.EPPSourceName {
+			return 0, fmt.Errorf(
+				"no ready Endpoint Picker pods available for selector %s=%s in namespace %s; "+
+					"this is expected temporarily during startup while KAITO creates the first Workspace and Endpoint Picker; "+
+					"if it persists, verify the InferenceSet uses a vLLM preset and the Gateway API Inference Extension is enabled",
+				metricsource.EPPNameLabel, metricsource.EPPName(snapshot.InferenceSet.Name), snapshot.InferenceSet.Namespace)
+		}
 		return 0, fmt.Errorf("no services found for inferenceset %s", snapshot.InferenceSet)
 	}
 

@@ -31,12 +31,14 @@ func TestServiceSumAggregator_Aggregate(t *testing.T) {
 	agg := NewServiceSumAggregator()
 
 	tests := []struct {
-		name       string
-		snapshot   *metricsource.MetricSnapshot
-		metricName string
-		threshold  float64
-		wantValue  float64
-		wantErr    bool
+		name         string
+		snapshot     *metricsource.MetricSnapshot
+		metricName   string
+		metricSource string
+		threshold    float64
+		wantValue    float64
+		wantErr      bool
+		wantErrMsg   string
 	}{
 		{
 			name:     "nil snapshot errors",
@@ -44,11 +46,13 @@ func TestServiceSumAggregator_Aggregate(t *testing.T) {
 			wantErr:  true,
 		},
 		{
-			name: "empty services errors",
+			name: "missing EPP reports expected selector",
 			snapshot: &metricsource.MetricSnapshot{
 				InferenceSet: types.NamespacedName{Namespace: "ns", Name: "is"},
 			},
-			wantErr: true,
+			metricSource: metricsource.EPPSourceName,
+			wantErr:      true,
+			wantErrMsg:   "no ready Endpoint Picker pods available for selector llm-d-router-gateway=is-inferencepool-epp in namespace ns; this is expected temporarily during startup while KAITO creates the first Workspace and Endpoint Picker; if it persists, verify the InferenceSet uses a vLLM preset and the Gateway API Inference Extension is enabled",
 		},
 		{
 			name: "sums across services",
@@ -125,11 +129,16 @@ func TestServiceSumAggregator_Aggregate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := agg.Aggregate(tt.snapshot, AggregateInput{
-				MetricName: tt.metricName,
-				Threshold:  tt.threshold,
+				MetricName:   tt.metricName,
+				MetricSource: tt.metricSource,
+				Threshold:    tt.threshold,
 			})
 			if tt.wantErr {
-				assert.Error(t, err)
+				if tt.wantErrMsg != "" {
+					assert.EqualError(t, err, tt.wantErrMsg)
+				} else {
+					assert.Error(t, err)
+				}
 				return
 			}
 			assert.NoError(t, err)
