@@ -273,7 +273,7 @@ func TestAutoscalingConfigError_Composite(t *testing.T) {
 		assert.Equal(t, reasonInvalidConfig, reason)
 	})
 
-	t.Run("unparseable max-replicas rejected as replica range", func(t *testing.T) {
+	t.Run("unparsable max-replicas rejected as replica range", func(t *testing.T) {
 		ann := compositeAnnotations()
 		ann[constants.AnnotationKeyMaxReplicas] = "abc"
 		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}

@@ -428,7 +428,7 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 }
 
 // resolveMinReplicas reads the min-replicas annotation. 0 is meaningful (it
-// requests scale-to-zero) and is returned verbatim; anything unparseable or
+// requests scale-to-zero) and is returned verbatim; anything unparsable or
 // negative falls back to 1, matching the historical behaviour for those inputs.
 func resolveMinReplicas(annotations map[string]string) int {
 	if minReplicasStr, ok := annotations[constants.AnnotationKeyMinReplicas]; ok {
