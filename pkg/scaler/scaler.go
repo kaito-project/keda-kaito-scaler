@@ -113,6 +113,8 @@ func NewKaitoScaler(kubeClient client.Client, cache *MetricCache, aggregators ma
 	return NewKaitoScalerWithAPIReader(kubeClient, kubeClient, cache, aggregators)
 }
 
+// +kubebuilder:rbac:groups="",resources=services,verbs=get
+
 // NewKaitoScalerWithAPIReader uses apiReader for uncached Service lookups. This
 // avoids starting a Service informer for a point lookup that only needs get RBAC.
 func NewKaitoScalerWithAPIReader(kubeClient client.Client, apiReader client.Reader, cache *MetricCache, aggregators map[string]aggregator.Aggregator) *KaitoScaler {
