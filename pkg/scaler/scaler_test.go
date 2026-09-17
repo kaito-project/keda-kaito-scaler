@@ -216,6 +216,32 @@ func TestParseScalerMetadata_ThresholdOnDemand(t *testing.T) {
 	}
 }
 
+func TestParseScalerMetadata_EPPSumUsesDefaultTarget(t *testing.T) {
+	meta := newValidScalerMetadata()
+	meta[constants.MetricSourceInMetadata] = metricsource.EPPSourceName
+	meta[constants.AggregationInMetadata] = aggregator.SumAggregatorName
+	delete(meta, constants.ThresholdInMetadata)
+
+	cfg, err := parseScalerMetadata(&externalscaler.ScaledObjectRef{ScalerMetadata: meta}, "")
+	assert.NoError(t, err)
+	assert.Equal(t, aggregator.SumAggregatorName, cfg.Aggregation)
+	assert.Equal(t, defaultThreshold, cfg.Threshold)
+}
+
+func TestKaitoScaler_GetMetricSpec_EPPSumUsesPositiveDefaultTarget(t *testing.T) {
+	meta := newValidScalerMetadata()
+	meta[constants.MetricSourceInMetadata] = metricsource.EPPSourceName
+	meta[constants.AggregationInMetadata] = aggregator.SumAggregatorName
+	delete(meta, constants.ThresholdInMetadata)
+
+	s := &KaitoScaler{}
+	resp, err := s.GetMetricSpec(context.Background(), &externalscaler.ScaledObjectRef{ScalerMetadata: meta})
+	assert.NoError(t, err)
+	if assert.Len(t, resp.MetricSpecs, 1) {
+		assert.Equal(t, defaultThreshold, resp.MetricSpecs[0].TargetSizeFloat)
+	}
+}
+
 func TestConfig_scrapeConfig(t *testing.T) {
 	cfg := &Config{
 		MetricProtocol: "https",
@@ -349,6 +375,57 @@ func TestKaitoScaler_GetMetrics_Routing(t *testing.T) {
 	assert.Equal(t, types.NamespacedName{}, serviceSource.gotIS)
 	assert.Equal(t, 1, serviceAvgAgg.callCount)
 	assert.Equal(t, 0, sumAgg.callCount)
+}
+
+func TestKaitoScaler_GetMetrics_EPPSumDisablesCompensation(t *testing.T) {
+	is := newReadyInferenceSet("is1", "ns1", true)
+	eppSource := &stubSource{snapshot: &metricsource.MetricSnapshot{
+		InferenceSet: types.NamespacedName{Namespace: "ns1", Name: "is1"},
+		Services:     []metricsource.ServiceMetrics{{Name: "epp-1", Namespace: "ns1"}},
+	}}
+	sumAgg := &stubAggregator{value: 3}
+
+	c := newFakeClient(t, is)
+	cache := NewMetricCache(c, map[string]metricsource.MetricSource{metricsource.EPPSourceName: eppSource})
+	s := NewKaitoScaler(c, cache, map[string]aggregator.Aggregator{aggregator.SumAggregatorName: sumAgg})
+
+	meta := newValidScalerMetadata()
+	meta[constants.MetricSourceInMetadata] = metricsource.EPPSourceName
+	meta[constants.AggregationInMetadata] = aggregator.SumAggregatorName
+	delete(meta, constants.ThresholdInMetadata)
+	meta[constants.MetricNameInMetadata] = "inference_pool_per_pod_queue_size"
+
+	resp, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+		ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: meta},
+		MetricName:      "inference_pool_per_pod_queue_size",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, float64(3), resp.MetricValues[0].MetricValueFloat)
+	assert.Equal(t, float64(0), sumAgg.threshold)
+}
+
+func TestKaitoScaler_GetMetrics_EmptyEPPReportsSelectors(t *testing.T) {
+	is := newReadyInferenceSet("is1", "ns1", true)
+	eppSource := &stubSource{snapshot: &metricsource.MetricSnapshot{
+		InferenceSet: types.NamespacedName{Namespace: "ns1", Name: "is1"},
+	}}
+
+	c := newFakeClient(t, is)
+	cache := NewMetricCache(c, map[string]metricsource.MetricSource{metricsource.EPPSourceName: eppSource})
+	s := NewKaitoScaler(c, cache, map[string]aggregator.Aggregator{
+		aggregator.SumAggregatorName: &stubAggregator{},
+	})
+
+	meta := newValidScalerMetadata()
+	meta[constants.MetricSourceInMetadata] = metricsource.EPPSourceName
+	meta[constants.AggregationInMetadata] = aggregator.SumAggregatorName
+	delete(meta, constants.ThresholdInMetadata)
+
+	_, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+		ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: meta},
+		MetricName:      "inference_pool_per_pod_queue_size",
+	})
+	assert.ErrorContains(t, err, "no ready Endpoint Picker pods available for selectors llm-d-router-gateway=is1-inferencepool-epp or inferencepool=is1-inferencepool-epp in namespace ns1")
 }
 
 func TestKaitoScaler_GetMetrics_WindowedAvg(t *testing.T) {

@@ -626,11 +626,7 @@ func TestReconcile_EqualPositiveReplicaBounds(t *testing.T) {
 	}
 }
 
-// KAITO gives a MultiRoleInference a single Endpoint Picker shared by all of its
-// children, so a child InferenceSet has no EPP of its own and could never
-// observe an activation signal. Provisioning one anyway would leave a workload
-// that can be parked but never woken.
-func TestReconcile_ScaleToZeroRejectedForMultiRoleInference(t *testing.T) {
+func TestInferenceSetPredicate_ExcludesMultiRoleInferenceChildren(t *testing.T) {
 	is := scaleToZeroIS("test-is", "default")
 	is.OwnerReferences = []metav1.OwnerReference{{
 		APIVersion: "kaito.sh/v1beta1",
@@ -640,34 +636,21 @@ func TestReconcile_ScaleToZeroRejectedForMultiRoleInference(t *testing.T) {
 		Controller: ptr.To(true),
 	}}
 
-	c := newReconcileFakeClient(t, is)
-	recorder := record.NewFakeRecorder(10)
-	ctrl := &Controller{Client: c, Recorder: recorder}
+	pred := generateInferenceSetPredicateFunc()
+	assert.False(t, pred.Create(event.CreateEvent{Object: is}))
 
-	_, err := ctrl.Reconcile(context.Background(), is)
-	assert.NoError(t, err)
-
-	var sos v1alpha1.ScaledObjectList
-	assert.NoError(t, c.List(context.Background(), &sos))
-	assert.Empty(t, sos.Items, "no ScaledObject should be provisioned")
-	assert.True(t, containsEvent(eventsFrom(t, recorder), "UnsupportedTopology"))
-
-	// A MultiRoleInference child is only rejected for scale-to-zero; the
-	// ordinary 1..N configuration keeps working.
-	is2 := scaleToZeroIS("test-is-2", "default")
-	is2.OwnerReferences = is.OwnerReferences
-	is2.Annotations[constants.AnnotationKeyMinReplicas] = "1"
-	is2.Annotations[constants.AnnotationKeyMetrics] = `
+	alwaysOn := scaleToZeroIS("test-is-2", "default")
+	alwaysOn.OwnerReferences = is.OwnerReferences
+	alwaysOn.Annotations[constants.AnnotationKeyMinReplicas] = "1"
+	alwaysOn.Annotations[constants.AnnotationKeyMetrics] = `
 - name: vllm:num_requests_running
   type: gauge
   upthreshold: 10
   downthreshold: 2
 `
-	c2 := newReconcileFakeClient(t, is2)
-	ctrl2 := &Controller{Client: c2, Recorder: record.NewFakeRecorder(10)}
-	_, err = ctrl2.Reconcile(context.Background(), is2)
-	assert.NoError(t, err)
+	assert.False(t, pred.Create(event.CreateEvent{Object: alwaysOn}))
 
-	assert.NoError(t, c2.List(context.Background(), &sos))
-	assert.Len(t, sos.Items, 1)
+	old := alwaysOn.DeepCopy()
+	alwaysOn.Annotations[constants.AnnotationKeyMaxReplicas] = "10"
+	assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: alwaysOn}))
 }

@@ -137,7 +137,7 @@ Each entry in the `metrics` list accepts the following fields:
 | `name` | yes | – | Prometheus metric name. |
 | `type` | yes | – | Aggregation: `gauge` → per-replica average across pods; `histogram` → average over the metric cache window. Both are replica-count independent. |
 | `source` | no | `modelpod` | Where the metric is scraped. `modelpod` reads the model-serving pods behind the `InferenceSet`'s workspace `Service`s. `epp` reads the Endpoint Picker, which keeps reporting while the workload is parked at zero replicas — see [Scale to zero](#scale-to-zero). |
-| `aggregation` | no | derived from `type` and `source` | Overrides the derived reduction. One of `sum`, `service-avg`, `service-sum`, `windowed-avg`. `windowed-avg` is only valid for `histogram`; the others only for `gauge`. |
+| `aggregation` | no | derived from `type` and `source` | Overrides the derived reduction. One of `sum`, `service-avg`, `windowed-avg`. `windowed-avg` is only valid for `histogram`; the others only for `gauge`. |
 | `upthreshold` | yes¹ | – | Scale-up threshold (float) for the 1..N range. |
 | `downthreshold` | yes¹ | – | Scale-down threshold (float) for the 1..N range. Must be `<= upthreshold`. |
 | `activationthreshold` | no² | – | Wake threshold for the 0 → 1 transition. Requires `min-replicas: "0"` and `source: epp`. |
@@ -145,8 +145,8 @@ Each entry in the `metrics` list accepts the following fields:
 | `metriccachewindow` | no | `300` | Rolling cache window in **seconds** over which a `histogram` metric is averaged. Each histogram metric may set its own; rejected on `gauge` metrics. |
 
 ¹ Required unless `min-replicas` is `"0"`, where a metric may carry only an
-activation/deactivation band. They must still be declared together, and at least
-one metric must declare them whenever `max-replicas` is greater than 1.
+activation/deactivation band. Up/down thresholds must still be declared
+together; without any such band, a running workload holds at one replica.
 
 ² Only accepted when `min-replicas` is `"0"`.
 
@@ -508,8 +508,9 @@ carry an `activationthreshold`. Set `source: epp` on that metric.
 
 The EPP is scraped **per pod** (port `9090`, path `/metrics`) and its gauges are
 **summed** across router replicas, since queue depth is only meaningful as a
-total. That is why `epp` gauges default to the `service-sum` aggregation instead
-of `service-avg`.
+total. That is why `epp` gauges default to the `sum` aggregation instead of
+`service-avg`. EPP disables missing-service compensation because its threshold
+describes a fleet-wide quantity rather than per-replica load.
 
 Deactivation, by contrast, must include at least one `modelpod`-sourced metric.
 The router's own view can go quiet while a replica is still generating tokens for

@@ -224,7 +224,6 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 			map[string]aggregator.Aggregator{
 				aggregator.SumAggregatorName:            aggregator.NewSumAggregator(),
 				aggregator.ServiceAverageAggregatorName: aggregator.NewServiceAverageAggregator(),
-				aggregator.ServiceSumAggregatorName:     aggregator.NewServiceSumAggregator(),
 				// The windowed-average aggregation is served by the metric cache
 				// itself (it holds the rolling snapshot window).
 				constants.AggregationWindowedAvg: metricCache,

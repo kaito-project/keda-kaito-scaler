@@ -324,7 +324,7 @@ func TestParseMetricsConfig_ScaleToZero(t *testing.T) {
 
 		// An EPP gauge is summed across router replicas rather than averaged.
 		assert.Equal(t, "epp", cfg.metrics[0].source)
-		assert.Equal(t, "service-sum", cfg.metrics[0].aggregation)
+		assert.Equal(t, "sum", cfg.metrics[0].aggregation)
 		assert.Equal(t, "0", cfg.metrics[0].activationThreshold)
 		assert.False(t, cfg.metrics[0].hasUpDownBand())
 
@@ -514,43 +514,6 @@ func TestParseMetricsConfig_ScaleToZero(t *testing.T) {
 	})
 }
 
-func TestValidateReplicaRange(t *testing.T) {
-	withBand, err := parseMetricsConfig(scaleToZeroAnnotations(), 0)
-	assert.NoError(t, err)
-
-	noBand, err := parseMetricsConfig(metricsAnn(`
-- name: inference_pool_per_pod_queue_size
-  type: gauge
-  source: epp
-  activationthreshold: 0
-- name: vllm:num_requests_running
-  type: gauge
-  deactivationthreshold: 0
-`), 0)
-	assert.NoError(t, err)
-
-	t.Run("a 0..N range needs a band to scale over", func(t *testing.T) {
-		assert.NoError(t, validateReplicaRange(withBand, 0, 5))
-		assert.ErrorContains(t, validateReplicaRange(noBand, 0, 5), "at least one metric")
-	})
-
-	// With a maximum of 1 the only transitions are 0 <-> 1, which the
-	// activation band drives; an up/down band would never be consulted.
-	t.Run("a 0..1 range must not declare a band", func(t *testing.T) {
-		assert.NoError(t, validateReplicaRange(noBand, 0, 1))
-		assert.ErrorContains(t, validateReplicaRange(withBand, 0, 1), "not allowed")
-	})
-
-	// A NodeCountLimit-derived min=1,max=1 is provisioned today with a band on
-	// every metric. The rule must not reach it.
-	t.Run("a non-zero minimum is never constrained", func(t *testing.T) {
-		alwaysOn, err := parseMetricsConfig(metricsAnnotations(), 1)
-		assert.NoError(t, err)
-		assert.NoError(t, validateReplicaRange(alwaysOn, 1, 1))
-		assert.NoError(t, validateReplicaRange(alwaysOn, 1, 5))
-	})
-}
-
 func TestBuildScaleToZeroFormula(t *testing.T) {
 	t.Run("0..N branches on replica_count then on the band", func(t *testing.T) {
 		cfg, err := parseMetricsConfig(scaleToZeroAnnotations(), 0)
@@ -578,6 +541,25 @@ func TestBuildScaleToZeroFormula(t *testing.T) {
 		assert.NoError(t, err)
 
 		got := buildFormula(cfg, 0, 1)
+		want := "(replica_count == 0) ? " +
+			"((inference_pool_per_pod_queue_size > 0) ? 1.0 : 0.0) : " +
+			"((inference_pool_per_pod_queue_size <= 0 && vllm_num_requests_running <= 0) ? 0.0 : 1.0)"
+		assert.Equal(t, want, got)
+	})
+
+	t.Run("0..N without an up-down band leaves the 1 to N range inert", func(t *testing.T) {
+		cfg, err := parseMetricsConfig(metricsAnn(`
+- name: inference_pool_per_pod_queue_size
+  type: gauge
+  source: epp
+  activationthreshold: 0
+- name: vllm:num_requests_running
+  type: gauge
+  deactivationthreshold: 0
+`), 0)
+		assert.NoError(t, err)
+
+		got := buildFormula(cfg, 0, 5)
 		want := "(replica_count == 0) ? " +
 			"((inference_pool_per_pod_queue_size > 0) ? 1.0 : 0.0) : " +
 			"((inference_pool_per_pod_queue_size <= 0 && vllm_num_requests_running <= 0) ? 0.0 : 1.0)"
@@ -655,6 +637,8 @@ func TestBuildScaledObject_ScaleToZero(t *testing.T) {
 	// on the scaler's Service-oriented defaults.
 	epp := byName["inference_pool_per_pod_queue_size"]
 	assert.Equal(t, "epp", epp[constants.MetricSourceInMetadata])
+	assert.Equal(t, "sum", epp[constants.AggregationInMetadata])
+	assert.NotContains(t, epp, constants.ThresholdInMetadata)
 	assert.Equal(t, "9090", epp[constants.MetricPortInMetadata])
 	assert.Equal(t, "/metrics", epp[constants.MetricPathInMetadata])
 	assert.NotContains(t, epp, constants.ZeroReplicaFallbackInMetadata)

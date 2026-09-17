@@ -22,58 +22,48 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
 )
 
-// ServiceSumAggregator sums a metric across every service in the snapshot
-// without compensating for services that failed to scrape.
+// SumAggregator sums a metric across every service that belongs to an
+// InferenceSet, compensating for services that could not be scraped in order
+// to avoid flapping.
 //
-// It exists alongside SumAggregator, which adds the per-replica threshold once
-// per unscrapable service so a partial scrape cannot look like a drop in load.
-// That compensation is deliberate for the single-metric AverageValue path, but
-// it is wrong for a fleet-wide quantity compared against a fixed threshold in
-// composite Value mode (scalingModifiers): there is no meaningful per-replica
-// threshold to add. The EPP queue depth is exactly such a quantity -- it is a
-// property of the router, not of any replica.
+// Compensation strategy (mirrors how K8s HPA's ReplicaCalculator handles
+// missing pods for Pods/Resource metrics, which it does NOT do for External
+// metrics – so we do it ourselves):
 //
-// Negative sums are clamped to 0 for the same reason SumAggregator clamps:
-// KEDA's external_scaler client silently treats a negative MetricValueFloat as
-// 0, which would mask metric source bugs.
-type ServiceSumAggregator struct{}
+//   - scale-up direction (avg of successful samples >= threshold): missing
+//     services contribute 0 (their absence must not prevent scale-up).
+//   - scale-down direction (avg of successful samples < threshold): missing
+//     services contribute the threshold value (their absence must not trigger
+//     further scale-down).
+//
+// If no service could be scraped successfully, the combined per-service errors
+// are returned.
+//
+// Negative aggregated values are clamped to 0; KEDA's external_scaler client
+// otherwise silently treats negative MetricValueFloat as 0 by falling back to
+// the deprecated int64 MetricValue, which would mask bugs in the metric source.
+type SumAggregator struct{}
 
-// ServiceSumAggregatorName is the registered name of the ServiceSumAggregator.
-const ServiceSumAggregatorName = "service-sum"
+// SumAggregatorName is the registered name of the SumAggregator.
+const SumAggregatorName = "sum"
 
-// NewServiceSumAggregator returns a ready-to-use ServiceSumAggregator.
-func NewServiceSumAggregator() *ServiceSumAggregator {
-	return &ServiceSumAggregator{}
+// NewSumAggregator returns a ready-to-use SumAggregator.
+func NewSumAggregator() *SumAggregator {
+	return &SumAggregator{}
 }
 
-// Name identifies the ServiceSumAggregator.
-func (a *ServiceSumAggregator) Name() string { return ServiceSumAggregatorName }
+// Name identifies the SumAggregator.
+func (a *SumAggregator) Name() string { return SumAggregatorName }
 
-// Aggregate implements Aggregator. It returns the plain sum of input.MetricName
-// across all successfully scraped services, and errors only when no service
-// could be scraped at all. The threshold is unused.
-//
-// Unlike ServiceAverageAggregator, absence of the metric on every scraped
-// service is reported as 0 rather than an error. The metrics this aggregator
-// serves are labelled vectors that publish no series until the first matching
-// event: an idle EPP genuinely exposes no queue-size series, and that idleness
-// is the entire state scale-to-zero needs to observe. Erroring there would put
-// every parked workload into a permanent TriggerError and freeze it. The cost is
-// that a misspelled metric name reads as a steady 0 instead of surfacing an
-// error.
-func (a *ServiceSumAggregator) Aggregate(snapshot *metricsource.MetricSnapshot, input AggregateInput) (float64, error) {
+// Aggregate implements Aggregator.
+func (a *SumAggregator) Aggregate(snapshot *metricsource.MetricSnapshot, input AggregateInput) (float64, error) {
 	metricName := input.MetricName
+	threshold := input.Threshold
 	if snapshot == nil {
 		return 0, fmt.Errorf("metric snapshot is nil")
 	}
-	if len(snapshot.Services) == 0 {
-		if input.MetricSource == metricsource.EPPSourceName {
-			return 0, fmt.Errorf(
-				"no ready Endpoint Picker pods available for selector %s=%s in namespace %s; "+
-					"this is expected temporarily during startup while KAITO creates the first Workspace and Endpoint Picker; "+
-					"if it persists, verify the InferenceSet uses a vLLM preset and the Gateway API Inference Extension is enabled",
-				metricsource.EPPNameLabel, metricsource.EPPName(snapshot.InferenceSet.Name), snapshot.InferenceSet.Namespace)
-		}
+	total := len(snapshot.Services)
+	if total == 0 {
 		return 0, fmt.Errorf("no services found for inferenceset %s", snapshot.InferenceSet)
 	}
 
@@ -87,13 +77,19 @@ func (a *ServiceSumAggregator) Aggregate(snapshot *metricsource.MetricSnapshot, 
 			errs = append(errs, fmt.Errorf("service %s/%s: %w", sm.Namespace, sm.Name, sm.Err))
 			continue
 		}
-		sum += sm.Metrics[metricName]
+		// The service was scraped successfully. A missing metric key means this
+		// replica currently reports no such activity (e.g. no requests queued),
+		// so it contributes 0 and still counts as a real replica instead of being
+		// treated as a scrape failure. This keeps cold-start / no-traffic windows
+		// from erroring (which would otherwise block composite formulas).
+		val, ok := sm.Metrics[metricName]
+		if !ok {
+			klog.V(4).Infof("metric %q absent on scraped service %s/%s; treating as 0", metricName, sm.Namespace, sm.Name)
+		}
+		sum += val
 		successCount++
 	}
 
-	// Nothing was scraped, so the value is unknown rather than 0. Reporting a
-	// phantom 0 here would look like an idle fleet and could park a workload
-	// that is in fact serving traffic.
 	if successCount == 0 {
 		if combined := multierr.Combine(errs...); combined != nil {
 			return 0, fmt.Errorf("failed to resolve metric %q for inferenceset %s: %w", metricName, snapshot.InferenceSet, combined)
@@ -101,12 +97,20 @@ func (a *ServiceSumAggregator) Aggregate(snapshot *metricsource.MetricSnapshot, 
 		return 0, fmt.Errorf("failed to resolve metric %q for inferenceset %s", metricName, snapshot.InferenceSet)
 	}
 
+	// Compensate for missing services only in the scale-down direction.
+	if successCount != total {
+		avgSuccess := sum / float64(successCount)
+		if avgSuccess < threshold {
+			sum += threshold * float64(total-successCount)
+		}
+	}
+
 	if sum < 0 {
-		klog.Warningf("summed metric %q for inferenceset %s is negative (%f); clamping to 0", metricName, snapshot.InferenceSet, sum)
+		klog.Warningf("aggregated metric %q for inferenceset %s is negative (%f); clamping to 0", metricName, snapshot.InferenceSet, sum)
 		sum = 0
 	}
 
-	klog.V(4).Infof("summed metric %q for inferenceset %s: sum=%f success=%d total=%d",
-		metricName, snapshot.InferenceSet, sum, successCount, len(snapshot.Services))
+	klog.V(4).Infof("aggregated metric %q for inferenceset %s: sum=%f success=%d total=%d threshold=%f",
+		metricName, snapshot.InferenceSet, sum, successCount, total, threshold)
 	return sum, nil
 }

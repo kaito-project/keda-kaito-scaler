@@ -151,9 +151,6 @@ func (b Builder) BuildDesired(is *kaitov1beta1.InferenceSet, minReplicas, maxRep
 	if err != nil {
 		return nil, err
 	}
-	if err := validateReplicaRange(cfg, minReplicas, maxReplicas); err != nil {
-		return nil, err
-	}
 	return b.buildScaledObject(is, minReplicas, maxReplicas, cfg), nil
 }
 
@@ -227,7 +224,6 @@ func (m metric) hasUpDownBand() bool { return m.upThreshold != "" && m.downThres
 var userSelectableAggregations = map[string]struct{}{
 	aggregator.SumAggregatorName:            {},
 	aggregator.ServiceAverageAggregatorName: {},
-	aggregator.ServiceSumAggregatorName:     {},
 	constants.AggregationWindowedAvg:        {},
 }
 
@@ -246,7 +242,7 @@ func aggregationForSpec(spec metricSpec, source string) (string, error) {
 	// EPP gauges describe the router as a whole, not any one replica, so the
 	// meaningful reduction across its pods is a sum rather than an average.
 	if source == metricsource.EPPSourceName && spec.Type == metricsTypeGauge {
-		derived = aggregator.ServiceSumAggregatorName
+		derived = aggregator.SumAggregatorName
 	}
 	if spec.Aggregation == "" {
 		return derived, nil
@@ -338,9 +334,7 @@ type metricSpec struct {
 // first invalid or missing field encountered.
 //
 // Only annotation-derived rules live here, so every caller can reach them --
-// including the watch predicates, which have no API client and therefore cannot
-// resolve the maximum. Rules that need the replica range are enforced
-// separately by validateReplicaRange.
+// including the watch predicates, which have no API client.
 func parseMetricsConfig(annotations map[string]string, minReplicas int) (metricsConfig, error) {
 	var cfg metricsConfig
 
@@ -542,38 +536,6 @@ func validateActivationRules(metrics []metric) error {
 	return nil
 }
 
-// validateReplicaRange enforces the one rule that needs the resolved maximum,
-// so it cannot live in parseMetricsConfig: the watch predicates validate an
-// InferenceSet without an API client and therefore cannot resolve a maximum
-// derived from NodeCountLimit.
-//
-// It is scoped to scale-to-zero. A NodeCountLimit-derived min=1,max=1 range is
-// provisioned with an up/down band on every metric, and rejecting it here
-// would break a live configuration.
-func validateReplicaRange(cfg metricsConfig, minReplicas, maxReplicas int) error {
-	if minReplicas != 0 {
-		return nil
-	}
-	var withBand int
-	for _, m := range cfg.metrics {
-		if m.hasUpDownBand() {
-			withBand++
-		}
-	}
-	if maxReplicas == 1 {
-		if withBand > 0 {
-			return fmt.Errorf("upthreshold/downthreshold are not allowed when %s is 1: there is no 1 to N range to scale over",
-				constants.AnnotationKeyMaxReplicas)
-		}
-		return nil
-	}
-	if withBand == 0 {
-		return fmt.Errorf("at least one metric must declare upthreshold and downthreshold when %s is greater than 1, otherwise the 1 to N range never scales",
-			constants.AnnotationKeyMaxReplicas)
-	}
-	return nil
-}
-
 // finiteThreshold renders an optional threshold as the decimal string used in
 // the formula and trigger metadata, returning "" when unset. YAML values like
 // ".inf"/".nan" decode to non-finite floats; they are rejected here so they
@@ -698,7 +660,7 @@ func buildScaleToZeroFormula(cfg metricsConfig, maxReplicas int) string {
 	// so the sub-tree collapses to deactivate-or-hold.
 	nonZeroBranch := fmt.Sprintf("(%s) ? %s : %s",
 		joinPredicate(deactivationConds, "&&"), deactivateMultiplier, holdMultiplier)
-	if maxReplicas > 1 {
+	if maxReplicas > 1 && len(upConds) > 0 {
 		nonZeroBranch = fmt.Sprintf("(%s) ? %s : ((%s) ? %s : ((%s) ? %s : %s))",
 			joinPredicate(deactivationConds, "&&"), deactivateMultiplier,
 			cfg.policy.scaleUpExpr(gateTriggerName, upConds), scaleUpMultiplier,

@@ -255,10 +255,22 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 	if !ok {
 		return nil, status.Error(codes.Unavailable, fmt.Sprintf("metrics for InferenceSet %s/%s are not available yet (scrape failing or cold)", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName))
 	}
+	if scalerConfig.MetricSource == metricsource.EPPSourceName &&
+		scalerConfig.Aggregation == aggregator.SumAggregatorName && len(snapshot.Services) == 0 {
+		return nil, status.Error(codes.Internal, fmt.Sprintf(
+			"no ready Endpoint Picker pods available for selectors %s in namespace %s; "+
+				"this is expected temporarily during startup while KAITO creates the first Workspace and Endpoint Picker; "+
+				"if it persists, verify the InferenceSet uses a vLLM preset and the Gateway API Inference Extension is enabled",
+			metricsource.EPPSelectorDescription(snapshot.InferenceSet.Name), snapshot.InferenceSet.Namespace))
+	}
 
+	aggregationThreshold := scalerConfig.Threshold
+	if scalerConfig.MetricSource == metricsource.EPPSourceName && scalerConfig.Aggregation == aggregator.SumAggregatorName {
+		aggregationThreshold = 0
+	}
 	value, err := agg.Aggregate(snapshot, aggregator.AggregateInput{
 		MetricName:   scalerConfig.MetricName,
-		Threshold:    scalerConfig.Threshold,
+		Threshold:    aggregationThreshold,
 		InferenceSet: is,
 		MetricSource: scalerConfig.MetricSource,
 		ScrapeConfig: scrapeCfg,
@@ -326,12 +338,12 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 		aggregation = aggregator.SumAggregatorName
 	}
 
-	// Threshold is the per-replica HPA target. It is required for aggregations
-	// that consume it (the single-metric "sum" path, where KEDA uses it as the
-	// AverageValue target). For service-avg/windowed-avg/gate it is optional and
-	// defaults to defaultThreshold, since those run in composite Value mode where
-	// the per-trigger target is overridden by the scalingModifiers formula. A
-	// supplied value is always validated.
+	// Threshold is the positive target returned to KEDA by GetMetricSpec. It is
+	// required for the legacy modelpod+sum path, but optional for composite
+	// triggers whose target is replaced by scalingModifiers. EPP+sum also uses
+	// the positive default here; GetMetrics separately passes 0 to SumAggregator
+	// to disable missing-service compensation. A supplied value is always
+	// validated.
 	threshold := defaultThreshold
 	if thresholdStr := md[constants.ThresholdInMetadata]; thresholdStr != "" {
 		v, err := strconv.ParseFloat(thresholdStr, 64)
@@ -339,7 +351,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 			return nil, status.Error(codes.InvalidArgument, "threshold must be a valid number")
 		}
 		threshold = v
-	} else if !thresholdOptional(aggregation) {
+	} else if !(metricSource == metricsource.EPPSourceName && aggregation == aggregator.SumAggregatorName) && !thresholdOptional(aggregation) {
 		return nil, status.Error(codes.InvalidArgument, "threshold must be specified")
 	}
 
@@ -409,7 +421,7 @@ func parseScalerMetadata(sor *externalscaler.ScaledObjectRef, metricName string)
 // threshold, so callers need not supply it in the trigger metadata.
 func thresholdOptional(aggregation string) bool {
 	switch aggregation {
-	case aggregator.ServiceAverageAggregatorName, aggregator.ServiceSumAggregatorName,
+	case aggregator.ServiceAverageAggregatorName,
 		constants.AggregationWindowedAvg, constants.AggregationGate, constants.AggregationReplicas:
 		return true
 	default:

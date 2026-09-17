@@ -127,23 +127,6 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSe
 		return reconcile.Result{}, nil
 	}
 
-	// Scale-to-zero depends on the Endpoint Picker, which KAITO creates once per
-	// standalone InferenceSet but shares across the children of a
-	// MultiRoleInference. A child's EPP would never exist, so reject explicitly
-	// rather than letting the config fail later as a generic "no EPP found".
-	if minReplicas == 0 {
-		if owner := metav1.GetControllerOf(is); owner != nil && owner.Kind == constants.MultiRoleInference {
-			logger.Info("skip reconciling inference set because scale-to-zero is not supported for MultiRoleInference children",
-				"namespace", is.Namespace, "name", is.Name, "owner", owner.Name)
-			if c.Recorder != nil {
-				c.Recorder.Eventf(is, corev1.EventTypeWarning, "UnsupportedTopology",
-					"Skip auto-provisioning ScaledObject: %s=%q is not supported for InferenceSets owned by %s %q, which share a single Endpoint Picker",
-					constants.AnnotationKeyMinReplicas, "0", constants.MultiRoleInference, owner.Name)
-			}
-			return reconcile.Result{}, nil
-		}
-	}
-
 	managedScaledObjects, err := c.listManagedScaledObjects(ctx, is)
 	if err != nil {
 		return reconcile.Result{}, err
@@ -395,6 +378,9 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			if !ok {
 				return false
 			}
+			if isMultiRoleInferenceChild(inferenceSet) {
+				return false
+			}
 			// Deliberately does not filter on config validity: an invalid config
 			// must still reach Reconcile so it can be reported as an Event.
 			return autoProvisionRequested(inferenceSet)
@@ -407,6 +393,9 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 
 			newInferenceSet, ok := e.ObjectNew.(*kaitov1beta1.InferenceSet)
 			if !ok {
+				return false
+			}
+			if isMultiRoleInferenceChild(newInferenceSet) {
 				return false
 			}
 
@@ -425,6 +414,11 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			return false
 		},
 	}
+}
+
+func isMultiRoleInferenceChild(inferenceSet *kaitov1beta1.InferenceSet) bool {
+	owner := metav1.GetControllerOf(inferenceSet)
+	return owner != nil && owner.Kind == constants.MultiRoleInference
 }
 
 // resolveMinReplicas reads the min-replicas annotation. 0 is meaningful (it

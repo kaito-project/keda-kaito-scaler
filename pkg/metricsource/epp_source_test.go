@@ -38,11 +38,15 @@ func newEPPFakeClient(t *testing.T, objs ...client.Object) client.Client {
 }
 
 func newEPPPod(name, namespace, eppName, podIP string, phase corev1.PodPhase) *corev1.Pod {
+	return newEPPPodWithLabels(name, namespace, map[string]string{eppNameLabel: eppName}, podIP, phase)
+}
+
+func newEPPPodWithLabels(name, namespace string, labels map[string]string, podIP string, phase corev1.PodPhase) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
-			Labels:    map[string]string{eppNameLabel: eppName},
+			Labels:    labels,
 		},
 		Status: corev1.PodStatus{Phase: phase, PodIP: podIP},
 	}
@@ -158,6 +162,30 @@ inference_pool_per_pod_queue_size{model_server_pod="p3"} 4
 		}
 		assert.Equal(t, float64(5), byName["epp-1"])
 		assert.Equal(t, float64(4), byName["epp-2"])
+	})
+
+	t.Run("discovers ModelDeployment EPP pods", func(t *testing.T) {
+		c := newEPPFakeClient(t,
+			newEPPPodWithLabels("epp-1", "ns1", map[string]string{
+				modelDeploymentEPPNameLabel: modelDeploymentEPPName(is.Name),
+			}, "10.0.0.1", corev1.PodRunning),
+		)
+		snap, err := newSource(c).Scrape(context.Background(), is, cfg)
+		assert.NoError(t, err)
+		assert.Len(t, snap.Services, 1)
+		assert.Equal(t, "epp-1", snap.Services[0].Name)
+	})
+
+	t.Run("a pod carrying both chart labels is scraped once", func(t *testing.T) {
+		c := newEPPFakeClient(t,
+			newEPPPodWithLabels("epp-1", "ns1", map[string]string{
+				eppNameLabel:                eppName,
+				modelDeploymentEPPNameLabel: modelDeploymentEPPName(is.Name),
+			}, "10.0.0.1", corev1.PodRunning),
+		)
+		snap, err := newSource(c).Scrape(context.Background(), is, cfg)
+		assert.NoError(t, err)
+		assert.Len(t, snap.Services, 1)
 	})
 
 	t.Run("a failing pod is recorded without failing the scrape", func(t *testing.T) {
