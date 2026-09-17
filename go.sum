@@ -88,8 +88,8 @@ github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2
 github.com/inconshreveable/mousetrap v1.1.0/go.mod h1:vpF70FUmC8bwa3OWnCshd2FqLfsEA9PFc4w1p2J65bw=
 github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnrnM=
 github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=
-github.com/kaito-project/kaito v0.11.0 h1:Y8wS9ng4HXr6V1+Wj/dFBEAsLoaiP8mgAedcyUoLZu0=
-github.com/kaito-project/kaito v0.11.0/go.mod h1:WM/XCHYy2z+cKZ5XVq+AAjUIIIlFds4e3Z/CU8N23As=
+github.com/kaito-project/kaito v0.12.0 h1:gRT8OqL7e9FDb+JJ7PCE4y53lVG2A3is8UZN+LObu/0=
+github.com/kaito-project/kaito v0.12.0/go.mod h1:oFQmRlvVe4JooBV3pdI4U6qS5/P6qRfREt07qaZqznI=
 github.com/kedacore/keda/v2 v2.20.2 h1:SR60v8uIcelbveS8n/1jcl8tLdBBIbHMxmdOHw8tKqA=
 github.com/kedacore/keda/v2 v2.20.2/go.mod h1:wrV1MP6buZQ1S5/J/R7UyBeJr857x92E43LADVoSajs=
 github.com/klauspost/compress v1.19.1 h1:VsB4HPswih7mmZ8WleSFQ75c/Ui1M4trX5oAsJnhSlk=
