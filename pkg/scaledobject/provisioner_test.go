@@ -299,15 +299,12 @@ func TestBuildScaledObject(t *testing.T) {
 }
 
 // scaleToZeroAnnotations returns a minimal configuration that satisfies every
-// scale-to-zero rule: an EPP-observed activation signal so the workload can
-// wake, a backend-observed deactivation signal so it can be parked safely, and
-// an up/down band so the 1..N range still scales.
+// scale-to-zero rule: a paired EPP-observed activation/deactivation signal so
+// queued work can wake and hold the workload, a backend-observed deactivation
+// signal so it can be parked safely, and an up/down band for the 1..N range.
 func scaleToZeroAnnotations() map[string]string {
 	return metricsAnn(`
-- name: inference_pool_per_pod_queue_size
-  type: gauge
-  source: epp
-  activationthreshold: 0
+- {name: inference_pool_per_pod_queue_size, type: gauge, source: epp, activationthreshold: 0, deactivationthreshold: 0}
 - name: vllm:num_requests_running
   type: gauge
   deactivationthreshold: 0
@@ -326,6 +323,7 @@ func TestParseMetricsConfig_ScaleToZero(t *testing.T) {
 		assert.Equal(t, "epp", cfg.metrics[0].source)
 		assert.Equal(t, "sum", cfg.metrics[0].aggregation)
 		assert.Equal(t, "0", cfg.metrics[0].activationThreshold)
+		assert.Equal(t, "0", cfg.metrics[0].deactivationThreshold)
 		assert.False(t, cfg.metrics[0].hasUpDownBand())
 
 		assert.Equal(t, "modelpod", cfg.metrics[1].source)
@@ -370,22 +368,29 @@ func TestParseMetricsConfig_ScaleToZero(t *testing.T) {
 		assert.ErrorContains(t, err, "activationthreshold")
 	})
 
-	t.Run("a metric may declare only an activation band when the minimum is zero", func(t *testing.T) {
+	t.Run("a metric may omit the up and down band when the minimum is zero", func(t *testing.T) {
 		cfg, err := parseMetricsConfig(scaleToZeroAnnotations(), 0)
 		assert.NoError(t, err)
 		assert.Empty(t, cfg.metrics[0].upThreshold)
 		assert.Empty(t, cfg.metrics[0].downThreshold)
 	})
 
-	// A half-declared band would compare against a threshold the other
-	// direction never sets, so it is rejected in both modes.
-	t.Run("a partial up/down band is always rejected", func(t *testing.T) {
+	t.Run("activation requires an explicit deactivation threshold", func(t *testing.T) {
 		ann := metricsAnn(`
 - name: inference_pool_per_pod_queue_size
   type: gauge
   source: epp
   activationthreshold: 0
-  upthreshold: 10
+`)
+		_, err := parseMetricsConfig(ann, 0)
+		assert.ErrorContains(t, err, "activationthreshold requires deactivationthreshold on the same metric")
+	})
+
+	// A half-declared band would compare against a threshold the other
+	// direction never sets, so it is rejected in both modes.
+	t.Run("a partial up/down band is always rejected", func(t *testing.T) {
+		ann := metricsAnn(`
+- {name: inference_pool_per_pod_queue_size, type: gauge, source: epp, activationthreshold: 0, deactivationthreshold: 0, upthreshold: 10}
 `)
 		_, err := parseMetricsConfig(ann, 0)
 		assert.ErrorContains(t, err, "must be declared together")
@@ -446,10 +451,7 @@ func TestParseMetricsConfig_ScaleToZero(t *testing.T) {
 	// metric of the same name would shadow it.
 	t.Run("the replica_count name is reserved when the minimum is zero", func(t *testing.T) {
 		ann := metricsAnn(`
-- name: replica_count
-  type: gauge
-  source: epp
-  activationthreshold: 0
+- {name: replica_count, type: gauge, source: epp, activationthreshold: 0, deactivationthreshold: 0}
 `)
 		_, err := parseMetricsConfig(ann, 0)
 		assert.ErrorContains(t, err, "reserved")
@@ -483,11 +485,7 @@ func TestParseMetricsConfig_ScaleToZero(t *testing.T) {
 
 	t.Run("an explicit aggregation override is honoured", func(t *testing.T) {
 		ann := metricsAnn(`
-- name: inference_pool_per_pod_queue_size
-  type: gauge
-  source: epp
-  aggregation: service-avg
-  activationthreshold: 0
+- {name: inference_pool_per_pod_queue_size, type: gauge, source: epp, aggregation: service-avg, activationthreshold: 0, deactivationthreshold: 0}
 - name: vllm:num_requests_running
   type: gauge
   deactivationthreshold: 0
@@ -530,10 +528,7 @@ func TestBuildScaleToZeroFormula(t *testing.T) {
 
 	t.Run("0..1 collapses to deactivate or hold", func(t *testing.T) {
 		cfg, err := parseMetricsConfig(metricsAnn(`
-- name: inference_pool_per_pod_queue_size
-  type: gauge
-  source: epp
-  activationthreshold: 0
+- {name: inference_pool_per_pod_queue_size, type: gauge, source: epp, activationthreshold: 0, deactivationthreshold: 0}
 - name: vllm:num_requests_running
   type: gauge
   deactivationthreshold: 0
@@ -549,10 +544,7 @@ func TestBuildScaleToZeroFormula(t *testing.T) {
 
 	t.Run("0..N without an up-down band leaves the 1 to N range inert", func(t *testing.T) {
 		cfg, err := parseMetricsConfig(metricsAnn(`
-- name: inference_pool_per_pod_queue_size
-  type: gauge
-  source: epp
-  activationthreshold: 0
+- {name: inference_pool_per_pod_queue_size, type: gauge, source: epp, activationthreshold: 0, deactivationthreshold: 0}
 - name: vllm:num_requests_running
   type: gauge
   deactivationthreshold: 0
@@ -570,15 +562,8 @@ func TestBuildScaleToZeroFormula(t *testing.T) {
 	// every signal must agree before it is parked.
 	t.Run("activation ORs and deactivation ANDs", func(t *testing.T) {
 		cfg, err := parseMetricsConfig(metricsAnn(`
-- name: inference_pool_per_pod_queue_size
-  type: gauge
-  source: epp
-  activationthreshold: 0
-  deactivationthreshold: 0
-- name: kv_cache_utilization
-  type: gauge
-  source: epp
-  activationthreshold: 1
+- {name: inference_pool_per_pod_queue_size, type: gauge, source: epp, activationthreshold: 0, deactivationthreshold: 0}
+- {name: kv_cache_utilization, type: gauge, source: epp, activationthreshold: 1, deactivationthreshold: 1}
 - name: vllm:num_requests_running
   type: gauge
   deactivationthreshold: 0

@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -88,6 +89,17 @@ func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 func newTestScaler(c client.Client, sc metricsource.MetricSource, ag aggregator.Aggregator) *KaitoScaler {
 	cache := NewMetricCache(c, map[string]metricsource.MetricSource{metricsource.ModelPodSourceName: sc})
 	return NewKaitoScaler(c, cache, map[string]aggregator.Aggregator{aggregator.SumAggregatorName: ag})
+}
+
+func eventFrom(t *testing.T, recorder *record.FakeRecorder) string {
+	t.Helper()
+	select {
+	case event := <-recorder.Events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Kubernetes Event")
+		return ""
+	}
 }
 
 func newValidScalerMetadata() map[string]string {
@@ -335,13 +347,39 @@ func TestKaitoScaler_GetMetrics(t *testing.T) {
 	t.Run("metric source failure bubbles up", func(t *testing.T) {
 		sc := &stubSource{err: errors.New("boom")}
 		ag := &stubAggregator{}
-		s := newTestScaler(newFakeClient(t, is), sc, ag)
+		c := newFakeClient(t, is)
+		cache := NewMetricCache(c, map[string]metricsource.MetricSource{metricsource.ModelPodSourceName: sc})
+		recorder := record.NewFakeRecorder(1)
+		s := NewKaitoScalerWithAPIReaderAndRecorder(c, c, cache,
+			map[string]aggregator.Aggregator{aggregator.SumAggregatorName: ag}, recorder)
 		_, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
 			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: newValidScalerMetadata()},
 			MetricName:      "vllm:num_requests_waiting",
 		})
 		assert.Error(t, err)
 		assert.Equal(t, 0, ag.callCount)
+		assert.Contains(t, eventFrom(t, recorder), "Warning MetricsUnavailable")
+	})
+
+	t.Run("aggregation failure emits an event", func(t *testing.T) {
+		snap := &metricsource.MetricSnapshot{
+			InferenceSet: types.NamespacedName{Namespace: "ns1", Name: "is1"},
+			Services:     []metricsource.ServiceMetrics{{Name: "ws0", Namespace: "ns1"}},
+		}
+		c := newFakeClient(t, is)
+		cache := NewMetricCache(c, map[string]metricsource.MetricSource{
+			metricsource.ModelPodSourceName: &stubSource{snapshot: snap},
+		})
+		recorder := record.NewFakeRecorder(1)
+		s := NewKaitoScalerWithAPIReaderAndRecorder(c, c, cache,
+			map[string]aggregator.Aggregator{aggregator.SumAggregatorName: &stubAggregator{err: errors.New("boom")}}, recorder)
+
+		_, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{
+			ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: newValidScalerMetadata()},
+			MetricName:      "vllm:num_requests_waiting",
+		})
+		assert.ErrorContains(t, err, "boom")
+		assert.Contains(t, eventFrom(t, recorder), "Warning MetricAggregationFailed")
 	})
 }
 

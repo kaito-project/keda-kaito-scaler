@@ -140,15 +140,16 @@ Each entry in the `metrics` list accepts the following fields:
 | `aggregation` | no | derived from `type` and `source` | Overrides the derived reduction. One of `sum`, `service-avg`, `windowed-avg`. `windowed-avg` is only valid for `histogram`; the others only for `gauge`. |
 | `upthreshold` | yes¹ | – | Scale-up threshold (float) for the 1..N range. |
 | `downthreshold` | yes¹ | – | Scale-down threshold (float) for the 1..N range. Must be `<= upthreshold`. |
-| `activationthreshold` | no² | – | Wake threshold for the 0 → 1 transition. Requires `min-replicas: "0"` and `source: epp`. |
-| `deactivationthreshold` | no² | – | Park threshold for the 1 → 0 transition. Requires `min-replicas: "0"`. Must be `<= activationthreshold` when both are set on the same metric. |
+| `activationthreshold` | no² | – | Wake threshold for the 0 → 1 transition. Requires `min-replicas: "0"`, `source: epp`, and a `deactivationthreshold` on the same metric. |
+| `deactivationthreshold` | no² | – | Park threshold for the 1 → 0 transition. Requires `min-replicas: "0"`. May be declared without activation for backend occupancy; when paired, it must be `<= activationthreshold`. |
 | `metriccachewindow` | no | `300` | Rolling cache window in **seconds** over which a `histogram` metric is averaged. Each histogram metric may set its own; rejected on `gauge` metrics. |
 
 ¹ Required unless `min-replicas` is `"0"`, where a metric may carry only an
 activation/deactivation band. Up/down thresholds must still be declared
 together; without any such band, a running workload holds at one replica.
 
-² Only accepted when `min-replicas` is `"0"`.
+² Only accepted when `min-replicas` is `"0"`. Every activation threshold must
+be paired with an explicit deactivation threshold on the same metric.
 
 The remaining global annotations:
 
@@ -493,7 +494,8 @@ The 1..N range keeps working exactly as described above. Scale to zero adds the
 
 - **`activationthreshold`** wakes the workload. Any single metric crossing it is
   enough (an **OR**), because a request that cannot be served is reason enough to
-  start.
+  start. It must have a `deactivationthreshold` on the same metric; the scaler
+  does not infer one from the activation value.
 - **`deactivationthreshold`** parks it. *Every* metric that declares one must
   agree the workload is idle (an **AND**), and the wait before parking is
   governed by `cooldownperiod`.
@@ -575,6 +577,7 @@ metadata:
         type: gauge
         source: epp
         activationthreshold: 0
+        deactivationthreshold: 0
       # 1 -> 0: park only once the backend itself is idle.
       # 1 <-> N: the usual up/down band.
       - name: vllm:num_requests_running
@@ -606,7 +609,8 @@ applying either decision:
 ```text
 (replica_count == 0)
   ? ((inference_pool_per_pod_queue_size > 0) ? 1.0 : 0.0)   // 0 -> 1
-  : ((vllm_num_requests_running <= 0)        ? 0.0          // 1 -> 0
+  : ((inference_pool_per_pod_queue_size <= 0 &&
+      vllm_num_requests_running <= 0)        ? 0.0          // 1 -> 0
      : ((readiness_gate == 1 && vllm_num_requests_running > 10) ? 2.0   // scale up
         : ((vllm_num_requests_running < 2)                      ? 0.5   // scale down
            : 1.0)))                                                     // hold
@@ -628,7 +632,7 @@ omitted entirely and the formula collapses to the 0 ↔ 1 decision.
   does not itself scale the workload back up.
 - Every metric carrying an `activationthreshold` must use `source: epp`; there is
   no way to supply a custom EPP selector, as the name is derived from the
-  `InferenceSet` name.
+  `InferenceSet` name. It must also carry an explicit `deactivationthreshold`.
 
 #### Option 2: Manual mode (recommended for time-based scaling)
 

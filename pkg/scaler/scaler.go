@@ -27,6 +27,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -38,6 +39,9 @@ import (
 
 const (
 	ScalerName = "keda-kaito-scaler"
+
+	reasonMetricsUnavailable      = "MetricsUnavailable"
+	reasonMetricAggregationFailed = "MetricAggregationFailed"
 
 	// Defaults applied when the corresponding metadata key is omitted. Only
 	// inferenceSetName/inferenceSetNamespace/metricName remain always mandatory;
@@ -102,6 +106,7 @@ type KaitoScaler struct {
 	serviceReader client.Reader
 	aggregators   map[string]aggregator.Aggregator
 	cache         *MetricCache
+	recorder      record.EventRecorder
 	externalscaler.UnimplementedExternalScalerServer
 }
 
@@ -118,11 +123,18 @@ func NewKaitoScaler(kubeClient client.Client, cache *MetricCache, aggregators ma
 // NewKaitoScalerWithAPIReader uses apiReader for uncached Service lookups. This
 // avoids starting a Service informer for a point lookup that only needs get RBAC.
 func NewKaitoScalerWithAPIReader(kubeClient client.Client, apiReader client.Reader, cache *MetricCache, aggregators map[string]aggregator.Aggregator) *KaitoScaler {
+	return NewKaitoScalerWithAPIReaderAndRecorder(kubeClient, apiReader, cache, aggregators, nil)
+}
+
+// NewKaitoScalerWithAPIReaderAndRecorder additionally emits Kubernetes Events
+// for runtime metric failures that cannot be caught during provisioning.
+func NewKaitoScalerWithAPIReaderAndRecorder(kubeClient client.Client, apiReader client.Reader, cache *MetricCache, aggregators map[string]aggregator.Aggregator, recorder record.EventRecorder) *KaitoScaler {
 	return &KaitoScaler{
 		kubeClient:    kubeClient,
 		serviceReader: apiReader,
 		cache:         cache,
 		aggregators:   aggregators,
+		recorder:      recorder,
 	}
 }
 
@@ -253,6 +265,9 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 	// aggregator).
 	snapshot, ok := e.cache.Current(ctx, is, scrapeCfg, scalerConfig.MetricSource, scalerConfig.MetricCacheWindow)
 	if !ok {
+		e.eventf(scalerConfig, reasonMetricsUnavailable,
+			"Metrics for metric %q from source %q are unavailable (scrape failing or cache cold)",
+			scalerConfig.MetricName, scalerConfig.MetricSource)
 		return nil, status.Error(codes.Unavailable, fmt.Sprintf("metrics for InferenceSet %s/%s are not available yet (scrape failing or cold)", scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName))
 	}
 	if scalerConfig.MetricSource == metricsource.EPPSourceName &&
@@ -277,11 +292,26 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		Window:       scalerConfig.MetricCacheWindow,
 	})
 	if err != nil {
+		e.eventf(scalerConfig, reasonMetricAggregationFailed,
+			"Failed to aggregate metric %q using %q: %v",
+			scalerConfig.MetricName, scalerConfig.Aggregation, err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	klog.V(4).Infof("aggregated metric %q for InferenceSet %s/%s: %f", scalerConfig.MetricName, scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, value)
 
 	return newMetricValueResponse(scalerConfig.MetricName, value), nil
+}
+
+func (e *KaitoScaler) eventf(cfg *Config, reason, messageFmt string, args ...any) {
+	if e.recorder == nil {
+		return
+	}
+	e.recorder.Eventf(&kaitov1beta1.InferenceSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cfg.InferenceSetName,
+			Namespace: cfg.InferenceSetNamespace,
+		},
+	}, corev1.EventTypeWarning, reason, messageFmt, args...)
 }
 
 func (e *KaitoScaler) hasModelService(ctx context.Context, inferenceSet *kaitov1beta1.InferenceSet) (bool, error) {

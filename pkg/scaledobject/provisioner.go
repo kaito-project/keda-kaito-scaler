@@ -204,8 +204,9 @@ type metric struct {
 	upThreshold   string
 	downThreshold string
 	// activationThreshold and deactivationThreshold drive the 0 -> 1 and 1 -> 0
-	// branches respectively. Both are empty unless the ScaledObject's minimum is
-	// 0, where at least one metric must supply each side.
+	// branches respectively. An activation threshold always has an explicit
+	// deactivation threshold on the same metric; backend metrics may declare only
+	// deactivation so parking accounts for in-flight work.
 	activationThreshold   string
 	deactivationThreshold string
 	// metricCacheWindow is the cache window in seconds (as a string, e.g. "300")
@@ -314,11 +315,11 @@ type metricSpec struct {
 	// DownThreshold is the scale-down threshold (must be <= upthreshold).
 	DownThreshold *float64 `json:"downthreshold"`
 	// ActivationThreshold wakes the workload (0 -> 1) when exceeded. Only valid
-	// when the ScaledObject's minimum is 0, and only on a source observable
-	// while the workload is parked.
+	// when the ScaledObject's minimum is 0, only on a source observable while the
+	// workload is parked, and only when paired with DeactivationThreshold.
 	ActivationThreshold *float64 `json:"activationthreshold,omitempty"`
 	// DeactivationThreshold parks the workload (1 -> 0) when every metric that
-	// declares one falls below it. Only valid when the minimum is 0.
+	// declares one is at or below it. Only valid when the minimum is 0.
 	DeactivationThreshold *float64 `json:"deactivationthreshold,omitempty"`
 	// Aggregation overrides the aggregation otherwise derived from Type.
 	Aggregation string `json:"aggregation,omitempty"`
@@ -425,6 +426,9 @@ func parseMetricsConfig(annotations map[string]string, minReplicas int) (metrics
 
 		if spec.ActivationThreshold != nil && source != metricsource.EPPSourceName {
 			return cfg, fmt.Errorf("metric %q (index %d): activationthreshold requires a source observable at zero replicas (%q), got %q", spec.Name, i, metricsource.EPPSourceName, source)
+		}
+		if spec.ActivationThreshold != nil && spec.DeactivationThreshold == nil {
+			return cfg, fmt.Errorf("metric %q (index %d): activationthreshold requires deactivationthreshold on the same metric", spec.Name, i)
 		}
 
 		up, err := finiteThreshold(spec.UpThreshold, "upthreshold", spec.Name, i)
@@ -642,10 +646,6 @@ func buildScaleToZeroFormula(cfg metricsConfig, maxReplicas int) string {
 		}
 		if m.deactivationThreshold != "" {
 			deactivationConds = append(deactivationConds, fmt.Sprintf("%s <= %s", v, m.deactivationThreshold))
-		} else if m.activationThreshold != "" {
-			// An activation signal must also be idle before a running workload can
-			// park. This keeps queued work alive while its backend is provisioning.
-			deactivationConds = append(deactivationConds, fmt.Sprintf("%s <= %s", v, m.activationThreshold))
 		}
 		if m.hasUpDownBand() {
 			upConds = append(upConds, fmt.Sprintf("%s > %s", v, m.upThreshold))

@@ -217,7 +217,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	// listening, so the manager alone drives the full lifecycle.
 	lo.Must0(mgr.Add(scaler.NewRunnable(scaler.ServerConfig{
 		Port: opts.GrpcPort,
-		Service: scaler.NewKaitoScalerWithAPIReader(
+		Service: scaler.NewKaitoScalerWithAPIReaderAndRecorder(
 			mgr.GetClient(),
 			mgr.GetAPIReader(),
 			metricCache,
@@ -228,6 +228,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 				// itself (it holds the rolling snapshot window).
 				constants.AggregationWindowedAvg: metricCache,
 			},
+			mgr.GetEventRecorderFor(KedaKaitoScaler),
 		),
 		GetServerCertificate: cert.NewServerCertLoader(secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName, ServerCert, ServerKey),
 		LoadRootCAs:          cert.NewRootCAsLoader(secretLister, opts.WorkingNamespace, opts.ScalerClientSecretName, CACert),
