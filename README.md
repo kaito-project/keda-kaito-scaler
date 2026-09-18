@@ -11,8 +11,8 @@ The KEDA Kaito Scaler provides intelligent autoscaling for vLLM inference worklo
 - **🚀 Zero Dependencies**: No Prometheus stack required - directly scrapes metrics from inference pods
 - **⚡ Simple Configuration**: Minimal YAML configuration with intelligent defaults
 - **🎯 GPU-Optimized**: Conservative scaling policies designed for expensive GPU resources
-- **� Scale to Zero**: Optionally release GPU capacity entirely while idle and reacquire it on the next request
-- **�🔒 Secure by Default**: Built-in TLS authentication between components
+- **💤 Scale to Zero**: Optionally release GPU capacity entirely while idle and reacquire it on the next request
+- **🔒 Secure by Default**: Built-in TLS authentication between components
 - **📊 Smart Fallback**: Intelligent handling of missing metrics to prevent scaling flapping
 - **🔧 Minimal Maintenance**: Self-managing certificates and authentication
 
@@ -532,9 +532,10 @@ following hold:
    reconcile the EPP before then, so a freshly created `InferenceSet` has no EPP
    for its first few reconciles.
 
-If no EPP pod is found, the controller still provisions the `ScaledObject` but
-emits an `EPPNotFound` warning `Event` naming the label selector it looked for.
-Condition 3 resolves on its own; conditions 1 and 2 do not.
+The controller provisions the `ScaledObject` without waiting for the EPP. Until
+a ready EPP pod exists, KEDA's metric requests fail with a diagnostic naming the
+selectors used for discovery, so the current replica count is held. Condition 3
+resolves on its own; conditions 1 and 2 do not.
 
 `InferenceSet`s owned by a `MultiRoleInference` are **rejected** for scale to
 zero (`UnsupportedTopology` warning `Event`): KAITO gives the group a single
