@@ -131,7 +131,7 @@ func EPPSelectorDescription(inferenceSetName string) string {
 // Finding no pods is not an error here: KAITO creates the EPP only for a vLLM,
 // preset-based InferenceSet with the Gateway API Inference Extension feature
 // gate on, and even then not until the first Workspace exists. The empty
-// snapshot is passed through so the aggregator decides how to report it.
+// snapshot is passed through so GetMetrics can report the expected selectors.
 func (s *EPPSource) Scrape(ctx context.Context, is *kaitov1beta1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error) {
 	selectors := []map[string]string{
 		{eppNameLabel: EPPName(is.Name)},

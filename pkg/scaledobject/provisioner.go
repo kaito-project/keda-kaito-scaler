@@ -291,8 +291,9 @@ type metricsConfig struct {
 // representation.
 //
 // minReplicas selects the rule set: scale-to-zero configurations make the
-// up/down band optional and add the activation rules, so the same annotations
-// can be valid under one minimum and invalid under another.
+// up/down band optional and add activation/deactivation rules for the 0 <-> 1
+// edge, so the same annotations can be valid under one minimum and invalid
+// under another.
 func ValidateConfig(annotations map[string]string, minReplicas int) error {
 	_, err := parseMetricsConfig(annotations, minReplicas)
 	return err
