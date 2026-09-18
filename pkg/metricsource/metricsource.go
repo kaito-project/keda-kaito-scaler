@@ -91,6 +91,13 @@ type MetricSnapshot struct {
 // "metricsource" annotation / metricSource metadata value.
 const ModelPodSourceName = "modelpod"
 
+// EPPSourceName is the registered name of the metric source that collects
+// metrics from the Endpoint Picker (EPP) pods KAITO deploys alongside an
+// InferenceSet. Unlike ModelPodSourceName it keeps reporting while the
+// InferenceSet sits at zero replicas, which is what makes activation
+// thresholds observable.
+const EPPSourceName = "epp"
+
 // MetricSource collects metrics from every service that backs an InferenceSet and
 // returns a MetricSnapshot. Implementations must be safe for concurrent use.
 type MetricSource interface {

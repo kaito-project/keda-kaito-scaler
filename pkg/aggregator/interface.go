@@ -26,8 +26,8 @@ import (
 type AggregateInput struct {
 	// MetricName is the metric family to aggregate.
 	MetricName string
-	// Threshold is the per-replica scale threshold; used by sum-style aggregators
-	// to compensate for services that could not be scraped. Ignored by others.
+	// Threshold is the per-replica scale threshold; used by SumAggregator to
+	// compensate for services that could not be scraped. Ignored by others.
 	Threshold float64
 	// InferenceSet, MetricSource, ScrapeConfig and Window let the windowed-average
 	// aggregation locate the target's cached snapshot window (by the same key the

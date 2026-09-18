@@ -86,6 +86,18 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 			wantValue: 20,
 		},
 		{
+			name: "zero threshold disables missing service compensation",
+			snapshot: &metricsource.MetricSnapshot{
+				Services: []metricsource.ServiceMetrics{
+					{Name: "a", Metrics: map[string]float64{"m": 3}},
+					{Name: "b", Err: errors.New("scrape failed")},
+				},
+			},
+			metricName: "m",
+			threshold:  0,
+			wantValue:  3,
+		},
+		{
 			name: "metric name missing on a scraped service counts as zero",
 			snapshot: &metricsource.MetricSnapshot{
 				Services: []metricsource.ServiceMetrics{
@@ -127,9 +139,12 @@ func TestSumAggregator_Aggregate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			val, err := agg.Aggregate(tt.snapshot, AggregateInput{MetricName: tt.metricName, Threshold: tt.threshold})
+			val, err := agg.Aggregate(tt.snapshot, AggregateInput{
+					MetricName: tt.metricName,
+					Threshold:  tt.threshold,
+			})
 			if tt.wantErr {
-				assert.Error(t, err)
+					assert.Error(t, err)
 				return
 			}
 			assert.NoError(t, err)
