@@ -57,6 +57,9 @@ const (
 	// controller consumes on an InferenceSet. Any change to a key under this
 	// prefix (including the metrics list annotation) triggers a reconcile.
 	annotationPrefix = "scaledobject.kaito.sh/"
+
+	reasonInvalidConfig       = "InvalidConfig"
+	reasonInvalidReplicaRange = "InvalidReplicaRange"
 )
 
 type Controller struct {
@@ -88,7 +91,17 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSe
 		return reconcile.Result{}, c.cleanupManagedScaledObjects(ctx, is)
 	}
 
-	if !autoscalingConfigValid(is) {
+	// Resolved before validation: the minimum decides which validation rules
+	// apply, since scale-to-zero relaxes some and tightens others (D10).
+	minReplicas := resolveMinReplicas(is.Annotations)
+
+	if reason, err := autoscalingConfigError(is, minReplicas); err != nil {
+		logger.Info("skip reconciling inference set because autoscaling config is invalid",
+			"namespace", is.Namespace, "name", is.Name, "reason", reason, "error", err.Error())
+		if c.Recorder != nil {
+			c.Recorder.Eventf(is, corev1.EventTypeWarning, reason,
+				"Skip auto-provisioning ScaledObject: %v", err)
+		}
 		return reconcile.Result{}, nil
 	}
 
@@ -102,13 +115,12 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSe
 		return reconcile.Result{RequeueAfter: requeueInterval}, nil
 	}
 
-	minReplicas := resolveMinReplicas(is.Annotations)
 	if maxReplicas < minReplicas {
 		logger.Info("skip reconciling inference set because max-replicas is less than min-replicas",
 			"namespace", is.Namespace, "name", is.Name,
 			"minReplicas", minReplicas, "maxReplicas", maxReplicas)
 		if c.Recorder != nil {
-			c.Recorder.Eventf(is, corev1.EventTypeWarning, "InvalidReplicaRange",
+			c.Recorder.Eventf(is, corev1.EventTypeWarning, reasonInvalidReplicaRange,
 				"Skip auto-provisioning ScaledObject: max-replicas (%d) is less than min-replicas (%d)",
 				maxReplicas, minReplicas)
 		}
@@ -133,11 +145,12 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSe
 		logger.Info("skip reconciling inference set because autoscaling config is invalid",
 			"namespace", is.Namespace, "name", is.Name, "error", err.Error())
 		if c.Recorder != nil {
-			c.Recorder.Eventf(is, corev1.EventTypeWarning, "InvalidConfig",
+			c.Recorder.Eventf(is, corev1.EventTypeWarning, reasonInvalidConfig,
 				"Skip auto-provisioning ScaledObject: %v", err)
 		}
 		return reconcile.Result{}, nil
 	}
+
 	return reconcile.Result{}, c.syncDesired(ctx, managedScaledObjects, desired)
 }
 
@@ -273,6 +286,10 @@ func (c *Controller) reconcileTo(ctx context.Context, existing, desired *v1alpha
 		existing.Spec.PollingInterval = desired.Spec.PollingInterval
 		updated = true
 	}
+	if !equalInt32Ptr(existing.Spec.CooldownPeriod, desired.Spec.CooldownPeriod) {
+		existing.Spec.CooldownPeriod = desired.Spec.CooldownPeriod
+		updated = true
+	}
 	if !reflect.DeepEqual(existing.Spec.Triggers, desired.Spec.Triggers) {
 		existing.Spec.Triggers = desired.Spec.Triggers
 		updated = true
@@ -361,7 +378,12 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			if !ok {
 				return false
 			}
-			return autoProvisionRequested(inferenceSet) && autoscalingConfigValid(inferenceSet)
+			if isMultiRoleInferenceChild(inferenceSet) {
+				return false
+			}
+			// Deliberately does not filter on config validity: an invalid config
+			// must still reach Reconcile so it can be reported as an Event.
+			return autoProvisionRequested(inferenceSet)
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldInferenceSet, ok := e.ObjectOld.(*kaitov1beta1.InferenceSet)
@@ -373,15 +395,18 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			if !ok {
 				return false
 			}
+			if isMultiRoleInferenceChild(newInferenceSet) {
+				return false
+			}
 
 			// Reconcile when any autoscaling annotation changes. Comparing by
 			// prefix covers all scaledobject.kaito.sh/ keys, including the
 			// scaledobject.kaito.sh/metrics list annotation.
 			if annotationsWithPrefixChanged(oldInferenceSet.Annotations, newInferenceSet.Annotations, annotationPrefix) {
-				// Fire when the new state is validly enabled (provision/update) or
-				// the old state requested auto-provisioning (so toggling the
-				// annotation off still triggers cleanup of the ScaledObject).
-				return (autoProvisionRequested(newInferenceSet) && autoscalingConfigValid(newInferenceSet)) || autoProvisionRequested(oldInferenceSet)
+				// Fire when the new state requests auto-provisioning (provision,
+				// update, or report an invalid config) or the old state did (so
+				// toggling the annotation off still triggers cleanup).
+				return autoProvisionRequested(newInferenceSet) || autoProvisionRequested(oldInferenceSet)
 			}
 			return false
 		},
@@ -391,9 +416,17 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 	}
 }
 
+func isMultiRoleInferenceChild(inferenceSet *kaitov1beta1.InferenceSet) bool {
+	owner := metav1.GetControllerOf(inferenceSet)
+	return owner != nil && owner.Kind == constants.MultiRoleInference
+}
+
+// resolveMinReplicas reads the min-replicas annotation. 0 is meaningful (it
+// requests scale-to-zero) and is returned verbatim; anything unparsable or
+// negative falls back to 1, matching the historical behaviour for those inputs.
 func resolveMinReplicas(annotations map[string]string) int {
 	if minReplicasStr, ok := annotations[constants.AnnotationKeyMinReplicas]; ok {
-		if v, err := strconv.Atoi(minReplicasStr); err == nil && v > 1 {
+		if v, err := strconv.Atoi(minReplicasStr); err == nil && v >= 0 {
 			if v > math.MaxInt32 {
 				return math.MaxInt32
 			}
@@ -403,23 +436,41 @@ func resolveMinReplicas(annotations map[string]string) int {
 	return 1
 }
 
-// autoscalingConfigValid reports whether the InferenceSet's autoscaling
-// configuration is valid enough to provision a ScaledObject. It assumes the
-// caller has already confirmed auto-provisioning was requested (see
+// autoscalingConfigError validates the InferenceSet's autoscaling
+// configuration and returns the Event reason and an error describing the first
+// problem found, or an empty reason and nil when the configuration is valid. It
+// assumes the caller has already confirmed auto-provisioning was requested (see
 // autoProvisionRequested) and only validates the replica bounds and the
 // auto-provision configuration.
-func autoscalingConfigValid(inferenceSet *kaitov1beta1.InferenceSet) bool {
-	// if max-replicas annotation exists, max replicas should be more than 1
-	// if not exists, NodeCountLimit should be more than 1, we will use it to calculate max replicas
+//
+// Rejections are reported rather than swallowed: a misconfigured annotation
+// otherwise produces no ScaledObject and no signal at all, leaving the user with
+// nothing to debug.
+func autoscalingConfigError(inferenceSet *kaitov1beta1.InferenceSet, minReplicas int) (string, error) {
+	// If max-replicas is absent, NodeCountLimit is used to calculate it.
 	if maxReplicasStr, ok := inferenceSet.Annotations[constants.AnnotationKeyMaxReplicas]; ok {
-		if maxReplicas, err := strconv.Atoi(maxReplicasStr); err != nil || maxReplicas <= 1 {
-			return false
+		maxReplicas, err := strconv.Atoi(maxReplicasStr)
+		if err != nil {
+			return reasonInvalidReplicaRange, fmt.Errorf("%s=%q is not a valid integer",
+				constants.AnnotationKeyMaxReplicas, maxReplicasStr)
+		}
+		if maxReplicas < 1 {
+			return reasonInvalidReplicaRange, fmt.Errorf("%s (%d) must be at least 1",
+				constants.AnnotationKeyMaxReplicas, maxReplicas)
+		}
+		if maxReplicas < minReplicas {
+			return reasonInvalidReplicaRange, fmt.Errorf("%s (%d) must be greater than or equal to %s (%d)",
+				constants.AnnotationKeyMaxReplicas, maxReplicas, constants.AnnotationKeyMinReplicas, minReplicas)
 		}
 	} else if inferenceSet.Spec.NodeCountLimit == 0 {
-		return false
+		return reasonInvalidReplicaRange, fmt.Errorf("neither %s nor spec.nodeCountLimit is set, so the maximum replica count cannot be derived",
+			constants.AnnotationKeyMaxReplicas)
 	}
 
-	return scaledobject.ValidateConfig(inferenceSet.Annotations) == nil
+	if err := scaledobject.ValidateConfig(inferenceSet.Annotations, minReplicas); err != nil {
+		return reasonInvalidConfig, err
+	}
+	return "", nil
 }
 
 // autoProvisionRequested reports whether the InferenceSet opts into
