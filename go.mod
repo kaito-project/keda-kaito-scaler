@@ -6,7 +6,7 @@ require (
 	github.com/kaito-project/kaito v0.13.0-rc.0
 	github.com/kedacore/keda/v2 v2.21.0
 	github.com/open-policy-agent/cert-controller v0.16.0
-	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/prometheus/common v1.20.99
 	github.com/samber/lo v1.53.0
