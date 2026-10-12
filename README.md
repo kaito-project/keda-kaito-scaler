@@ -11,7 +11,7 @@ The KEDA Kaito Scaler provides intelligent autoscaling for vLLM inference worklo
 - **🚀 Zero Dependencies**: No Prometheus stack required - directly scrapes metrics from inference pods
 - **⚡ Simple Configuration**: Minimal YAML configuration with intelligent defaults
 - **🎯 GPU-Optimized**: Conservative scaling policies designed for expensive GPU resources
-- **💤 Scale to Zero**: Optionally release GPU capacity entirely while idle and reacquire it on the next request
+- **💤 Scale to Zero (0 ↔ 1)** *(new in v0.7.0)*: Optionally release GPU capacity entirely while idle (1 → 0) and reacquire it on the next request (0 → 1) — see [Scale to zero](#scale-to-zero)
 - **🔒 Secure by Default**: Built-in TLS authentication between components
 - **📊 Smart Fallback**: Intelligent handling of missing metrics to prevent scaling flapping
 - **🔧 Minimal Maintenance**: Self-managing certificates and authentication
@@ -53,6 +53,8 @@ helm install keda kedacore/keda --namespace keda --create-namespace
 ### Deploy KEDA Kaito Scaler
 
 > autoscaling of KAITO GPU inference workloads requires KEDA Kaito Scaler version v0.3.3 or higher.
+>
+> [Scale to zero](#scale-to-zero) (scaling between 0 and 1 replicas) requires KEDA Kaito Scaler version v0.7.0 or higher.
 
 ```bash
 helm repo add keda-kaito-scaler https://kaito-project.github.io/keda-kaito-scaler/charts/kaito-project
@@ -67,10 +69,11 @@ helm search repo -l keda-kaito-scaler
 
 ```text
 NAME                                    CHART VERSION   APP VERSION   DESCRIPTION
-keda-kaito-scaler/keda-kaito-scaler     0.3.3           v0.3.3        A Helm chart for Kaito keda-kaito-scaler compon...
-keda-kaito-scaler/keda-kaito-scaler     0.3.0           v0.3.0        A Helm chart for Kaito keda-kaito-scaler compon...
-keda-kaito-scaler/keda-kaito-scaler     0.2.0           v0.2.0        A Helm chart for Kaito keda-kaito-scaler compon...
-keda-kaito-scaler/keda-kaito-scaler     0.0.1           v0.0.1        A Helm chart for Kaito keda-kaito-scaler compon...
+keda-kaito-scaler/keda-kaito-scaler     0.7.0           v0.7.0        A Helm chart for Kaito keda-kaito-scaler compon...
+keda-kaito-scaler/keda-kaito-scaler     0.6.2           v0.6.2        A Helm chart for Kaito keda-kaito-scaler compon...
+keda-kaito-scaler/keda-kaito-scaler     0.6.1           v0.6.1        A Helm chart for Kaito keda-kaito-scaler compon...
+keda-kaito-scaler/keda-kaito-scaler     0.6.0           v0.6.0        A Helm chart for Kaito keda-kaito-scaler compon...
+...
 ```
 
 ```bash
@@ -485,6 +488,8 @@ spec:
 > `histogram` is averaged over its metric cache window.
 
 ##### Scale to zero
+
+> Available since KEDA Kaito Scaler **v0.7.0**.
 
 Setting `scaledobject.kaito.sh/min-replicas: "0"` lets the `InferenceSet` release
 its GPU capacity entirely while idle and reacquire it on the next request.
