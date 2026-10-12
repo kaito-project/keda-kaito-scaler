@@ -9,7 +9,7 @@ on:
   workflow_dispatch: {}
 
 env:
-  GO_VERSION: '1.26.4'
+  GO_VERSION: '1.26.6'
 
 jobs:
   check-files:
@@ -28,7 +28,7 @@ jobs:
       - name: Link Checker
         uses: lycheeverse/lychee-action@v2
         with:
-          args: --base . --verbose --no-progress './**/*.md'
+          args: --base ${{ github.workspace }} --verbose --no-progress './**/*.md'
           fail: false
       - name: Verify Mod
         run: make verify-mod
