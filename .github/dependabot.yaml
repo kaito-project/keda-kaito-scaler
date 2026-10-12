@@ -37,3 +37,7 @@ updates:
     - "release-note-none"
     - "ok-to-test"
     - "kind/cleanup"
+  ignore:
+    # Keep the builder on the Go minor line that downstream (Dalec/Azure Linux) builds support.
+    - dependency-name: "oss/go/microsoft/golang"
+      update-types: ["version-update:semver-major", "version-update:semver-minor"]
