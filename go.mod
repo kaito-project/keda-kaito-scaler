@@ -1,6 +1,6 @@
 module github.com/kaito-project/keda-kaito-scaler
 
-go 1.27.2
+go 1.27.1
 
 require (
 	github.com/kaito-project/kaito v0.13.0-rc.0
