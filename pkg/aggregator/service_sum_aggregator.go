@@ -32,7 +32,7 @@ import (
 //
 //   - scale-up direction (avg of successful samples >= threshold): missing
 //     services contribute 0 (their absence must not prevent scale-up).
-//   - scale-down direction (avg of successful samples <  threshold): missing
+//   - scale-down direction (avg of successful samples < threshold): missing
 //     services contribute the threshold value (their absence must not trigger
 //     further scale-down).
 //
