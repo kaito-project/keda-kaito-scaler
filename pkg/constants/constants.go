@@ -45,9 +45,18 @@ const (
 	AnnotationKeyScaleUpCooldown = "scaledobject.kaito.sh/scaleupcooldown"
 	// AnnotationKeyScaleDownCooldown sets the minimum seconds between scale-down steps.
 	AnnotationKeyScaleDownCooldown = "scaledobject.kaito.sh/scaledowncooldown"
+	// AnnotationKeyCooldownPeriod sets the seconds KEDA waits after the last
+	// active trigger reading before scaling to zero. Only meaningful when
+	// min-replicas is "0": KEDA consults it exclusively on the scale-to-zero
+	// path, so it is rejected rather than ignored for any other minimum.
+	AnnotationKeyCooldownPeriod = "scaledobject.kaito.sh/cooldownperiod"
 
 	// InferenceSet is the Kind of the scale target referenced by managed ScaledObjects.
 	InferenceSet = "InferenceSet"
+
+	// MultiRoleInference is the Kind of the KAITO resource that owns a group of
+	// InferenceSets and shares a single Endpoint Picker across them.
+	MultiRoleInference = "MultiRoleInference"
 	// InferenceSetAPIVersion is the apiVersion of the InferenceSet scale target.
 	InferenceSetAPIVersion = "kaito.sh/v1beta1"
 
@@ -85,6 +94,11 @@ const (
 	// "300") over which the windowed-avg aggregation averages a histogram
 	// metric's _sum/_count. Only carried by histogram triggers.
 	MetricCacheWindowInMetadata = "metricCacheWindow"
+	// ZeroReplicaFallbackInMetadata opts a trigger into reporting 0 instead of
+	// scraping while the InferenceSet sits at zero replicas. Emitted only for
+	// modelpod triggers of a ScaledObject whose minimum is 0, so a trigger
+	// belonging to any other ScaledObject keeps erroring on a failed scrape.
+	ZeroReplicaFallbackInMetadata = "zeroReplicaFallback"
 
 	// AggregationWindowedAvg averages a histogram metric's observations over a
 	// rolling cache window (metricCacheWindow) using _sum/_count deltas instead
@@ -98,4 +112,10 @@ const (
 	// "gate" used by composite scaling formulas to hold scale decisions until pods
 	// are ready.
 	AggregationGate = "gate"
+
+	// AggregationReplicas is a pseudo-aggregation: instead of scraping, the
+	// scaler reports the InferenceSet's desired replica count. It backs the
+	// replica_count trigger that lets a scale-to-zero formula tell the 0 -> 1
+	// branch apart from the 1 -> N branch.
+	AggregationReplicas = "replicas"
 )
