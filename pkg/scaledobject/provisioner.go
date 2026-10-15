@@ -118,20 +118,30 @@ const (
 	eppMetricsPort = "9090"
 	eppMetricsPath = "/metrics"
 
-	// Defaults (seconds) when the corresponding annotation is absent.
-	defaultEvaluationWindow  = 60
-	defaultScaleUpCooldown   = 300
-	defaultScaleDownCooldown = 300
+	// Defaults (seconds) when the corresponding annotation is absent. Scale-up
+	// reacts after a short stabilization window, while scale-down and the
+	// scale-to-zero cooldowns are deliberately long to avoid releasing
+	// expensive GPU capacity on short traffic dips.
+	defaultScaleUpStabilizationWindow   = 60
+	defaultScaleUpCooldown              = 900
+	defaultScaleDownStabilizationWindow = 1800
+	defaultScaleDownCooldown            = 1800
 
-	// defaultCooldownPeriod is KEDA's own default for the delay before scaling
-	// to zero. Set explicitly so the rendered ScaledObject states the value it
-	// is actually running with.
-	defaultCooldownPeriod = 300
+	// defaultCooldownPeriod and defaultInitialCooldownPeriod are applied to
+	// scale-to-zero ScaledObjects only. They are set explicitly (overriding
+	// KEDA's 300s / 0s defaults) so the rendered ScaledObject states the
+	// values it is actually running with.
+	defaultCooldownPeriod        = 1800
+	defaultInitialCooldownPeriod = 1800
 
-	// scalingTolerance must be strictly below the scale-down multiplier's
+	// The default scalingTolerance is strictly below the scale-down multiplier's
 	// distance from 1 (|0.5 - 1| = 0.5) so a 0.5 ratio still triggers a
 	// scale-down, while a hold ratio of 1.0 is left untouched.
 	scalingTolerance = "0.1"
+
+	// maxStabilizationWindowSeconds is the upper bound the HPA API enforces on
+	// stabilizationWindowSeconds.
+	maxStabilizationWindowSeconds = 3600
 )
 
 // Builder carries the scaler service coordinates needed to build ScaledObject
@@ -277,12 +287,16 @@ func sourceForMetricSource(s string) (string, error) {
 
 // metricsConfig is the fully parsed auto-provision configuration.
 type metricsConfig struct {
-	metrics           []metric
-	policy            combinePolicy
-	evaluationWindow  int32
-	scaleUpCooldown   int32
-	scaleDownCooldown int32
-	cooldownPeriod    *int32
+	metrics                      []metric
+	policy                       combinePolicy
+	scaleUpStabilizationWindow   int32
+	scaleUpCooldown              int32
+	scaleDownCooldown            int32
+	cooldownPeriod               *int32
+	initialCooldownPeriod        *int32
+	scaleDownStabilizationWindow int32
+	scaleUpTolerance             resource.Quantity
+	scaleDownTolerance           resource.Quantity
 }
 
 // ValidateConfig validates the auto-provision annotations, returning an
@@ -488,13 +502,22 @@ func parseMetricsConfig(annotations map[string]string, minReplicas int) (metrics
 	}
 
 	var err error
-	if cfg.evaluationWindow, err = parseSecondsAnnotation(annotations, constants.AnnotationKeyEvaluationWindow, defaultEvaluationWindow); err != nil {
+	if cfg.scaleUpStabilizationWindow, err = parseStabilizationWindowAnnotation(annotations, constants.AnnotationKeyScaleUpStabilizationWindow, defaultScaleUpStabilizationWindow); err != nil {
 		return cfg, err
 	}
 	if cfg.scaleUpCooldown, err = parseSecondsAnnotation(annotations, constants.AnnotationKeyScaleUpCooldown, defaultScaleUpCooldown); err != nil {
 		return cfg, err
 	}
 	if cfg.scaleDownCooldown, err = parseSecondsAnnotation(annotations, constants.AnnotationKeyScaleDownCooldown, defaultScaleDownCooldown); err != nil {
+		return cfg, err
+	}
+	if cfg.scaleDownStabilizationWindow, err = parseStabilizationWindowAnnotation(annotations, constants.AnnotationKeyScaleDownStabilizationWindow, defaultScaleDownStabilizationWindow); err != nil {
+		return cfg, err
+	}
+	if cfg.scaleUpTolerance, err = parseToleranceAnnotation(annotations, constants.AnnotationKeyScaleUpTolerance); err != nil {
+		return cfg, err
+	}
+	if cfg.scaleDownTolerance, err = parseToleranceAnnotation(annotations, constants.AnnotationKeyScaleDownTolerance); err != nil {
 		return cfg, err
 	}
 
@@ -507,8 +530,17 @@ func parseMetricsConfig(annotations map[string]string, minReplicas int) (metrics
 			return cfg, err
 		}
 		cfg.cooldownPeriod = &cooldown
-	} else if _, ok := annotations[constants.AnnotationKeyCooldownPeriod]; ok {
-		return cfg, fmt.Errorf("%s requires %s=%q", constants.AnnotationKeyCooldownPeriod, constants.AnnotationKeyMinReplicas, "0")
+		initialCooldown, err := parseSecondsAnnotation(annotations, constants.AnnotationKeyInitialCooldownPeriod, defaultInitialCooldownPeriod)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.initialCooldownPeriod = &initialCooldown
+	} else {
+		for _, key := range []string{constants.AnnotationKeyCooldownPeriod, constants.AnnotationKeyInitialCooldownPeriod} {
+			if _, ok := annotations[key]; ok {
+				return cfg, fmt.Errorf("%s requires %s=%q", key, constants.AnnotationKeyMinReplicas, "0")
+			}
+		}
 	}
 
 	return cfg, nil
@@ -770,19 +802,48 @@ func (b Builder) buildTriggers(inferenceSetName, inferenceSetNamespace string, m
 	return triggers
 }
 
-// buildHPAConfig builds the HPA behaviour for auto-provision: the
-// evaluation window gates scale-up stabilization, the cooldowns bound how often
-// replicas may change, and the tolerance is tightened to 0.1 in both directions
-// so the 0.5 scale-down ratio is not swallowed.
-func buildHPAConfig(cfg metricsConfig) *v1alpha1.HorizontalPodAutoscalerConfig {
-	tolerance := func() *resource.Quantity {
-		q := resource.MustParse(scalingTolerance)
-		return &q
+// parseStabilizationWindowAnnotation parses an HPA stabilization window,
+// mirroring the HPA API's upper bound so the error surfaces on the
+// InferenceSet instead of as a rejected ScaledObject/HPA update.
+func parseStabilizationWindowAnnotation(annotations map[string]string, key string, def int32) (int32, error) {
+	v, err := parseSecondsAnnotation(annotations, key, def)
+	if err != nil {
+		return 0, err
 	}
+	if v > maxStabilizationWindowSeconds {
+		return 0, fmt.Errorf("%s must not exceed %d seconds, got %d", key, maxStabilizationWindowSeconds, v)
+	}
+	return v, nil
+}
+
+// parseToleranceAnnotation parses an HPA tolerance ratio, returning the
+// default scalingTolerance when the annotation is absent or empty.
+func parseToleranceAnnotation(annotations map[string]string, key string) (resource.Quantity, error) {
+	v := annotations[key]
+	if v == "" {
+		return resource.MustParse(scalingTolerance), nil
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil || math.IsInf(n, 0) || math.IsNaN(n) || n < 0 {
+		return resource.Quantity{}, fmt.Errorf("%s must be a finite non-negative number, got %q", key, v)
+	}
+	q, err := resource.ParseQuantity(v)
+	if err != nil {
+		return resource.Quantity{}, fmt.Errorf("%s must be a finite non-negative number, got %q", key, v)
+	}
+	return q, nil
+}
+
+// buildHPAConfig builds the HPA behaviour for auto-provision:
+// scaleupstabilizationwindow and scaledownstabilizationwindow gate the
+// stabilization windows, the cooldowns bound how often replicas may change
+// (one pod per period), and the tolerances (0.1 by default) keep the 2.0 / 0.5
+// formula ratios outside the HPA deadband.
+func buildHPAConfig(cfg metricsConfig) *v1alpha1.HorizontalPodAutoscalerConfig {
 	return &v1alpha1.HorizontalPodAutoscalerConfig{
 		Behavior: &autoscalingv2.HorizontalPodAutoscalerBehavior{
 			ScaleUp: &autoscalingv2.HPAScalingRules{
-				StabilizationWindowSeconds: ptr.To(cfg.evaluationWindow),
+				StabilizationWindowSeconds: ptr.To(cfg.scaleUpStabilizationWindow),
 				SelectPolicy:               ptr.To(autoscalingv2.MaxChangePolicySelect),
 				Policies: []autoscalingv2.HPAScalingPolicy{
 					{
@@ -791,10 +852,10 @@ func buildHPAConfig(cfg metricsConfig) *v1alpha1.HorizontalPodAutoscalerConfig {
 						PeriodSeconds: cfg.scaleUpCooldown,
 					},
 				},
-				Tolerance: tolerance(),
+				Tolerance: ptr.To(cfg.scaleUpTolerance.DeepCopy()),
 			},
 			ScaleDown: &autoscalingv2.HPAScalingRules{
-				StabilizationWindowSeconds: ptr.To(cfg.scaleDownCooldown),
+				StabilizationWindowSeconds: ptr.To(cfg.scaleDownStabilizationWindow),
 				SelectPolicy:               ptr.To(autoscalingv2.MaxChangePolicySelect),
 				Policies: []autoscalingv2.HPAScalingPolicy{
 					{
@@ -803,7 +864,7 @@ func buildHPAConfig(cfg metricsConfig) *v1alpha1.HorizontalPodAutoscalerConfig {
 						PeriodSeconds: cfg.scaleDownCooldown,
 					},
 				},
-				Tolerance: tolerance(),
+				Tolerance: ptr.To(cfg.scaleDownTolerance.DeepCopy()),
 			},
 		},
 	}
@@ -860,6 +921,7 @@ func (b Builder) buildScaledObject(is *kaitov1beta1.InferenceSet, minReplicas, m
 	}
 	if scaleToZero {
 		so.Spec.CooldownPeriod = cfg.cooldownPeriod
+		so.Spec.InitialCooldownPeriod = cfg.initialCooldownPeriod
 	}
 	return so
 }

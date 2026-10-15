@@ -161,12 +161,26 @@ The remaining global annotations:
 | `auto-provision` | yes | – | Must be `"true"` to enable auto-provisioning. |
 | `metrics` | yes | – | YAML/JSON list of metric entries (see fields above). At least one entry is required. |
 | `combinepolicy` | no | `AND` | How per-metric conditions are combined. Only `AND` is currently supported. |
-| `evaluationwindow` | no | `60` | Scale-up stabilization window (seconds). |
-| `scaleupcooldown` | no | `300` | Minimum seconds between scale-up steps. |
-| `scaledowncooldown` | no | `300` | Minimum seconds between scale-down steps. |
+| `scaleupstabilizationwindow` | no | `60` | HPA scale-up stabilization window (0–3600 seconds). |
+| `scaleupcooldown` | no | `900` | Minimum seconds between scale-up steps (HPA Pods policy period). |
+| `scaledowncooldown` | no | `1800` | Minimum seconds between scale-down steps (HPA Pods policy period). |
 | `min-replicas` | no | `1` | Minimum replica count. `0` enables [scale to zero](#scale-to-zero); any other value below `1`, or a non-numeric value, collapses to `1`. |
 | `max-replicas` | no | derived from `spec.nodeCountLimit` | Maximum replica count. Must be at least `1` and `>= min-replicas`; if absent, `spec.nodeCountLimit` must be set. |
-| `cooldownperiod` | no | `300` | Seconds KEDA waits after the last active trigger reading before parking the workload at zero. Requires `min-replicas: "0"`. |
+| `cooldownperiod` | no | `1800` | Seconds KEDA waits after the last active trigger reading before parking the workload at zero. Requires `min-replicas: "0"`. |
+| `initialcooldownperiod` | no | `1800` | Non-negative int32 seconds after ScaledObject creation before applying the scale-to-zero cooldown. Does not delay initial scale-up. Requires `min-replicas: "0"`. |
+| `scaledownstabilizationwindow` | no | `1800` | HPA scale-down stabilization window (0–3600 seconds), independent of `scaledowncooldown`. |
+| `scaleuptolerance` | no | `0.1` | HPA scale-up tolerance ratio (finite, non-negative); `0` disables the deadband. |
+| `scaledowntolerance` | no | `0.1` | HPA scale-down tolerance ratio (finite, non-negative); `0` disables the deadband. |
+
+Each field of the generated HPA behavior is driven by exactly one annotation:
+`scaleupstabilizationwindow` / `scaleupcooldown` (scale-up stabilization window /
+policy period), `scaledownstabilizationwindow` / `scaledowncooldown` (scale-down
+stabilization window / policy period) and `scaleuptolerance` /
+`scaledowntolerance`. The policies always allow one pod per period with
+`selectPolicy: Max`, and only affect 1 ↔ N scaling. Per-direction tolerance
+requires the Kubernetes `HPAConfigurableTolerance` feature gate; a tolerance
+`>= 1` for scale-up or `>= 0.5` for scale-down suppresses that direction's
+formula signal.
 
 ##### Single-metric example
 
@@ -246,21 +260,21 @@ spec:
     horizontalPodAutoscalerConfig:
       behavior:
         scaleUp:
-          stabilizationWindowSeconds: 60     # evaluationwindow
+          stabilizationWindowSeconds: 60     # scaleupstabilizationwindow
           selectPolicy: Max
           policies:
             - type: Pods
               value: 1
-              periodSeconds: 300             # scaleupcooldown
-          tolerance: "0.1"
+              periodSeconds: 900             # scaleupcooldown
+          tolerance: "0.1"                   # scaleuptolerance
         scaleDown:
-          stabilizationWindowSeconds: 300    # scaledowncooldown
+          stabilizationWindowSeconds: 1800   # scaledownstabilizationwindow
           selectPolicy: Max
           policies:
             - type: Pods
               value: 1
-              periodSeconds: 300             # scaledowncooldown
-          tolerance: "0.1"
+              periodSeconds: 1800            # scaledowncooldown
+          tolerance: "0.1"                   # scaledowntolerance
     scalingModifiers:
       target: "1"
       metricType: Value
@@ -329,9 +343,12 @@ metadata:
 
     # Optional global tuning (defaults shown)
     scaledobject.kaito.sh/combinepolicy: "AND"
-    scaledobject.kaito.sh/evaluationwindow: "60"
-    scaledobject.kaito.sh/scaleupcooldown: "300"
-    scaledobject.kaito.sh/scaledowncooldown: "300"
+    scaledobject.kaito.sh/scaleupstabilizationwindow: "60"
+    scaledobject.kaito.sh/scaleupcooldown: "900"
+    scaledobject.kaito.sh/scaledownstabilizationwindow: "1800"
+    scaledobject.kaito.sh/scaledowncooldown: "1800"
+    scaledobject.kaito.sh/scaleuptolerance: "0.1"
+    scaledobject.kaito.sh/scaledowntolerance: "0.1"
   name: phi-4
   namespace: default
 spec:
@@ -392,21 +409,21 @@ spec:
     horizontalPodAutoscalerConfig:
       behavior:
         scaleUp:
-          stabilizationWindowSeconds: 60     # evaluationwindow
+          stabilizationWindowSeconds: 60     # scaleupstabilizationwindow
           selectPolicy: Max
           policies:
             - type: Pods
               value: 1
-              periodSeconds: 300             # scaleupcooldown
-          tolerance: "0.1"
+              periodSeconds: 900             # scaleupcooldown
+          tolerance: "0.1"                   # scaleuptolerance
         scaleDown:
-          stabilizationWindowSeconds: 300    # scaledowncooldown
+          stabilizationWindowSeconds: 1800   # scaledownstabilizationwindow
           selectPolicy: Max
           policies:
             - type: Pods
               value: 1
-              periodSeconds: 300             # scaledowncooldown
-          tolerance: "0.1"
+              periodSeconds: 1800            # scaledowncooldown
+          tolerance: "0.1"                   # scaledowntolerance
     scalingModifiers:
       target: "1"
       metricType: Value

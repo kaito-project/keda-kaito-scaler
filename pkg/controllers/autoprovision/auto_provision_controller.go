@@ -290,6 +290,10 @@ func (c *Controller) reconcileTo(ctx context.Context, existing, desired *v1alpha
 		existing.Spec.CooldownPeriod = desired.Spec.CooldownPeriod
 		updated = true
 	}
+	if !equalInt32Ptr(existing.Spec.InitialCooldownPeriod, desired.Spec.InitialCooldownPeriod) {
+		existing.Spec.InitialCooldownPeriod = desired.Spec.InitialCooldownPeriod
+		updated = true
+	}
 	if !reflect.DeepEqual(existing.Spec.Triggers, desired.Spec.Triggers) {
 		existing.Spec.Triggers = desired.Spec.Triggers
 		updated = true

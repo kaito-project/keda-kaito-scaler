@@ -429,10 +429,7 @@ func TestReconcile_CleanupWhenAutoProvisionDisabled(t *testing.T) {
 	})
 }
 
-// The CooldownPeriod is only set for scale-to-zero, so it is the one managed
-// field that can legitimately go from unset to set (and back) on an existing
-// ScaledObject. It has to be reconciled or a user toggling the annotation would
-// keep KEDA's old idle delay forever.
+// Scale-to-zero cooldown fields must follow annotation additions and removals.
 func TestReconcileTo_CooldownPeriod(t *testing.T) {
 	is := &kaitov1beta1.InferenceSet{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-is", Namespace: "default", UID: types.UID("is-uid")},
@@ -464,6 +461,36 @@ func TestReconcileTo_CooldownPeriod(t *testing.T) {
 			var got v1alpha1.ScaledObject
 			assert.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-is-so"}, &got))
 			assert.Equal(t, tt.want, got.Spec.CooldownPeriod)
+		})
+	}
+}
+
+func TestReconcileTo_InitialCooldownPeriod(t *testing.T) {
+	is := &kaitov1beta1.InferenceSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-is", Namespace: "default", UID: types.UID("is-uid")},
+	}
+	for _, tt := range []struct {
+		name     string
+		existing *int32
+		desired  *int32
+	}{
+		{"add", nil, ptr.To(int32(60))},
+		{"clear", ptr.To(int32(60)), nil},
+		{"change", ptr.To(int32(60)), ptr.To(int32(120))},
+		{"zero", ptr.To(int32(60)), ptr.To(int32(0))},
+		{"unchanged", ptr.To(int32(60)), ptr.To(int32(60))},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			existing := newManagedScaledObject("test-is-so", is)
+			existing.Spec.InitialCooldownPeriod = tt.existing
+			desired := newManagedScaledObject("test-is-so", is)
+			desired.Spec.InitialCooldownPeriod = tt.desired
+			c := newReconcileFakeClient(t, is, existing)
+			ctrl := &Controller{Client: c}
+			assert.NoError(t, ctrl.reconcileTo(context.Background(), existing, desired))
+			var got v1alpha1.ScaledObject
+			assert.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-is-so"}, &got))
+			assert.Equal(t, tt.desired, got.Spec.InitialCooldownPeriod)
 		})
 	}
 }
