@@ -39,8 +39,9 @@ const (
 
 	// AnnotationKeyCombinePolicy selects how metrics are combined (only AND).
 	AnnotationKeyCombinePolicy = "scaledobject.kaito.sh/combinepolicy"
-	// AnnotationKeyEvaluationWindow sets the scale-up stabilization window (seconds).
-	AnnotationKeyEvaluationWindow = "scaledobject.kaito.sh/evaluationwindow"
+	// AnnotationKeyScaleUpStabilizationWindow sets the HPA scale-up
+	// stabilization window (seconds).
+	AnnotationKeyScaleUpStabilizationWindow = "scaledobject.kaito.sh/scaleupstabilizationwindow"
 	// AnnotationKeyScaleUpCooldown sets the minimum seconds between scale-up steps.
 	AnnotationKeyScaleUpCooldown = "scaledobject.kaito.sh/scaleupcooldown"
 	// AnnotationKeyScaleDownCooldown sets the minimum seconds between scale-down steps.
@@ -50,6 +51,17 @@ const (
 	// min-replicas is "0": KEDA consults it exclusively on the scale-to-zero
 	// path, so it is rejected rather than ignored for any other minimum.
 	AnnotationKeyCooldownPeriod = "scaledobject.kaito.sh/cooldownperiod"
+	// AnnotationKeyInitialCooldownPeriod sets the seconds after ScaledObject
+	// creation before KEDA starts applying cooldownperiod. Like cooldownperiod
+	// it only affects the scale-to-zero path and requires min-replicas "0".
+	AnnotationKeyInitialCooldownPeriod = "scaledobject.kaito.sh/initialcooldownperiod"
+	// AnnotationKeyScaleDownStabilizationWindow sets the HPA scale-down
+	// stabilization window (seconds), independent of scaledowncooldown.
+	AnnotationKeyScaleDownStabilizationWindow = "scaledobject.kaito.sh/scaledownstabilizationwindow"
+	// AnnotationKeyScaleUpTolerance sets the HPA scale-up tolerance ratio.
+	AnnotationKeyScaleUpTolerance = "scaledobject.kaito.sh/scaleuptolerance"
+	// AnnotationKeyScaleDownTolerance sets the HPA scale-down tolerance ratio.
+	AnnotationKeyScaleDownTolerance = "scaledobject.kaito.sh/scaledowntolerance"
 
 	// InferenceSet is the Kind of the scale target referenced by managed ScaledObjects.
 	InferenceSet = "InferenceSet"

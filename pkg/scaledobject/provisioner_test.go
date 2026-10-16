@@ -44,6 +44,144 @@ func metricsAnnotations() map[string]string {
 `)
 }
 
+func TestHPABehaviorAnnotations(t *testing.T) {
+	build := func(t *testing.T, ann map[string]string) *autoscalingv2.HorizontalPodAutoscalerBehavior {
+		t.Helper()
+		is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "default", Annotations: ann}}
+		so, err := (Builder{}).BuildDesired(is, 1, 5)
+		if !assert.NoError(t, err) {
+			t.FailNow()
+		}
+		return so.Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		b := build(t, metricsAnnotations())
+		assert.Equal(t, int32(60), *b.ScaleUp.StabilizationWindowSeconds)
+		assert.Equal(t, int32(900), b.ScaleUp.Policies[0].PeriodSeconds)
+		assert.Equal(t, int32(1800), *b.ScaleDown.StabilizationWindowSeconds)
+		assert.Equal(t, int32(1800), b.ScaleDown.Policies[0].PeriodSeconds)
+		assert.InDelta(t, 0.1, b.ScaleUp.Tolerance.AsApproximateFloat64(), 1e-9)
+		assert.InDelta(t, 0.1, b.ScaleDown.Tolerance.AsApproximateFloat64(), 1e-9)
+	})
+
+	t.Run("each annotation drives exactly one field", func(t *testing.T) {
+		ann := metricsAnnotations()
+		ann[constants.AnnotationKeyScaleUpStabilizationWindow] = "45"
+		ann[constants.AnnotationKeyScaleUpCooldown] = "120"
+		ann[constants.AnnotationKeyScaleDownCooldown] = "240"
+		b := build(t, ann)
+		assert.Equal(t, int32(45), *b.ScaleUp.StabilizationWindowSeconds)
+		assert.Equal(t, int32(120), b.ScaleUp.Policies[0].PeriodSeconds)
+		// scaledowncooldown no longer drives the scale-down window.
+		assert.Equal(t, int32(defaultScaleDownStabilizationWindow), *b.ScaleDown.StabilizationWindowSeconds)
+		assert.Equal(t, int32(240), b.ScaleDown.Policies[0].PeriodSeconds)
+	})
+
+	t.Run("legacy evaluationwindow annotation is ignored", func(t *testing.T) {
+		ann := metricsAnnotations()
+		ann["scaledobject.kaito.sh/evaluationwindow"] = "45"
+		assert.Equal(t, int32(defaultScaleUpStabilizationWindow), *build(t, ann).ScaleUp.StabilizationWindowSeconds)
+	})
+
+	t.Run("scale-down window and tolerances are independent", func(t *testing.T) {
+		ann := metricsAnnotations()
+		ann[constants.AnnotationKeyScaleDownCooldown] = "120"
+		ann[constants.AnnotationKeyScaleDownStabilizationWindow] = "3600"
+		ann[constants.AnnotationKeyScaleUpTolerance] = "0"
+		ann[constants.AnnotationKeyScaleDownTolerance] = "0.2"
+		b := build(t, ann)
+		assert.Equal(t, int32(3600), *b.ScaleDown.StabilizationWindowSeconds)
+		assert.Equal(t, int32(120), b.ScaleDown.Policies[0].PeriodSeconds)
+		assert.True(t, b.ScaleUp.Tolerance.IsZero())
+		assert.InDelta(t, 0.2, b.ScaleDown.Tolerance.AsApproximateFloat64(), 1e-9)
+		for _, rule := range []*autoscalingv2.HPAScalingRules{b.ScaleUp, b.ScaleDown} {
+			assert.Equal(t, autoscalingv2.MaxChangePolicySelect, *rule.SelectPolicy)
+			assert.Equal(t, autoscalingv2.PodsScalingPolicy, rule.Policies[0].Type)
+			assert.Equal(t, int32(1), rule.Policies[0].Value)
+		}
+	})
+
+	t.Run("explicit zero windows are kept", func(t *testing.T) {
+		ann := metricsAnnotations()
+		ann[constants.AnnotationKeyScaleUpStabilizationWindow] = "0"
+		ann[constants.AnnotationKeyScaleDownStabilizationWindow] = "0"
+		b := build(t, ann)
+		assert.Equal(t, int32(0), *b.ScaleUp.StabilizationWindowSeconds)
+		assert.Equal(t, int32(0), *b.ScaleDown.StabilizationWindowSeconds)
+	})
+
+	t.Run("empty values fall back to defaults", func(t *testing.T) {
+		ann := metricsAnnotations()
+		ann[constants.AnnotationKeyScaleUpStabilizationWindow] = ""
+		ann[constants.AnnotationKeyScaleDownStabilizationWindow] = ""
+		ann[constants.AnnotationKeyScaleUpTolerance] = ""
+		ann[constants.AnnotationKeyScaleDownTolerance] = ""
+		b := build(t, ann)
+		assert.Equal(t, int32(defaultScaleUpStabilizationWindow), *b.ScaleUp.StabilizationWindowSeconds)
+		assert.Equal(t, int32(defaultScaleDownStabilizationWindow), *b.ScaleDown.StabilizationWindowSeconds)
+		assert.InDelta(t, 0.1, b.ScaleUp.Tolerance.AsApproximateFloat64(), 1e-9)
+		assert.InDelta(t, 0.1, b.ScaleDown.Tolerance.AsApproximateFloat64(), 1e-9)
+	})
+}
+
+func TestInvalidHPABehaviorAnnotations(t *testing.T) {
+	invalid := map[string][]string{
+		constants.AnnotationKeyScaleUpStabilizationWindow:   {"-1", "3601", "2147483648", "0.5", "invalid"},
+		constants.AnnotationKeyScaleDownStabilizationWindow: {"-1", "3601", "2147483648", "0.5", "invalid"},
+		constants.AnnotationKeyScaleUpTolerance:             {"-0.1", "NaN", "+Inf", "invalid"},
+		constants.AnnotationKeyScaleDownTolerance:           {"-0.1", "NaN", "+Inf", "invalid"},
+	}
+	for key, values := range invalid {
+		for _, value := range values {
+			t.Run(key+"/"+value, func(t *testing.T) {
+				ann := metricsAnnotations()
+				ann[key] = value
+				assert.ErrorContains(t, ValidateConfig(ann, 1), key)
+			})
+		}
+	}
+}
+
+func TestInitialCooldownPeriod(t *testing.T) {
+	for _, value := range []string{"", "0", "600", "2147483647"} {
+		t.Run("valid/"+value, func(t *testing.T) {
+			ann := scaleToZeroAnnotations()
+			ann[constants.AnnotationKeyInitialCooldownPeriod] = value
+			is := &kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "default", Annotations: ann}}
+			so, err := (Builder{}).BuildDesired(is, 0, 5)
+			if !assert.NoError(t, err) {
+				return
+			}
+			if !assert.NotNil(t, so.Spec.InitialCooldownPeriod) {
+				return
+			}
+			want := value
+			if want == "" {
+				want = "1800"
+			}
+			assert.Equal(t, want, fmt.Sprint(*so.Spec.InitialCooldownPeriod))
+			assert.Equal(t, int32(1800), *so.Spec.CooldownPeriod)
+		})
+	}
+	for _, value := range []string{"-1", "2147483648", "0.5", "invalid"} {
+		t.Run("invalid/"+value, func(t *testing.T) {
+			ann := scaleToZeroAnnotations()
+			ann[constants.AnnotationKeyInitialCooldownPeriod] = value
+			assert.ErrorContains(t, ValidateConfig(ann, 0), constants.AnnotationKeyInitialCooldownPeriod)
+		})
+	}
+	ann := metricsAnnotations()
+	ann[constants.AnnotationKeyInitialCooldownPeriod] = "60"
+	assert.ErrorContains(t, ValidateConfig(ann, 1), constants.AnnotationKeyMinReplicas)
+	delete(ann, constants.AnnotationKeyInitialCooldownPeriod)
+	so, err := (Builder{}).BuildDesired(&kaitov1beta1.InferenceSet{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}, 1, 5)
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Nil(t, so.Spec.InitialCooldownPeriod)
+}
+
 func TestParseMetricsConfig(t *testing.T) {
 	t.Run("valid two-metric config", func(t *testing.T) {
 		cfg, err := parseMetricsConfig(metricsAnnotations(), 1)
@@ -59,7 +197,7 @@ func TestParseMetricsConfig(t *testing.T) {
 		// Metric cache window defaults to 300 seconds for histogram metrics.
 		assert.Equal(t, "300", cfg.metrics[1].metricCacheWindow)
 		// Defaults applied.
-		assert.Equal(t, int32(defaultEvaluationWindow), cfg.evaluationWindow)
+		assert.Equal(t, int32(defaultScaleUpStabilizationWindow), cfg.scaleUpStabilizationWindow)
 		assert.Equal(t, int32(defaultScaleUpCooldown), cfg.scaleUpCooldown)
 		assert.Equal(t, int32(defaultScaleDownCooldown), cfg.scaleDownCooldown)
 	})
@@ -79,12 +217,12 @@ func TestParseMetricsConfig(t *testing.T) {
 
 	t.Run("custom windows and cooldowns", func(t *testing.T) {
 		ann := metricsAnnotations()
-		ann[constants.AnnotationKeyEvaluationWindow] = "30"
+		ann[constants.AnnotationKeyScaleUpStabilizationWindow] = "30"
 		ann[constants.AnnotationKeyScaleUpCooldown] = "120"
 		ann[constants.AnnotationKeyScaleDownCooldown] = "240"
 		cfg, err := parseMetricsConfig(ann, 1)
 		assert.NoError(t, err)
-		assert.Equal(t, int32(30), cfg.evaluationWindow)
+		assert.Equal(t, int32(30), cfg.scaleUpStabilizationWindow)
 		assert.Equal(t, int32(120), cfg.scaleUpCooldown)
 		assert.Equal(t, int32(240), cfg.scaleDownCooldown)
 	})
@@ -292,8 +430,8 @@ func TestBuildScaledObject(t *testing.T) {
 	behavior := so.Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior
 	assert.InDelta(t, 0.1, behavior.ScaleUp.Tolerance.AsApproximateFloat64(), 1e-9)
 	assert.InDelta(t, 0.1, behavior.ScaleDown.Tolerance.AsApproximateFloat64(), 1e-9)
-	assert.Equal(t, int32(defaultEvaluationWindow), *behavior.ScaleUp.StabilizationWindowSeconds)
-	assert.Equal(t, int32(defaultScaleDownCooldown), *behavior.ScaleDown.StabilizationWindowSeconds)
+	assert.Equal(t, int32(defaultScaleUpStabilizationWindow), *behavior.ScaleUp.StabilizationWindowSeconds)
+	assert.Equal(t, int32(defaultScaleDownStabilizationWindow), *behavior.ScaleDown.StabilizationWindowSeconds)
 	assert.Equal(t, int32(1), behavior.ScaleUp.Policies[0].Value)
 	assert.Equal(t, int32(1), behavior.ScaleDown.Policies[0].Value)
 }
