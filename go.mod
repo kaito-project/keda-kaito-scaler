@@ -3,7 +3,7 @@ module github.com/kaito-project/keda-kaito-scaler
 go 1.26.9
 
 require (
-	github.com/kaito-project/kaito v0.13.0-rc.0
+	github.com/kaito-project/kaito v0.13.0-rc.1
 	github.com/kedacore/keda/v2 v2.21.0
 	github.com/open-policy-agent/cert-controller v0.16.0
 	github.com/prometheus/client_golang v1.25.0
@@ -57,6 +57,7 @@ require (
 	github.com/google/gnostic-models v0.7.1 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/gowebpki/jcs v1.0.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/kr/text v0.2.0 // indirect
