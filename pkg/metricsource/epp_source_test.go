@@ -61,19 +61,19 @@ func TestEPPName(t *testing.T) {
 		want             string
 	}{
 		{
-			name:             "name is suffixed",
+			name:             "name is the InferenceSet name",
 			inferenceSetName: "phi-4-mini",
-			want:             "phi-4-mini-inferencepool-epp",
+			want:             "phi-4-mini",
 		},
 		{
 			name:             "surrounding whitespace is trimmed",
 			inferenceSetName: " phi-4-mini ",
-			want:             "phi-4-mini-inferencepool-epp",
+			want:             "phi-4-mini",
 		},
 		{
 			name:             "long name is not truncated",
-			inferenceSetName: strings.Repeat("b", 60),
-			want:             strings.Repeat("b", 60) + "-inferencepool-epp",
+			inferenceSetName: "smoke-test-nvidia-nvidia-nemotron-3-nano-4b-bf16-01fb4588",
+			want:             "smoke-test-nvidia-nvidia-nemotron-3-nano-4b-bf16-01fb4588",
 		},
 	}
 

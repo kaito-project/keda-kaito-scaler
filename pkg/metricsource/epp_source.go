@@ -32,12 +32,8 @@ import (
 // +kubebuilder:rbac:groups="",resources=pods,verbs=list;watch
 
 const (
-	// eppNameSuffix and inferencePoolSuffix mirror the EPP resource naming used
-	// by the production-stack ModelDeployment chart.
-	inferencePoolSuffix = "-inferencepool"
-	eppNameSuffix       = "-epp"
-
-	// The ModelDeployment chart labels EPP Pods with their InferencePool name.
+	// The ModelDeployment chart labels EPP Pods with their InferencePool name,
+	// which equals the InferenceSet name.
 	eppNameLabel = "inferencepool"
 
 	// defaultEPPMetricsPort and defaultEPPMetricsPath are the EPP's Prometheus
@@ -84,10 +80,11 @@ func (s *EPPSource) Name() string {
 	return EPPSourceName
 }
 
-// EPPName derives the EPP resource name used as the production-stack
-// ModelDeployment chart's InferencePool label value.
+// EPPName derives the production-stack ModelDeployment chart's `inferencepool`
+// label value on the EPP Pods. The chart names the InferencePool and the EPP
+// Service after the InferenceSet, so this is the InferenceSet name itself.
 func EPPName(inferenceSetName string) string {
-	return strings.TrimSpace(inferenceSetName) + inferencePoolSuffix + eppNameSuffix
+	return strings.TrimSpace(inferenceSetName)
 }
 
 // EPPSelectorDescription returns the EPP pod selector used in diagnostics.
