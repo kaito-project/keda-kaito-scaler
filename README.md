@@ -691,7 +691,7 @@ are not used.
 
 - To turn scale to zero off, make these changes together:
   - Set `min-replicas` to `1` or higher, or remove it.
-  - Remove `cooldownperiod`.
+  - Remove `cooldownperiod` and `initialcooldownperiod`.
   - Remove every `activationthreshold` and `deactivationthreshold`.
   - Give every remaining metric an up/down threshold pair, and remove metrics
     that only drove activation or deactivation.
