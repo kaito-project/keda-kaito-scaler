@@ -584,12 +584,38 @@ waiting for a backend, so the activation contract is:
 - A request that arrives while the workload is parked is what triggers the wake.
   Whether that request survives the cold start depends on the client's timeout
   and on the gateway's request-buffering configuration.
-- Traffic that stays at or below the activation threshold never wakes the
-  workload. Choose an `activationthreshold` of `0` unless you
-  deliberately want a minimum demand level before paying for a GPU.
+- With `activationthreshold` set to `0`, a single buffered request wakes the
+  workload. With a threshold `T` greater than `0`, the wake-up condition becomes
+  a minimum request rate. While the workload is parked, nothing drains the EPP
+  queue; buffered requests leave it only when they hit the EPP's request TTL. The
+  queue size is therefore the number of requests that arrived within one TTL,
+  and the workload wakes when:
+
+  ```text
+  queue > T   <=>   RPS > T / TTL
+  ```
+
+  For example, with an EPP request TTL of 600 seconds and an
+  `activationthreshold` of `10`, the workload wakes once traffic exceeds about
+  one request per minute. Traffic that stays at or below `T / TTL` never wakes
+  the workload; those requests stay buffered until the TTL expires and then
+  fail. Choose `0` unless you deliberately want a minimum demand level before
+  paying for a GPU.
 - Cold start is not instant: the workload has to acquire a node, pull the model
   and become Ready. Size `cooldownperiod` against how often you are willing to
   pay that cost.
+- The workload can park again before the GPU is ready. Until KAITO creates the
+  model Service, which happens after the node is provisioned, `modelpod` metrics
+  report `0`, so only the EPP queue keeps the workload awake. The EPP queue
+  still drains only through the TTL, so with deactivation threshold `D` the
+  workload stays awake only while `RPS > D / TTL`. Once that no longer holds,
+  it parks after `cooldownperiod`. Set `cooldownperiod` to at least the
+  worst-case node provisioning time.
+- `cooldownperiod` applies only once the workload has been active. Before its
+  first activation, KEDA uses `initialcooldownperiod` instead (default `1800`
+  seconds, counted from ScaledObject creation), so a newly deployed
+  `InferenceSet` with no traffic can park once it elapses. Set it to at least
+  the worst-case time to provision the first GPU node.
 
 ###### Example
 
