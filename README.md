@@ -554,6 +554,13 @@ following hold:
    reconcile the EPP before then, so a freshly created `InferenceSet` has no EPP
    for its first few reconciles.
 
+> **EPP discovery.** EPP pods are discovered by the label
+> `inferencepool=<InferenceSet name>`, which the production-stack
+> `modeldeployment` chart stamps on its EPP pods from **v0.5.1** onwards.
+> Since KEDA Kaito Scaler **v0.7.2**, EPPs deployed by older `modeldeployment`
+> charts (labelled `inferencepool=<name>-inferencepool-epp`) are no longer
+> discovered; upgrade the `modeldeployment` chart to v0.5.1 or later.
+
 The controller provisions the `ScaledObject` without waiting for the EPP. Until
 a ready EPP pod exists, KEDA's metric requests fail with a diagnostic naming the
 selectors used for discovery, so the current replica count is held. Condition 3

@@ -463,7 +463,7 @@ func TestKaitoScaler_GetMetrics_EmptyEPPReportsSelector(t *testing.T) {
 		ScaledObjectRef: &externalscaler.ScaledObjectRef{ScalerMetadata: meta},
 		MetricName:      "inference_pool_per_pod_queue_size",
 	})
-	assert.ErrorContains(t, err, "no ready Endpoint Picker pods available for selector inferencepool=is1-inferencepool-epp in namespace ns1")
+	assert.ErrorContains(t, err, "no ready Endpoint Picker pods available for selector inferencepool=is1 in namespace ns1")
 	assert.Contains(t, eventFrom(t, recorder), "Warning EPPPodsUnavailable")
 }
 

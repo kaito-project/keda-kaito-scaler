@@ -52,34 +52,29 @@ func newEPPPodWithLabels(name, namespace string, labels map[string]string, podIP
 	}
 }
 
-// The derived name is the only handle on the EPP pods, so it has to reproduce
-// the production-stack ModelDeployment chart's label value byte for byte.
-func TestEPPName(t *testing.T) {
+// The selector is the only handle on the EPP pods, so it has to reproduce the
+// production-stack ModelDeployment chart's label byte for byte.
+func TestEPPSelectorDescription(t *testing.T) {
 	tests := []struct {
 		name             string
 		inferenceSetName string
 		want             string
 	}{
 		{
-			name:             "name is suffixed",
+			name:             "label value is the InferenceSet name",
 			inferenceSetName: "phi-4-mini",
-			want:             "phi-4-mini-inferencepool-epp",
+			want:             "inferencepool=phi-4-mini",
 		},
 		{
-			name:             "surrounding whitespace is trimmed",
-			inferenceSetName: " phi-4-mini ",
-			want:             "phi-4-mini-inferencepool-epp",
-		},
-		{
-			name:             "long name is not truncated",
-			inferenceSetName: strings.Repeat("b", 60),
-			want:             strings.Repeat("b", 60) + "-inferencepool-epp",
+			name:             "63-character name is used verbatim",
+			inferenceSetName: strings.Repeat("b", 63),
+			want:             "inferencepool=" + strings.Repeat("b", 63),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := EPPName(tt.inferenceSetName)
+			got := EPPSelectorDescription(tt.inferenceSetName)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -123,7 +118,7 @@ inference_pool_per_pod_queue_size{model_server_pod="p3"} 4
 	}
 
 	is := newInferenceSet("is1", "ns1")
-	eppName := EPPName(is.Name)
+	eppName := is.Name
 	cfg := ScrapeConfig{Protocol: "http", Port: "9090", Path: "/metrics", Timeout: 3 * time.Second}
 
 	t.Run("scrapes every running EPP pod", func(t *testing.T) {
@@ -180,7 +175,7 @@ inference_pool_per_pod_queue_size{model_server_pod="p3"} 4
 	t.Run("pods of another InferenceSet or namespace are ignored", func(t *testing.T) {
 		c := newEPPFakeClient(t,
 			newEPPPod("epp-1", "ns1", eppName, "10.0.0.1", corev1.PodRunning),
-			newEPPPod("other-epp", "ns1", EPPName("is2"), "10.0.0.2", corev1.PodRunning),
+			newEPPPod("other-epp", "ns1", "is2", "10.0.0.2", corev1.PodRunning),
 			newEPPPod("far-epp", "ns2", eppName, "10.0.0.2", corev1.PodRunning),
 		)
 		snap, err := newSource(c).Scrape(context.Background(), is, cfg)
