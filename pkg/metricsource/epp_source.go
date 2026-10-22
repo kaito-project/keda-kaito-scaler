@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
@@ -32,12 +31,8 @@ import (
 // +kubebuilder:rbac:groups="",resources=pods,verbs=list;watch
 
 const (
-	// eppNameSuffix and inferencePoolSuffix mirror the EPP resource naming used
-	// by the production-stack ModelDeployment chart.
-	inferencePoolSuffix = "-inferencepool"
-	eppNameSuffix       = "-epp"
-
-	// The ModelDeployment chart labels EPP Pods with their InferencePool name.
+	// The production-stack ModelDeployment chart (v0.5.1+) labels EPP Pods with
+	// inferencepool=<InferenceSet name>.
 	eppNameLabel = "inferencepool"
 
 	// defaultEPPMetricsPort and defaultEPPMetricsPath are the EPP's Prometheus
@@ -45,11 +40,6 @@ const (
 	defaultEPPMetricsPort = "9090"
 	defaultEPPMetricsPath = "/metrics"
 )
-
-// EPPNameLabel is the label the chart stamps on the EPP Pods with the derived
-// name as its value. Exported so downstream diagnostics can name the selector
-// used during discovery.
-const EPPNameLabel = eppNameLabel
 
 // EPPSource scrapes the Prometheus /metrics endpoint of every Endpoint Picker
 // (EPP) pod KAITO deploys for an InferenceSet.
@@ -84,15 +74,9 @@ func (s *EPPSource) Name() string {
 	return EPPSourceName
 }
 
-// EPPName derives the EPP resource name used as the production-stack
-// ModelDeployment chart's InferencePool label value.
-func EPPName(inferenceSetName string) string {
-	return strings.TrimSpace(inferenceSetName) + inferencePoolSuffix + eppNameSuffix
-}
-
 // EPPSelectorDescription returns the EPP pod selector used in diagnostics.
 func EPPSelectorDescription(inferenceSetName string) string {
-	return fmt.Sprintf("%s=%s", eppNameLabel, EPPName(inferenceSetName))
+	return fmt.Sprintf("%s=%s", eppNameLabel, inferenceSetName)
 }
 
 // Scrape lists the EPP pods for the InferenceSet and scrapes each one. A
@@ -105,7 +89,7 @@ func EPPSelectorDescription(inferenceSetName string) string {
 // snapshot is passed through so GetMetrics can report the expected selectors.
 func (s *EPPSource) Scrape(ctx context.Context, is *kaitov1beta1.InferenceSet, cfg ScrapeConfig) (*MetricSnapshot, error) {
 	podList := &corev1.PodList{}
-	selector := map[string]string{eppNameLabel: EPPName(is.Name)}
+	selector := map[string]string{eppNameLabel: is.Name}
 	if err := s.kubeClient.List(ctx, podList,
 		client.InNamespace(is.Namespace),
 		client.MatchingLabels(selector),
