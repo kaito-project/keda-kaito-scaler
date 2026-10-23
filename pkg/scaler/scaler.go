@@ -80,9 +80,10 @@ type Config struct {
 	Aggregation  string
 	// MetricCacheWindow is the rolling window for the "windowed-avg" aggregation.
 	MetricCacheWindow time.Duration
-	// ZeroReplicaFallback makes this trigger report 0 instead of scraping while
-	// the InferenceSet is parked or provisioning without a model Service. Set
-	// only on modelpod triggers of a ScaledObject whose minimum is 0.
+	// ZeroReplicaFallback makes this trigger report 0 instead of erroring while
+	// the InferenceSet is still provisioning without a model Service. Set only
+	// on modelpod triggers of a ScaledObject whose minimum is 0. (At zero desired
+	// replicas every modelpod trigger reports 0, opted in or not.)
 	ZeroReplicaFallback bool
 }
 
@@ -216,15 +217,21 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 		return newMetricValueResponse(scalerConfig.MetricName, value), nil
 	}
 
-	// A parked or still-provisioning InferenceSet has no model Service to scrape,
-	// so a modelpod metric would otherwise report a scrape failure and freeze the
-	// composite formula. Report 0 until the Service exists. The scale-to-zero
-	// formula separately requires every activation signal to be idle, so queued
-	// EPP work vetoes parking while the backend is provisioning.
+	// A modelpod metric has nothing to scrape at zero desired replicas, whatever
+	// the ScaledObject minimum is. Report 0 instead of an error: KEDA treats any
+	// trigger error as "not active" and then skips enforcing minReplicaCount, so
+	// a workload parked at 0 whose minimum is raised to >= 1 (or that was scaled
+	// to 0 out of band) would otherwise stay at 0 forever with a TriggerError.
+	// With every trigger answering, the always-on formula evaluates to a positive
+	// ratio, KEDA sees the ScaledObject as active and scales 0 -> minReplicaCount.
 	//
-	// Gated on the trigger's own opt-in rather than inferred, so a ScaledObject
-	// that cannot reach zero keeps treating a failed scrape as an error.
-	if scalerConfig.ZeroReplicaFallback && scalerConfig.MetricSource == metricsource.ModelPodSourceName {
+	// A still-provisioning InferenceSet (desired > 0, no model Service yet) is
+	// different: only an opted-in trigger (scale-to-zero ScaledObject) reads that
+	// as 0, so a ScaledObject that cannot reach zero keeps treating a missing
+	// backend as an error. The scale-to-zero formula separately requires every
+	// activation signal to be idle, so queued EPP work vetoes parking while the
+	// backend is provisioning.
+	if scalerConfig.MetricSource == metricsource.ModelPodSourceName {
 		inferenceSet, err := e.getInferenceSet(ctx, scalerConfig)
 		if err != nil {
 			return nil, err
@@ -234,14 +241,16 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 				scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, scalerConfig.MetricName)
 			return newMetricValueResponse(scalerConfig.MetricName, 0), nil
 		}
-		hasService, err := e.hasModelService(ctx, inferenceSet)
-		if err != nil {
-			return nil, err
-		}
-		if !hasService {
-			klog.V(4).Infof("InferenceSet %s/%s has no model Service yet; reporting 0 for metric %q without scraping",
-				scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, scalerConfig.MetricName)
-			return newMetricValueResponse(scalerConfig.MetricName, 0), nil
+		if scalerConfig.ZeroReplicaFallback {
+			hasService, err := e.hasModelService(ctx, inferenceSet)
+			if err != nil {
+				return nil, err
+			}
+			if !hasService {
+				klog.V(4).Infof("InferenceSet %s/%s has no model Service yet; reporting 0 for metric %q without scraping",
+					scalerConfig.InferenceSetNamespace, scalerConfig.InferenceSetName, scalerConfig.MetricName)
+				return newMetricValueResponse(scalerConfig.MetricName, 0), nil
+			}
 		}
 	}
 

@@ -15,6 +15,8 @@ package scaler
 
 import (
 	"context"
+	"errors"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
@@ -134,6 +136,165 @@ func TestMetricCache_PrunesOldSamples(t *testing.T) {
 	v, err := aggWindowed(cache, nn, cfg, cacheTestMetric, window)
 	assert.NoError(t, err)
 	assert.InDelta(t, 3.0, v, 1e-9)
+}
+
+// steadySnapshots returns n cumulative histogram snapshots whose average
+// observation between any two of them is always 3s.
+func steadySnapshots(n int) []*metricsource.MetricSnapshot {
+	snaps := make([]*metricsource.MetricSnapshot, n)
+	for i := range snaps {
+		snaps[i] = histSnapshot(float64(30*i), uint64(10*i))
+	}
+	return snaps
+}
+
+// TestMetricCache_WindowedAverage_SteadyState drives the real poll cadence
+// (defaultCachePollInterval) and checks that, once warmed up, the windowed
+// average is served on every query despite scrape-timestamp jitter, a missed
+// scrape, or a window shorter than the poll interval.
+func TestMetricCache_WindowedAverage_SteadyState(t *testing.T) {
+	tests := []struct {
+		name    string
+		window  time.Duration
+		jitter  time.Duration
+		missAt  int // poll index whose scrape fails; -1 for none
+		warmups int // polls after which every query must succeed
+	}{
+		{name: "60s window, no jitter", window: 60 * time.Second, missAt: -1, warmups: 4},
+		{name: "60s window, 50ms jitter", window: 60 * time.Second, jitter: 50 * time.Millisecond, missAt: -1, warmups: 5},
+		{name: "60s window, 2s jitter", window: 60 * time.Second, jitter: 2 * time.Second, missAt: -1, warmups: 5},
+		{name: "60s window, 2s jitter, one missed scrape", window: 60 * time.Second, jitter: 2 * time.Second, missAt: 20, warmups: 5},
+		{name: "10s window shorter than the poll interval", window: 10 * time.Second, jitter: 2 * time.Second, missAt: -1, warmups: 1},
+		{name: "300s window, 2s jitter", window: 300 * time.Second, jitter: 2 * time.Second, missAt: -1, warmups: 21},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			is := newReadyInferenceSet("is1", "ns1", true)
+			cfg := metricsource.ScrapeConfig{Protocol: "http", Port: "80", Path: "/metrics"}
+			nn := types.NamespacedName{Namespace: "ns1", Name: "is1"}
+			src := &seqSource{snaps: steadySnapshots(200)}
+			cache := NewMetricCache(newFakeClient(t, is), map[string]metricsource.MetricSource{metricsource.ModelPodSourceName: src})
+			base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			now := base
+			cache.now = func() time.Time { return now }
+			rng := rand.New(rand.NewSource(1))
+
+			cache.ensure(context.Background(), nn, cfg, metricsource.ModelPodSourceName, tt.window)
+			for k := 1; k < 120; k++ {
+				now = base.Add(time.Duration(k) * defaultCachePollInterval)
+				if tt.jitter > 0 {
+					now = now.Add(time.Duration(rng.Int63n(int64(tt.jitter))))
+				}
+				src.mu.Lock()
+				src.err = nil
+				if k == tt.missAt {
+					src.err = errors.New("scrape failed")
+				}
+				src.mu.Unlock()
+				cache.poll(context.Background())
+
+				now = now.Add(time.Second)
+				v, err := aggWindowed(cache, nn, cfg, cacheTestMetric, tt.window)
+				if k < tt.warmups {
+					continue
+				}
+				if assert.NoError(t, err, "poll %d", k) {
+					assert.InDelta(t, 3.0, v, 1e-9, "poll %d", k)
+				}
+			}
+		})
+	}
+}
+
+// TestMetricCache_WindowedAverage_WarmsUpAgainAfterOutage checks that a
+// baseline left over from before a long scrape outage is not used to stretch
+// the average far beyond the window: the cache warms up again instead.
+func TestMetricCache_WindowedAverage_WarmsUpAgainAfterOutage(t *testing.T) {
+	is := newReadyInferenceSet("is1", "ns1", true)
+	cfg := metricsource.ScrapeConfig{Protocol: "http", Port: "80", Path: "/metrics"}
+	nn := types.NamespacedName{Namespace: "ns1", Name: "is1"}
+	window := 60 * time.Second
+	src := &seqSource{snaps: steadySnapshots(50)}
+	cache := NewMetricCache(newFakeClient(t, is), map[string]metricsource.MetricSource{metricsource.ModelPodSourceName: src})
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := base
+	cache.now = func() time.Time { return now }
+	pollAt := func(d time.Duration) {
+		now = base.Add(d)
+		cache.poll(context.Background())
+	}
+
+	cache.ensure(context.Background(), nn, cfg, metricsource.ModelPodSourceName, window)
+	for d := 15 * time.Second; d <= 60*time.Second; d += 15 * time.Second {
+		pollAt(d)
+	}
+	_, err := aggWindowed(cache, nn, cfg, cacheTestMetric, window)
+	assert.NoError(t, err)
+
+	// Scraping fails from t=75s to t=185s, then recovers at t=200s.
+	src.err = errors.New("scrape failed")
+	for d := 75 * time.Second; d <= 185*time.Second; d += 15 * time.Second {
+		pollAt(d)
+	}
+	src.err = nil
+	pollAt(200 * time.Second)
+	_, err = aggWindowed(cache, nn, cfg, cacheTestMetric, window)
+	assert.ErrorContains(t, err, "warming up", "pre-outage baseline must not be used")
+
+	for d := 215 * time.Second; d < 260*time.Second; d += 15 * time.Second {
+		pollAt(d)
+	}
+	_, err = aggWindowed(cache, nn, cfg, cacheTestMetric, window)
+	assert.ErrorContains(t, err, "warming up")
+
+	pollAt(260 * time.Second)
+	v, err := aggWindowed(cache, nn, cfg, cacheTestMetric, window)
+	assert.NoError(t, err)
+	assert.InDelta(t, 3.0, v, 1e-9)
+}
+
+func TestPruneSamples_KeepsBaselineAtWindowStart(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(s float64) snapshotSample {
+		return snapshotSample{at: base.Add(time.Duration(s * float64(time.Second)))}
+	}
+	window := 60 * time.Second
+	tests := []struct {
+		name    string
+		samples []snapshotSample
+		now     time.Time
+		want    []snapshotSample
+	}{
+		{
+			name:    "newest a few ms late keeps the sample just before the window start",
+			samples: []snapshotSample{at(0), at(15), at(30), at(45), at(60.05)},
+			now:     base.Add(60*time.Second + 50*time.Millisecond),
+			want:    []snapshotSample{at(0), at(15), at(30), at(45), at(60.05)},
+		},
+		{
+			name:    "drops samples older than the baseline",
+			samples: []snapshotSample{at(-30), at(-15), at(0), at(15), at(30), at(45), at(60.05)},
+			now:     base.Add(60*time.Second + 50*time.Millisecond),
+			want:    []snapshotSample{at(0), at(15), at(30), at(45), at(60.05)},
+		},
+		{
+			name:    "sample exactly at the window start is the baseline",
+			samples: []snapshotSample{at(-15), at(0), at(15), at(60)},
+			now:     base.Add(60 * time.Second),
+			want:    []snapshotSample{at(0), at(15), at(60)},
+		},
+		{
+			name:    "keeps the newest sample even when everything is old",
+			samples: []snapshotSample{at(0), at(15)},
+			now:     base.Add(10 * time.Minute),
+			want:    []snapshotSample{at(15)},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, pruneSamples(tt.samples, tt.now, window))
+		})
+	}
 }
 
 func TestMetricCache_HoldsWhenStale(t *testing.T) {

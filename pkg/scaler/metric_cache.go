@@ -89,7 +89,8 @@ type cacheEntry struct {
 	scrapeCfg  metricsource.ScrapeConfig
 	sourceName string
 	// window is the largest cache window requested by any histogram metric on
-	// this target; the snapshot history is pruned to it.
+	// this target; the snapshot history is pruned to it (plus the newest sample
+	// at or before the window start, kept as the windowed-average baseline).
 	window     time.Duration
 	lastAccess time.Time
 	samples    []snapshotSample
@@ -201,7 +202,8 @@ func (c *MetricCache) Name() string { return constants.AggregationWindowedAvg }
 // Aggregate implements aggregator.Aggregator for the windowed-average
 // aggregation: it returns the average observation of a histogram metric over
 // input.Window, computed as (ΔSum / ΔCount) between the newest cached snapshot
-// and the oldest snapshot still inside the window, for the target located via
+// and the baseline snapshot at (or just before) the window start (see
+// windowBaseline), for the target located via
 // input.InferenceSet + input.ScrapeConfig + input.MetricSource. The passed
 // snapshot is ignored (the cache holds the whole window).
 //
@@ -238,26 +240,16 @@ func (c *MetricCache) Aggregate(_ *metricsource.MetricSnapshot, input aggregator
 		return 0, windowedWarmingUpErr(input)
 	}
 
-	cutoff := newest.at.Add(-input.Window)
-	// Baseline: the oldest sample still within the window.
-	baseline := e.samples[0]
-	for _, s := range e.samples {
-		if !s.at.Before(cutoff) {
-			baseline = s
-			break
-		}
-	}
+	baseline := windowBaseline(e.samples, input.Window, input.Window+c.staleAfter)
 
-	// Coverage gate: hold until the retained samples span at least ~80% of the
-	// requested window, so the average is representative of the whole window and
-	// not a short recent slice (cold start, or scrape failures near the warm-up's
-	// trailing edge). pruneSamples drops samples older than newest-window and caps
-	// the retained span just under the window, so with any missed/jittered scrapes
-	// the oldest retained sample can sit several poll intervals inside the window.
-	// Requiring near-full coverage would then trip on ordinary scrape gaps and,
-	// because one erroring trigger makes the whole composite metric unavailable,
-	// needlessly freeze scaling; 80% tolerates that jitter while staying
-	// representative.
+	// Coverage gate: hold until the samples span at least ~80% of the requested
+	// window, so the average is representative of the whole window and not a
+	// short recent slice. Once warmed up, windowBaseline anchors on a sample at or
+	// before the window start, so the span is at least the full window regardless
+	// of scrape jitter or a missed scrape; the gate therefore only holds during
+	// warm-up (or after a scrape outage longer than staleAfter), never in steady
+	// state. Holding matters because one erroring trigger makes the whole
+	// composite metric unavailable.
 	if newest.at.Sub(baseline.at) < input.Window*4/5 {
 		return 0, windowedWarmingUpErr(input)
 	}
@@ -409,8 +401,37 @@ func (c *MetricCache) evict(key string) {
 	c.mu.Unlock()
 }
 
-// pruneSamples drops samples older than the window relative to now, always
-// keeping at least the newest sample. It copies into a fresh slice so the pruned
+// windowBaseline picks the sample the windowed average is measured from: the
+// newest sample at or before the window start (newest-window), so the average
+// spans at least the full window. Anchoring strictly inside the window would
+// lose the boundary sample whenever the newest scrape lands a few milliseconds
+// later than the one a window earlier, shrinking the span by a whole poll
+// interval (e.g. 45s of a 60s window) and tripping the coverage gate on ordinary
+// scrape jitter. A boundary sample older than maxSpan (a scrape outage) is not
+// used, so the average never stretches far beyond the window; the oldest sample
+// inside the window is used instead and the coverage gate decides. Without any
+// sample at or before the window start (warm-up) the oldest sample is used.
+func windowBaseline(samples []snapshotSample, window, maxSpan time.Duration) snapshotSample {
+	newest := samples[len(samples)-1]
+	cutoff := newest.at.Add(-window)
+	idx := -1
+	for i := 0; i < len(samples)-1 && !samples[i].at.After(cutoff); i++ {
+		idx = i
+	}
+	switch {
+	case idx < 0:
+		return samples[0]
+	case newest.at.Sub(samples[idx].at) > maxSpan:
+		return samples[idx+1]
+	default:
+		return samples[idx]
+	}
+}
+
+// pruneSamples drops samples that are no longer needed for a window ending at
+// now: everything older than the newest sample at or before the window start,
+// which is kept as the windowed-average baseline (see windowBaseline). The
+// newest sample is always kept. It copies into a fresh slice so the pruned
 // prefix can be garbage collected rather than lingering at the head of a growing
 // backing array.
 func pruneSamples(samples []snapshotSample, now time.Time, window time.Duration) []snapshotSample {
@@ -419,7 +440,7 @@ func pruneSamples(samples []snapshotSample, now time.Time, window time.Duration)
 	}
 	cutoff := now.Add(-window)
 	first := 0
-	for first < len(samples)-1 && samples[first].at.Before(cutoff) {
+	for first < len(samples)-1 && !samples[first+1].at.After(cutoff) {
 		first++
 	}
 	if first == 0 {
