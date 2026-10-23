@@ -31,8 +31,10 @@ RUN --mount=type=cache,target=${GOCACHE} \
     --mount=type=cache,id=keda,sharing=locked,target=/go/pkg/mod \
     MS_GO_NOSYSTEMCRYPTO=1 CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} GO111MODULE=on VERSION=${VERSION} GIT_COMMIT=${GIT_COMMIT} make bin/keda-kaito-scaler
 
-# Build a small image
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/cbl-mariner/distroless/minimal:2.0
+# Build a small image. scratch carries no CA bundle: the binary is statically
+# linked and never trusts the system roots (mTLS uses the scaler's own CA and
+# kube-apiserver uses the ServiceAccount CA).
+FROM scratch
 WORKDIR /
 COPY --from=builder /workspace/_output/keda-kaito-scaler .
 
