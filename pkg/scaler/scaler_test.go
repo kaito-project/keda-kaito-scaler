@@ -729,11 +729,31 @@ func TestKaitoScaler_GetMetrics_ZeroReplicaFallback(t *testing.T) {
 		assert.Equal(t, types.NamespacedName{Namespace: "ns1", Name: "is1"}, sc.gotIS)
 	})
 
-	// Triggers that did not opt in keep their existing behaviour, so an
-	// unreachable workload still surfaces as an error rather than a silent 0.
-	t.Run("without opt-in a parked workload still errors", func(t *testing.T) {
-		sc := &stubSource{err: errors.New("connection refused")}
+	// Without the opt-in, zero desired replicas still report 0: an error there
+	// would make KEDA skip enforcing minReplicaCount (see GetMetrics), leaving a
+	// workload whose minimum was raised from 0 stuck at zero replicas.
+	t.Run("without opt-in a parked workload reports zero", func(t *testing.T) {
+		sc := &stubSource{err: errors.New("should not scrape")}
 		s := newScaler(t, zeroReplicaInferenceSet("is1", "ns1"), sc)
+
+		resp, err := getMetrics(s, newValidScalerMetadata())
+		assert.NoError(t, err)
+		assert.Equal(t, float64(0), resp.MetricValues[0].MetricValueFloat)
+		assert.Equal(t, types.NamespacedName{}, sc.gotIS)
+	})
+
+	// A missing backend while replicas are desired is still an error for a
+	// ScaledObject that cannot reach zero.
+	t.Run("without opt-in provisioning without a service still errors", func(t *testing.T) {
+		is := newReadyInferenceSet("is1", "ns1", false)
+		is.Spec.Replicas = ptr.To(int32(1))
+		workspace := &kaitov1beta1.Workspace{ObjectMeta: metav1.ObjectMeta{
+			Name:      "ws1",
+			Namespace: "ns1",
+			Labels:    map[string]string{"inferenceset.kaito.sh/created-by": "is1"},
+		}}
+		sc := &stubSource{err: errors.New("connection refused")}
+		s := newTestScaler(newFakeClient(t, is, workspace), sc, &stubAggregator{value: 42})
 
 		_, err := getMetrics(s, newValidScalerMetadata())
 		assert.Error(t, err)

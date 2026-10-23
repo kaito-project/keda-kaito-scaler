@@ -107,9 +107,10 @@ const (
 	// metric's _sum/_count. Only carried by histogram triggers.
 	MetricCacheWindowInMetadata = "metricCacheWindow"
 	// ZeroReplicaFallbackInMetadata opts a trigger into reporting 0 instead of
-	// scraping while the InferenceSet sits at zero replicas. Emitted only for
-	// modelpod triggers of a ScaledObject whose minimum is 0, so a trigger
-	// belonging to any other ScaledObject keeps erroring on a failed scrape.
+	// erroring while the InferenceSet is provisioning without a model Service.
+	// Emitted only for modelpod triggers of a ScaledObject whose minimum is 0, so
+	// a trigger belonging to any other ScaledObject keeps erroring on a missing
+	// backend. At zero desired replicas every modelpod trigger reports 0.
 	ZeroReplicaFallbackInMetadata = "zeroReplicaFallback"
 
 	// AggregationWindowedAvg averages a histogram metric's observations over a
