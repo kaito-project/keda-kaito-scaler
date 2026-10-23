@@ -133,6 +133,10 @@ request path. Histogram metrics are reduced to the **average observation over a
 rolling cache window** (`ΔSum / ΔCount`), which stays responsive to sudden
 changes instead of being diluted by the full cumulative history.
 
+> **`MultiRoleInference` children are not supported.** Auto-provisioning skips
+> any `InferenceSet` whose controller owner is a `MultiRoleInference`: no
+> `ScaledObject` is created for it and no `Event` is recorded.
+
 Each entry in the `metrics` list accepts the following fields:
 
 | Field | Required | Default | Description |
@@ -531,10 +535,11 @@ count and observes requests as they arrive, so it is the only source that can
 carry an `activationthreshold`. Set `source: epp` on that metric.
 
 The EPP is scraped **per pod** (port `9090`, path `/metrics`) and its gauges are
-**summed** across router replicas, since queue depth is only meaningful as a
-total. That is why `epp` gauges default to the `sum` aggregation instead of
-`service-avg`. EPP disables missing-service compensation because its threshold
-describes a fleet-wide quantity rather than per-replica load.
+**summed by default** across router replicas, so the flow-control queue metric
+(`llm_d_epp_flow_control_queue_size`) reports the total buffered demand. That is why `epp` gauges default to the `sum`
+aggregation instead of `service-avg`. EPP's `sum` aggregation disables
+missing-service compensation because its threshold describes a fleet-wide
+quantity rather than per-replica load.
 
 Deactivation, by contrast, must include at least one `modelpod`-sourced metric.
 The router's own view can go quiet while a replica is still generating tokens for
@@ -547,7 +552,7 @@ Scale to zero depends on the EPP, which KAITO only creates when **all** of the
 following hold:
 
 1. KAITO is installed with the Gateway API Inference Extension feature gate
-   enabled.
+   (`gatewayAPIInferenceExtension`) enabled.
 2. The `InferenceSet` uses the **vLLM** runtime with a **preset** inference
    template.
 3. At least one `Workspace` exists for the `InferenceSet` — KAITO does not
@@ -566,25 +571,51 @@ a ready EPP pod exists, KEDA's metric requests fail with a diagnostic naming the
 selectors used for discovery, so the current replica count is held. Condition 3
 resolves on its own; conditions 1 and 2 do not.
 
-`InferenceSet`s owned by a `MultiRoleInference` are **rejected** for scale to
-zero (`UnsupportedTopology` warning `Event`): KAITO gives the group a single
-shared EPP, so a child has none of its own and could be parked but never woken.
+Request-driven wake-up also requires KAITO's **`enableEPPFlowControl`** feature
+gate, which is **disabled by default**. It enables request buffering in the EPP
+and the flow-control queue metric used in the example below.
 
 ###### What waking actually depends on
 
-The EPP reports **buffered** demand, not rejected demand. A request only shows up
-in the metrics once it has reached the router and is waiting for a backend, so
-the activation contract is:
+The flow-control queue metric reports **buffered** demand, not rejected demand.
+A request only shows up in this metric once it has reached the router and is
+waiting for a backend, so the activation contract is:
 
 - A request that arrives while the workload is parked is what triggers the wake.
   Whether that request survives the cold start depends on the client's timeout
   and on the gateway's request-buffering configuration.
-- Traffic that sits persistently *below* the activation threshold never wakes the
-  workload. Choose an `activationthreshold` of `0` unless you deliberately want a
-  minimum demand level before paying for a GPU.
+- With `activationthreshold` set to `0`, a single buffered request wakes the
+  workload. With a threshold `T` greater than `0`, the wake-up condition becomes
+  a minimum request rate. While the workload is parked, nothing drains the EPP
+  queue; buffered requests leave it only when they hit the EPP's request TTL. The
+  queue size is therefore the number of requests that arrived within one TTL,
+  and the workload wakes when:
+
+  ```text
+  queue > T   <=>   RPS > T / TTL
+  ```
+
+  For example, with an EPP request TTL of 600 seconds and an
+  `activationthreshold` of `10`, the workload wakes once traffic exceeds about
+  one request per minute. Traffic that stays at or below `T / TTL` never wakes
+  the workload; those requests stay buffered until the TTL expires and then
+  fail. Choose `0` unless you deliberately want a minimum demand level before
+  paying for a GPU.
 - Cold start is not instant: the workload has to acquire a node, pull the model
   and become Ready. Size `cooldownperiod` against how often you are willing to
   pay that cost.
+- The workload can park again before the GPU is ready. Until KAITO creates the
+  model Service, which happens after the node is provisioned, `modelpod` metrics
+  report `0`, so only the EPP queue keeps the workload awake. The EPP queue
+  still drains only through the TTL, so with deactivation threshold `D` the
+  workload stays awake only while `RPS > D / TTL`. Once that no longer holds,
+  it parks after `cooldownperiod`. Set `cooldownperiod` to at least the
+  worst-case node provisioning time.
+- `cooldownperiod` applies only once the workload has been active. Before its
+  first activation, KEDA uses `initialcooldownperiod` instead (default `1800`
+  seconds, counted from ScaledObject creation), so a newly deployed
+  `InferenceSet` with no traffic can park once it elapses. Set it to at least
+  the worst-case time to provision the first GPU node.
 
 ###### Example
 
@@ -603,7 +634,7 @@ metadata:
 
     scaledobject.kaito.sh/metrics: |
       # 0 -> 1: any request queued at the router wakes the workload.
-      - name: inference_pool_per_pod_queue_size
+      - name: llm_d_epp_flow_control_queue_size
         type: gauge
         source: epp
         activationthreshold: 0
@@ -638,8 +669,8 @@ applying either decision:
 
 ```text
 (replica_count == 0)
-  ? ((inference_pool_per_pod_queue_size > 0) ? 1.0 : 0.0)   // 0 -> 1
-  : ((inference_pool_per_pod_queue_size <= 0 &&
+  ? ((llm_d_epp_flow_control_queue_size > 0) ? 1.0 : 0.0)   // 0 -> 1
+  : ((llm_d_epp_flow_control_queue_size <= 0 &&
       vllm_num_requests_running <= 0)        ? 0.0          // 1 -> 0
      : ((readiness_gate == 1 && vllm_num_requests_running > 10) ? 2.0   // scale up
         : ((vllm_num_requests_running < 2)                      ? 0.5   // scale down
@@ -652,14 +683,23 @@ applying either decision:
 failing while the workload is parked, so KEDA sees a clean reading rather than a
 `TriggerError` on every poll.
 
-When `max-replicas` is `1` there is no 1..N range, so the up/down band must be
-omitted entirely and the formula collapses to the 0 ↔ 1 decision.
+When `max-replicas` is `1` there is no 1..N range, so the formula collapses to
+the 0 ↔ 1 decision. Up/down thresholds are optional in this case and, if set,
+are not used.
 
 ###### Limitations
 
-- Removing `min-replicas: "0"` from a running `InferenceSet` that is currently
-  parked leaves it at zero until something wakes it; KEDA raises the floor but
-  does not itself scale the workload back up.
+- To turn scale to zero off, make these changes together:
+  - Set `min-replicas` to `1` or higher, or remove it.
+  - Remove `cooldownperiod` and `initialcooldownperiod`.
+  - Remove every `activationthreshold` and `deactivationthreshold`.
+  - Give every remaining metric an up/down threshold pair, and remove metrics
+    that only drove activation or deactivation.
+
+  Until all of these are in place, the configuration is invalid: the controller
+  records an `InvalidConfig` warning `Event` and keeps the existing
+  `ScaledObject`, including its zero minimum. If the workload is parked and does
+  not come back up, set `spec.replicas` on the `InferenceSet` to the new minimum.
 - Every metric carrying an `activationthreshold` must use `source: epp`; there is
   no way to supply a custom EPP selector, as the name is derived from the
   `InferenceSet` name. It must also carry an explicit `deactivationthreshold`.
