@@ -8,7 +8,7 @@ nameOverrider: ""
 image:
     registry: ghcr.io
     repository: kaito-project/keda-kaito-scaler
-    tag: 0.7.2
+    tag: 0.7.3
     pullSecrets: []
 
 ports:
