@@ -53,11 +53,6 @@ import (
 const (
 	requeueInterval = 5 * time.Second
 
-	// annotationPrefix is the common prefix for every autoscaling annotation the
-	// controller consumes on an InferenceSet. Any change to a key under this
-	// prefix (including the metrics list annotation) triggers a reconcile.
-	annotationPrefix = constants.AnnotationPrefix
-
 	reasonInvalidConfig       = "InvalidConfig"
 	reasonInvalidReplicaRange = "InvalidReplicaRange"
 )
@@ -422,7 +417,7 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			// Reconcile when any autoscaling annotation changes. Comparing by
 			// prefix covers all scaledobject.kaito.sh/ keys, including the
 			// scaledobject.kaito.sh/metrics list annotation.
-			if annotationsWithPrefixChanged(oldInferenceSet.Annotations, newInferenceSet.Annotations, annotationPrefix) {
+			if annotationsWithPrefixChanged(oldInferenceSet.Annotations, newInferenceSet.Annotations, constants.AnnotationPrefix) {
 				// Fire when the new state requests auto-provisioning (provision,
 				// update, or report an invalid config) or the old state did (so
 				// toggling the annotation off still triggers cleanup).

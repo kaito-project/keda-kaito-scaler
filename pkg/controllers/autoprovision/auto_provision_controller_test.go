@@ -318,15 +318,15 @@ func TestAnnotationsWithPrefixChanged(t *testing.T) {
 
 	// Changing a composite key is detected.
 	next := map[string]string{"scaledobject.kaito.sh/metrics": "latency-p95", "other": "x"}
-	assert.True(t, annotationsWithPrefixChanged(old, next, annotationPrefix))
+	assert.True(t, annotationsWithPrefixChanged(old, next, constants.AnnotationPrefix))
 
 	// Adding a new prefixed key is detected.
 	added := map[string]string{"scaledobject.kaito.sh/metrics": "queue", "scaledobject.kaito.sh/max-replicas": "10", "other": "x"}
-	assert.True(t, annotationsWithPrefixChanged(old, added, annotationPrefix))
+	assert.True(t, annotationsWithPrefixChanged(old, added, constants.AnnotationPrefix))
 
 	// Changing a non-prefixed key is ignored.
 	unrelated := map[string]string{"scaledobject.kaito.sh/metrics": "queue", "other": "y"}
-	assert.False(t, annotationsWithPrefixChanged(old, unrelated, annotationPrefix))
+	assert.False(t, annotationsWithPrefixChanged(old, unrelated, constants.AnnotationPrefix))
 }
 
 func newReconcileFakeClient(t *testing.T, objs ...client.Object) client.Client {
@@ -809,7 +809,7 @@ func TestReconcile_AnnotationCollisionsPreventCleanup(t *testing.T) {
 			is := scaleToZeroIS("test-is", "default")
 			// Even an opt-out must not destroy a managed object on conflict.
 			is.Annotations = map[string]string{constants.AnnotationKeyAutoProvision: "false"}
-			first, second := annotationPrefix+strings.ToUpper(name), annotationPrefix+name
+			first, second := constants.AnnotationPrefix+strings.ToUpper(name), constants.AnnotationPrefix+name
 			is.Annotations[first], is.Annotations[second] = "", "false"
 			so := newManagedScaledObject("managed-so", is)
 			c := newReconcileFakeClient(t, is, so)
@@ -838,7 +838,7 @@ func TestInferenceSetPredicate_CaseInsensitiveAnnotationNames(t *testing.T) {
 	assert.True(t, pred.Create(event.CreateEvent{Object: is}))
 	for _, key := range []string{"MeTrIcS", "MIN-REPLICAS", "MAX-REPLICAS", "NewFutureKey", "COOLDOWNPERIOD"} {
 		next := is.DeepCopy()
-		next.Annotations[annotationPrefix+key] = ""
+		next.Annotations[constants.AnnotationPrefix+key] = ""
 		assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: is, ObjectNew: next}), "adding empty %s", key)
 		assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: next, ObjectNew: is}), "removing empty %s", key)
 	}
