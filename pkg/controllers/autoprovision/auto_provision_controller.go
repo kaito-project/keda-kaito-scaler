@@ -487,12 +487,12 @@ func autoProvisionRequested(inferenceSet *kaitov1beta1.InferenceSet) bool {
 // prefix differs between the old and new maps (including keys added or removed).
 func annotationsWithPrefixChanged(oldAnnotations, newAnnotations map[string]string, prefix string) bool {
 	for k, v := range oldAnnotations {
-		if strings.HasPrefix(k, prefix) && newAnnotations[k] != v {
+		if newValue, exists := newAnnotations[k]; strings.HasPrefix(k, prefix) && (!exists || newValue != v) {
 			return true
 		}
 	}
 	for k, v := range newAnnotations {
-		if strings.HasPrefix(k, prefix) && oldAnnotations[k] != v {
+		if oldValue, exists := oldAnnotations[k]; strings.HasPrefix(k, prefix) && (!exists || oldValue != v) {
 			return true
 		}
 	}

@@ -681,3 +681,59 @@ func TestInferenceSetPredicate_ExcludesMultiRoleInferenceChildren(t *testing.T) 
 	alwaysOn.Annotations[constants.AnnotationKeyMaxReplicas] = "10"
 	assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: alwaysOn}))
 }
+
+// Alias conflicts must be visible to users, including when an empty-valued key
+// is added or removed. The watch must enqueue both invalid and repaired states.
+func TestReconcile_TuningAnnotationAliases(t *testing.T) {
+	for _, tt := range []struct {
+		name, canonical, legacy string
+		conflict                bool
+	}{
+		{"matching aliases", "120", "120", false},
+		{"different values", "120", "240", true},
+		{"empty canonical", "", "120", true},
+		{"empty legacy", "120", "", true},
+		{"both empty", "", "", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			is := scaleToZeroIS("test-is", "default")
+			// This helper's router metric needs a deactivation threshold as well.
+			is.Annotations[constants.AnnotationKeyMetrics] = `
+- {name: router_queue, type: gauge, source: epp, activationthreshold: 0, deactivationthreshold: 0}
+- {name: backend_running, type: gauge, deactivationthreshold: 0}
+`
+			is.Annotations[constants.AnnotationKeyScaleUpCooldown] = tt.legacy
+			old := is.DeepCopy()
+			is.Annotations[constants.AnnotationKeyScaleUpCooldownCamelCase] = tt.canonical
+			pred := generateInferenceSetPredicateFunc()
+			assert.True(t, pred.Create(event.CreateEvent{Object: is}))
+			assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: is}))
+			assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: is, ObjectNew: old}))
+
+			c := newReconcileFakeClient(t, is)
+			recorder := record.NewFakeRecorder(10)
+			ctrl := &Controller{Client: c, Recorder: recorder}
+			_, err := ctrl.Reconcile(context.Background(), is)
+			assert.NoError(t, err)
+			var sos v1alpha1.ScaledObjectList
+			assert.NoError(t, c.List(context.Background(), &sos))
+			events := eventsFrom(t, recorder)
+			if tt.conflict {
+				assert.Empty(t, sos.Items)
+				assert.True(t, containsEvent(events, reasonInvalidConfig))
+				assert.True(t, containsEvent(events, "conflicting annotations"))
+				assert.True(t, containsEvent(events, constants.AnnotationKeyScaleUpCooldownCamelCase))
+				assert.True(t, containsEvent(events, constants.AnnotationKeyScaleUpCooldown))
+			} else {
+				assert.Empty(t, events)
+				if assert.Len(t, sos.Items, 1) {
+					want := int32(120)
+					if tt.canonical == "" {
+						want = 900
+					}
+					assert.Equal(t, want, sos.Items[0].Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior.ScaleUp.Policies[0].PeriodSeconds)
+				}
+			}
+		})
+	}
+}

@@ -22,6 +22,7 @@ package scaledobject
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"strconv"
 	"strings"
@@ -343,6 +344,37 @@ type metricSpec struct {
 	MetricCacheWindow *int `json:"metriccachewindow,omitempty"`
 }
 
+// normalizeTuningAnnotations resolves only the explicitly supported aliases.
+// Keep the caller's annotations untouched and retain legacy keys internally so
+// every parser (including scale-to-zero presence checks) sees the same values.
+// Compare raw strings before parsing: neither spelling silently wins a conflict.
+func normalizeTuningAnnotations(annotations map[string]string) (map[string]string, error) {
+	aliases := [...]struct{ canonical, legacy string }{
+		{constants.AnnotationKeyCombinePolicyCamelCase, constants.AnnotationKeyCombinePolicy},
+		{constants.AnnotationKeyScaleUpStabilizationWindowCamelCase, constants.AnnotationKeyScaleUpStabilizationWindow},
+		{constants.AnnotationKeyScaleDownStabilizationWindowCamelCase, constants.AnnotationKeyScaleDownStabilizationWindow},
+		{constants.AnnotationKeyScaleUpCooldownCamelCase, constants.AnnotationKeyScaleUpCooldown},
+		{constants.AnnotationKeyScaleDownCooldownCamelCase, constants.AnnotationKeyScaleDownCooldown},
+		{constants.AnnotationKeyScaleUpToleranceCamelCase, constants.AnnotationKeyScaleUpTolerance},
+		{constants.AnnotationKeyScaleDownToleranceCamelCase, constants.AnnotationKeyScaleDownTolerance},
+		{constants.AnnotationKeyCooldownPeriodCamelCase, constants.AnnotationKeyCooldownPeriod},
+		{constants.AnnotationKeyInitialCooldownPeriodCamelCase, constants.AnnotationKeyInitialCooldownPeriod},
+	}
+	normalized := maps.Clone(annotations)
+	for _, alias := range aliases {
+		value, present := annotations[alias.canonical]
+		if !present {
+			continue
+		}
+		if legacyValue, exists := annotations[alias.legacy]; exists && value != legacyValue {
+			return nil, fmt.Errorf("conflicting annotations %s=%q and %s=%q: values must match exactly",
+				alias.canonical, value, alias.legacy, legacyValue)
+		}
+		normalized[alias.legacy] = value
+	}
+	return normalized, nil
+}
+
 // parseMetricsConfig parses and validates the auto-provision annotations into a
 // metricsConfig. The per-metric configuration is read from the
 // scaledobject.kaito.sh/metrics annotation (a YAML list); the remaining global
@@ -353,6 +385,10 @@ type metricSpec struct {
 // including the watch predicates, which have no API client.
 func parseMetricsConfig(annotations map[string]string, minReplicas int) (metricsConfig, error) {
 	var cfg metricsConfig
+	annotations, err := normalizeTuningAnnotations(annotations)
+	if err != nil {
+		return cfg, err
+	}
 
 	// Scale-to-zero is the only mode with a 0 <-> 1 range, so it is what makes
 	// the activation thresholds meaningful and the up/down band optional.
@@ -501,7 +537,6 @@ func parseMetricsConfig(annotations map[string]string, minReplicas int) (metrics
 		})
 	}
 
-	var err error
 	if cfg.scaleUpStabilizationWindow, err = parseStabilizationWindowAnnotation(annotations, constants.AnnotationKeyScaleUpStabilizationWindow, defaultScaleUpStabilizationWindow); err != nil {
 		return cfg, err
 	}
