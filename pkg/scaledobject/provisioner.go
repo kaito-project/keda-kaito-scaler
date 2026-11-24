@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -344,33 +345,28 @@ type metricSpec struct {
 	MetricCacheWindow *int `json:"metriccachewindow,omitempty"`
 }
 
-// normalizeTuningAnnotations resolves only the explicitly supported aliases.
-// Keep the caller's annotations untouched and retain legacy keys internally so
-// every parser (including scale-to-zero presence checks) sees the same values.
-// Compare raw strings before parsing: neither spelling silently wins a conflict.
-func normalizeTuningAnnotations(annotations map[string]string) (map[string]string, error) {
-	aliases := [...]struct{ canonical, legacy string }{
-		{constants.AnnotationKeyCombinePolicyCamelCase, constants.AnnotationKeyCombinePolicy},
-		{constants.AnnotationKeyScaleUpStabilizationWindowCamelCase, constants.AnnotationKeyScaleUpStabilizationWindow},
-		{constants.AnnotationKeyScaleDownStabilizationWindowCamelCase, constants.AnnotationKeyScaleDownStabilizationWindow},
-		{constants.AnnotationKeyScaleUpCooldownCamelCase, constants.AnnotationKeyScaleUpCooldown},
-		{constants.AnnotationKeyScaleDownCooldownCamelCase, constants.AnnotationKeyScaleDownCooldown},
-		{constants.AnnotationKeyScaleUpToleranceCamelCase, constants.AnnotationKeyScaleUpTolerance},
-		{constants.AnnotationKeyScaleDownToleranceCamelCase, constants.AnnotationKeyScaleDownTolerance},
-		{constants.AnnotationKeyCooldownPeriodCamelCase, constants.AnnotationKeyCooldownPeriod},
-		{constants.AnnotationKeyInitialCooldownPeriodCamelCase, constants.AnnotationKeyInitialCooldownPeriod},
-	}
-	normalized := maps.Clone(annotations)
-	for _, alias := range aliases {
-		value, present := annotations[alias.canonical]
-		if !present {
-			continue
+// NormalizeAnnotations returns a copy with names under the exact autoscaling
+// namespace prefix lowercased. Unknown names follow the same rules; other
+// namespaces and all values (including metrics YAML) are untouched. Colliding
+// names must have identical raw values. Sorting makes conflict errors stable
+// and preserves the original keys in diagnostics. The result is idempotent.
+func NormalizeAnnotations(annotations map[string]string) (map[string]string, error) {
+	normalized := make(map[string]string, len(annotations))
+	originalKeys := make(map[string]string, len(annotations))
+	for _, key := range slices.Sorted(maps.Keys(annotations)) {
+		name := key
+		if strings.HasPrefix(key, constants.AnnotationPrefix) {
+			name = constants.AnnotationPrefix + strings.ToLower(strings.TrimPrefix(key, constants.AnnotationPrefix))
 		}
-		if legacyValue, exists := annotations[alias.legacy]; exists && value != legacyValue {
+		value := annotations[key]
+		if original, exists := originalKeys[name]; exists && normalized[name] != value {
 			return nil, fmt.Errorf("conflicting annotations %s=%q and %s=%q: values must match exactly",
-				alias.canonical, value, alias.legacy, legacyValue)
+				original, normalized[name], key, value)
 		}
-		normalized[alias.legacy] = value
+		if _, exists := originalKeys[name]; !exists {
+			originalKeys[name] = key
+		}
+		normalized[name] = value
 	}
 	return normalized, nil
 }
@@ -385,7 +381,7 @@ func normalizeTuningAnnotations(annotations map[string]string) (map[string]strin
 // including the watch predicates, which have no API client.
 func parseMetricsConfig(annotations map[string]string, minReplicas int) (metricsConfig, error) {
 	var cfg metricsConfig
-	annotations, err := normalizeTuningAnnotations(annotations)
+	annotations, err := NormalizeAnnotations(annotations)
 	if err != nil {
 		return cfg, err
 	}

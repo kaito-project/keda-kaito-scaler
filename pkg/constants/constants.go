@@ -16,6 +16,9 @@
 package constants
 
 const (
+	// AnnotationPrefix is the exact namespace prefix for autoscaling annotations.
+	AnnotationPrefix = "scaledobject.kaito.sh/"
+
 	// AnnotationKeyManagedBy marks a ScaledObject as managed by keda-kaito-scaler.
 	AnnotationKeyManagedBy = "scaledobject.kaito.sh/managed-by"
 	// AnnotationKeyAutoProvision enables auto-provisioning when set to "true".
@@ -62,18 +65,6 @@ const (
 	AnnotationKeyScaleUpTolerance = "scaledobject.kaito.sh/scaleuptolerance"
 	// AnnotationKeyScaleDownTolerance sets the HPA scale-down tolerance ratio.
 	AnnotationKeyScaleDownTolerance = "scaledobject.kaito.sh/scaledowntolerance"
-
-	// Canonical camelCase global tuning keys. The original constants above keep
-	// their lowercase values for source compatibility; both spellings are accepted.
-	AnnotationKeyCombinePolicyCamelCase                = "scaledobject.kaito.sh/combinePolicy"
-	AnnotationKeyScaleUpStabilizationWindowCamelCase   = "scaledobject.kaito.sh/scaleUpStabilizationWindow"
-	AnnotationKeyScaleDownStabilizationWindowCamelCase = "scaledobject.kaito.sh/scaleDownStabilizationWindow"
-	AnnotationKeyScaleUpCooldownCamelCase              = "scaledobject.kaito.sh/scaleUpCooldown"
-	AnnotationKeyScaleDownCooldownCamelCase            = "scaledobject.kaito.sh/scaleDownCooldown"
-	AnnotationKeyScaleUpToleranceCamelCase             = "scaledobject.kaito.sh/scaleUpTolerance"
-	AnnotationKeyScaleDownToleranceCamelCase           = "scaledobject.kaito.sh/scaleDownTolerance"
-	AnnotationKeyCooldownPeriodCamelCase               = "scaledobject.kaito.sh/cooldownPeriod"
-	AnnotationKeyInitialCooldownPeriodCamelCase        = "scaledobject.kaito.sh/initialCooldownPeriod"
 
 	// InferenceSet is the Kind of the scale target referenced by managed ScaledObjects.
 	InferenceSet = "InferenceSet"

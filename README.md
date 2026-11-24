@@ -178,36 +178,31 @@ The remaining global annotations:
 
 #### Annotation spelling and compatibility
 
-Use the camelCase tuning keys above for new configurations. The following exact
-lowercase spellings remain supported as backward-compatible aliases (all keys use
-the `scaledobject.kaito.sh/` prefix):
+Use the camelCase tuning keys above for new configurations. Annotation **names**
+under the exact `scaledobject.kaito.sh/` namespace prefix are case-insensitive:
+`scaleUpStabilizationWindow`, `scaleupStabilizationWindow`,
+`scaleupstabilizationwindow`, and `SCALEUPSTABILIZATIONWINDOW` are equivalent.
+Existing lowercase spellings remain supported. This applies to every name under
+this prefix, including `metrics`, `auto-provision`, `min-replicas`, and
+`max-replicas`. Hyphens are preserved: `AUTO-PROVISION` is accepted, but
+`autoProvision` is not a spelling of `auto-provision`.
 
-| Canonical key | Legacy alias |
-| --- | --- |
-| `combinePolicy` | `combinepolicy` |
-| `scaleUpStabilizationWindow` | `scaleupstabilizationwindow` |
-| `scaleDownStabilizationWindow` | `scaledownstabilizationwindow` |
-| `scaleUpCooldown` | `scaleupcooldown` |
-| `scaleDownCooldown` | `scaledowncooldown` |
-| `scaleUpTolerance` | `scaleuptolerance` |
-| `scaleDownTolerance` | `scaledowntolerance` |
-| `cooldownPeriod` | `cooldownperiod` |
-| `initialCooldownPeriod` | `initialcooldownperiod` |
+Names are normalized to lowercase before reading configuration. When multiple
+keys normalize to the same name, their raw string values must match exactly.
+Identical values are accepted; different values reject the configuration and
+produce an `InvalidConfig` warning Event rather than choosing one spelling or
+cleaning up existing ScaledObjects. Errors name the original keys in a stable
+order. For example, `"60"` and `"060"` conflict, as do `"AND"` and `"and"`, or an
+empty string and `"60"`. Identical empty values retain the existing behavior for
+that setting (defaults for tuning keys). `cooldownPeriod` and
+`initialCooldownPeriod` still require `min-replicas: "0"`, even when empty.
+Unknown names under this prefix are also normalized and checked for collisions,
+but do not otherwise configure any setting.
 
-When both spellings of a setting are present, their string values must match
-exactly. Identical values are accepted; different values reject the configuration
-and produce an `InvalidConfig` warning Event rather than choosing one spelling.
-For example, `"60"` and `"060"` conflict, as do an empty string and `"60"`.
-Empty values (including both aliases set to `""`) retain the existing default
-behavior. `cooldownPeriod` and `initialCooldownPeriod` still require
-`min-replicas: "0"`, even when empty.
-
-Keys are case-sensitive: only the canonical and legacy spellings listed here are
-recognized; `scaleupStabilizationWindow` is not an alias for
-`scaleUpStabilizationWindow`. Existing hyphenated keys (`auto-provision`,
-`min-replicas`, `max-replicas`, `managed-by`) and the `metrics` key are unchanged.
-The fields inside the `metrics` YAML list, such as `upthreshold`, `downthreshold`,
-and `metriccachewindow`, are also unchanged.
+The namespace prefix itself must match exactly; other namespaces are untouched.
+Annotation values are never case-normalized, including the `metrics` YAML list.
+Its fields, such as `upthreshold`, `downthreshold`, and `metriccachewindow`, and
+metric names keep their existing parsing behavior.
 
 Each field of the generated HPA behavior is driven by exactly one annotation:
 `scaleUpStabilizationWindow` / `scaleUpCooldown` (scale-up stabilization window /
