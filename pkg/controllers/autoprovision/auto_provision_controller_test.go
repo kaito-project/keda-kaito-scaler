@@ -24,6 +24,7 @@ import (
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -317,15 +318,15 @@ func TestAnnotationsWithPrefixChanged(t *testing.T) {
 
 	// Changing a composite key is detected.
 	next := map[string]string{"scaledobject.kaito.sh/metrics": "latency-p95", "other": "x"}
-	assert.True(t, annotationsWithPrefixChanged(old, next, annotationPrefix))
+	assert.True(t, annotationsWithPrefixChanged(old, next, constants.AnnotationPrefix))
 
 	// Adding a new prefixed key is detected.
 	added := map[string]string{"scaledobject.kaito.sh/metrics": "queue", "scaledobject.kaito.sh/max-replicas": "10", "other": "x"}
-	assert.True(t, annotationsWithPrefixChanged(old, added, annotationPrefix))
+	assert.True(t, annotationsWithPrefixChanged(old, added, constants.AnnotationPrefix))
 
 	// Changing a non-prefixed key is ignored.
 	unrelated := map[string]string{"scaledobject.kaito.sh/metrics": "queue", "other": "y"}
-	assert.False(t, annotationsWithPrefixChanged(old, unrelated, annotationPrefix))
+	assert.False(t, annotationsWithPrefixChanged(old, unrelated, constants.AnnotationPrefix))
 }
 
 func newReconcileFakeClient(t *testing.T, objs ...client.Object) client.Client {
@@ -680,4 +681,186 @@ func TestInferenceSetPredicate_ExcludesMultiRoleInferenceChildren(t *testing.T) 
 	old := alwaysOn.DeepCopy()
 	alwaysOn.Annotations[constants.AnnotationKeyMaxReplicas] = "10"
 	assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: alwaysOn}))
+}
+
+// Alias conflicts must be visible to users, including when an empty-valued key
+// is added or removed. The watch must enqueue both invalid and repaired states.
+func TestReconcile_TuningAnnotationAliases(t *testing.T) {
+	for _, tt := range []struct {
+		name, canonical, legacy string
+		conflict                bool
+	}{
+		{"matching aliases", "120", "120", false},
+		{"different values", "120", "240", true},
+		{"empty canonical", "", "120", true},
+		{"empty legacy", "120", "", true},
+		{"both empty", "", "", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			is := scaleToZeroIS("test-is", "default")
+			// This helper's router metric needs a deactivation threshold as well.
+			is.Annotations[constants.AnnotationKeyMetrics] = `
+- {name: router_queue, type: gauge, source: epp, activationthreshold: 0, deactivationthreshold: 0}
+- {name: backend_running, type: gauge, deactivationthreshold: 0}
+`
+			is.Annotations[constants.AnnotationKeyScaleUpCooldown] = tt.legacy
+			old := is.DeepCopy()
+			is.Annotations["scaledobject.kaito.sh/scaleUpCooldown"] = tt.canonical
+			pred := generateInferenceSetPredicateFunc()
+			assert.True(t, pred.Create(event.CreateEvent{Object: is}))
+			assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: is}))
+			assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: is, ObjectNew: old}))
+
+			c := newReconcileFakeClient(t, is)
+			recorder := record.NewFakeRecorder(10)
+			ctrl := &Controller{Client: c, Recorder: recorder}
+			_, err := ctrl.Reconcile(context.Background(), is)
+			assert.NoError(t, err)
+			var sos v1alpha1.ScaledObjectList
+			assert.NoError(t, c.List(context.Background(), &sos))
+			events := eventsFrom(t, recorder)
+			if tt.conflict {
+				assert.Empty(t, sos.Items)
+				assert.True(t, containsEvent(events, reasonInvalidConfig))
+				assert.True(t, containsEvent(events, "conflicting annotations"))
+				assert.True(t, containsEvent(events, "scaledobject.kaito.sh/scaleUpCooldown"))
+				assert.True(t, containsEvent(events, constants.AnnotationKeyScaleUpCooldown))
+			} else {
+				assert.Empty(t, events)
+				if assert.Len(t, sos.Items, 1) {
+					want := int32(120)
+					if tt.canonical == "" {
+						want = 900
+					}
+					assert.Equal(t, want, sos.Items[0].Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior.ScaleUp.Policies[0].PeriodSeconds)
+				}
+			}
+		})
+	}
+}
+
+// Exercise the public controller boundary, not only the metrics parser: opt-in,
+// replica bounds, validation and cleanup must all see the same normalized map.
+func TestReconcile_CaseInsensitiveAnnotationNames(t *testing.T) {
+	for _, tt := range []struct {
+		name, min, max, metrics, cooldown, reason string
+	}{
+		{name: "positive replicas", min: "2", max: "5", metrics: compositeAnnotations()[constants.AnnotationKeyMetrics]},
+		{name: "scale to zero", min: "0", max: "5", cooldown: "600", metrics: `
+- {name: router_queue, type: gauge, source: epp, activationthreshold: 0, deactivationthreshold: 0}
+- {name: backend_running, type: gauge, deactivationthreshold: 0}
+`},
+		{name: "invalid max", min: "1", max: "invalid", metrics: compositeAnnotations()[constants.AnnotationKeyMetrics], reason: reasonInvalidReplicaRange},
+		{name: "invalid range", min: "3", max: "2", metrics: compositeAnnotations()[constants.AnnotationKeyMetrics], reason: reasonInvalidReplicaRange},
+		{name: "missing metrics", min: "1", max: "5", reason: reasonInvalidConfig},
+		{name: "invalid metrics", min: "1", max: "5", metrics: "[", reason: reasonInvalidConfig},
+		{name: "cooldown requires zero", min: "1", max: "5", cooldown: "600", metrics: compositeAnnotations()[constants.AnnotationKeyMetrics], reason: reasonInvalidConfig},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			is := scaleToZeroIS("test-is", "default")
+			is.Annotations = map[string]string{
+				"scaledobject.kaito.sh/AUTO-PROVISION": "true",
+				"scaledobject.kaito.sh/MiN-RePlIcAs":   tt.min,
+				"scaledobject.kaito.sh/MAX-REPLICAS":   tt.max,
+				"scaledobject.kaito.sh/MeTrIcS":        tt.metrics,
+			}
+			if tt.cooldown != "" {
+				is.Annotations["scaledobject.kaito.sh/COOLDOWNPERIOD"] = tt.cooldown
+			}
+			c := newReconcileFakeClient(t, is)
+			before := is.DeepCopy()
+			recorder := record.NewFakeRecorder(10)
+			ctrl := &Controller{Client: c, Recorder: recorder}
+			_, err := ctrl.Reconcile(context.Background(), is)
+			require.NoError(t, err)
+			assert.Equal(t, before, is, "must not mutate caller/cache objects")
+			var sos v1alpha1.ScaledObjectList
+			require.NoError(t, c.List(context.Background(), &sos))
+			events := eventsFrom(t, recorder)
+			if tt.reason != "" {
+				assert.Empty(t, sos.Items)
+				assert.True(t, containsEvent(events, tt.reason), "%v", events)
+				return
+			}
+			require.Len(t, sos.Items, 1)
+			minReplicas, err := strconv.Atoi(tt.min)
+			require.NoError(t, err)
+			assert.Equal(t, int32(minReplicas), *sos.Items[0].Spec.MinReplicaCount)
+			assert.Equal(t, int32(5), *sos.Items[0].Spec.MaxReplicaCount)
+			if tt.cooldown != "" {
+				assert.Equal(t, int32(600), *sos.Items[0].Spec.CooldownPeriod)
+			}
+			assert.Empty(t, events)
+
+			// Turning the mixed-case opt-in off still enqueues and cleans up.
+			is.Annotations["scaledobject.kaito.sh/AUTO-PROVISION"] = "false"
+			assert.True(t, generateInferenceSetPredicateFunc().Update(event.UpdateEvent{ObjectOld: before, ObjectNew: is}))
+			_, err = ctrl.Reconcile(context.Background(), is)
+			require.NoError(t, err)
+			require.NoError(t, c.List(context.Background(), &sos))
+			assert.Empty(t, sos.Items)
+		})
+	}
+}
+
+func TestReconcile_AnnotationCollisionsPreventCleanup(t *testing.T) {
+	for _, name := range []string{"auto-provision", "min-replicas", "max-replicas", "metrics", "future-key"} {
+		t.Run(name, func(t *testing.T) {
+			is := scaleToZeroIS("test-is", "default")
+			// Even an opt-out must not destroy a managed object on conflict.
+			is.Annotations = map[string]string{constants.AnnotationKeyAutoProvision: "false"}
+			first, second := constants.AnnotationPrefix+strings.ToUpper(name), constants.AnnotationPrefix+name
+			is.Annotations[first], is.Annotations[second] = "", "false"
+			so := newManagedScaledObject("managed-so", is)
+			c := newReconcileFakeClient(t, is, so)
+			before := is.DeepCopy()
+			recorder := record.NewFakeRecorder(10)
+			ctrl := &Controller{Client: c, Recorder: recorder}
+			assert.True(t, generateInferenceSetPredicateFunc().Create(event.CreateEvent{Object: is}))
+			_, err := ctrl.Reconcile(context.Background(), is)
+			require.NoError(t, err)
+			assert.Equal(t, before, is)
+			var got v1alpha1.ScaledObject
+			require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(so), &got))
+			assert.Equal(t, so.Spec, got.Spec)
+			events := eventsFrom(t, recorder)
+			assert.True(t, containsEvent(events, reasonInvalidConfig))
+			assert.True(t, containsEvent(events, first))
+			assert.True(t, containsEvent(events, second))
+		})
+	}
+}
+
+func TestInferenceSetPredicate_CaseInsensitiveAnnotationNames(t *testing.T) {
+	pred := generateInferenceSetPredicateFunc()
+	is := scaleToZeroIS("test-is", "default")
+	is.Annotations = map[string]string{"scaledobject.kaito.sh/AuTo-PrOvIsIoN": "true"}
+	assert.True(t, pred.Create(event.CreateEvent{Object: is}))
+	for _, key := range []string{"MeTrIcS", "MIN-REPLICAS", "MAX-REPLICAS", "NewFutureKey", "COOLDOWNPERIOD"} {
+		next := is.DeepCopy()
+		next.Annotations[constants.AnnotationPrefix+key] = ""
+		assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: is, ObjectNew: next}), "adding empty %s", key)
+		assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: next, ObjectNew: is}), "removing empty %s", key)
+	}
+	for _, key := range []string{"other.example/METRICS", "ScaledObject.kaito.sh/METRICS"} {
+		next := is.DeepCopy()
+		next.Annotations[key] = ""
+		assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: is, ObjectNew: next}))
+	}
+	for _, ann := range []map[string]string{
+		{"ScaledObject.kaito.sh/AUTO-PROVISION": "true"},
+		{"other.example/auto-provision": "true"},
+		{"scaledobject.kaito.sh/autoProvision": "true"},
+		{"scaledobject.kaito.sh/AUTO-PROVISION": "TRUE"},
+	} {
+		next := is.DeepCopy()
+		next.Annotations = ann
+		assert.False(t, pred.Create(event.CreateEvent{Object: next}))
+	}
+	// A conflicting empty opt-in must be enqueued when added and when repaired.
+	next := is.DeepCopy()
+	next.Annotations[constants.AnnotationKeyAutoProvision] = ""
+	assert.True(t, pred.Create(event.CreateEvent{Object: next}))
+	assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: is, ObjectNew: next}))
+	assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: next, ObjectNew: is}))
 }

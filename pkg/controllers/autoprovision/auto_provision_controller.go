@@ -53,11 +53,6 @@ import (
 const (
 	requeueInterval = 5 * time.Second
 
-	// annotationPrefix is the common prefix for every autoscaling annotation the
-	// controller consumes on an InferenceSet. Any change to a key under this
-	// prefix (including the metrics list annotation) triggers a reconcile.
-	annotationPrefix = "scaledobject.kaito.sh/"
-
 	reasonInvalidConfig       = "InvalidConfig"
 	reasonInvalidReplicaRange = "InvalidReplicaRange"
 )
@@ -83,11 +78,26 @@ func NewAutoProvisionController(c client.Client, scalerNamespace, scalerServiceN
 func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSet) (reconcile.Result, error) {
 	logger := log.FromContext(ctx).WithName("auto-provision-controller")
 
+	// Normalize before any control reads, including opt-in/cleanup and replica
+	// bounds. Never replace annotations on the caller's (possibly cached) object.
+	annotations, err := scaledobject.NormalizeAnnotations(is.Annotations)
+	if err != nil {
+		logger.Info("skip reconciling inference set because autoscaling config is invalid",
+			"namespace", is.Namespace, "name", is.Name, "error", err.Error())
+		if c.Recorder != nil {
+			c.Recorder.Eventf(is, corev1.EventTypeWarning, reasonInvalidConfig,
+				"Skip auto-provisioning ScaledObject: %v", err)
+		}
+		return reconcile.Result{}, nil
+	}
+	is = is.DeepCopy()
+	is.Annotations = annotations
+
 	// When auto-provisioning is not requested (annotation missing or set to a
 	// value other than "true"), tear down any ScaledObject we previously
 	// provisioned for this InferenceSet. This handles the case where the
 	// auto-provision annotation is toggled off after a ScaledObject was created.
-	if !autoProvisionRequested(is) {
+	if is.Annotations[constants.AnnotationKeyAutoProvision] != "true" {
 		return reconcile.Result{}, c.cleanupManagedScaledObjects(ctx, is)
 	}
 
@@ -157,7 +167,8 @@ func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSe
 // resolveMaxReplicas computes the max replicas for the ScaledObject. When
 // NodeCountLimit is set, it derives the value from workspaces and may signal a
 // requeue if information is not yet available. Otherwise it falls back to the
-// max-replicas annotation or a default of 1.
+// max-replicas annotation or a default of 1. Reconcile normalizes annotations
+// before calling this helper.
 func (c *Controller) resolveMaxReplicas(ctx context.Context, is *kaitov1beta1.InferenceSet) (int, bool, error) {
 	if is.Spec.NodeCountLimit == 0 {
 		if maxReplicasStr, ok := is.Annotations[constants.AnnotationKeyMaxReplicas]; ok {
@@ -387,7 +398,7 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			}
 			// Deliberately does not filter on config validity: an invalid config
 			// must still reach Reconcile so it can be reported as an Event.
-			return autoProvisionRequested(inferenceSet)
+			return autoProvisionRequestedOrInvalid(inferenceSet)
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldInferenceSet, ok := e.ObjectOld.(*kaitov1beta1.InferenceSet)
@@ -406,11 +417,11 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			// Reconcile when any autoscaling annotation changes. Comparing by
 			// prefix covers all scaledobject.kaito.sh/ keys, including the
 			// scaledobject.kaito.sh/metrics list annotation.
-			if annotationsWithPrefixChanged(oldInferenceSet.Annotations, newInferenceSet.Annotations, annotationPrefix) {
+			if annotationsWithPrefixChanged(oldInferenceSet.Annotations, newInferenceSet.Annotations, constants.AnnotationPrefix) {
 				// Fire when the new state requests auto-provisioning (provision,
 				// update, or report an invalid config) or the old state did (so
 				// toggling the annotation off still triggers cleanup).
-				return autoProvisionRequested(newInferenceSet) || autoProvisionRequested(oldInferenceSet)
+				return autoProvisionRequestedOrInvalid(newInferenceSet) || autoProvisionRequestedOrInvalid(oldInferenceSet)
 			}
 			return false
 		},
@@ -428,6 +439,7 @@ func isMultiRoleInferenceChild(inferenceSet *kaitov1beta1.InferenceSet) bool {
 // resolveMinReplicas reads the min-replicas annotation. 0 is meaningful (it
 // requests scale-to-zero) and is returned verbatim; anything unparsable or
 // negative falls back to 1, matching the historical behaviour for those inputs.
+// Reconcile normalizes annotations before calling this helper.
 func resolveMinReplicas(annotations map[string]string) int {
 	if minReplicasStr, ok := annotations[constants.AnnotationKeyMinReplicas]; ok {
 		if v, err := strconv.Atoi(minReplicasStr); err == nil && v >= 0 {
@@ -443,8 +455,8 @@ func resolveMinReplicas(annotations map[string]string) int {
 // autoscalingConfigError validates the InferenceSet's autoscaling
 // configuration and returns the Event reason and an error describing the first
 // problem found, or an empty reason and nil when the configuration is valid. It
-// assumes the caller has already confirmed auto-provisioning was requested (see
-// autoProvisionRequested) and only validates the replica bounds and the
+// assumes the caller has normalized annotations and confirmed auto-provisioning
+// was requested, and only validates the replica bounds and the
 // auto-provision configuration.
 //
 // Rejections are reported rather than swallowed: a misconfigured annotation
@@ -477,22 +489,25 @@ func autoscalingConfigError(inferenceSet *kaitov1beta1.InferenceSet, minReplicas
 	return "", nil
 }
 
-// autoProvisionRequested reports whether the InferenceSet opts into
+// autoProvisionRequestedOrInvalid reports whether the InferenceSet opts into
 // auto-provisioning via the scaledobject.kaito.sh/auto-provision annotation.
-func autoProvisionRequested(inferenceSet *kaitov1beta1.InferenceSet) bool {
-	return inferenceSet.Annotations[constants.AnnotationKeyAutoProvision] == "true"
+// Predicates also enqueue conflicts so Reconcile can report them rather than
+// silently ignore invalid configuration (or accidentally trigger cleanup).
+func autoProvisionRequestedOrInvalid(inferenceSet *kaitov1beta1.InferenceSet) bool {
+	annotations, err := scaledobject.NormalizeAnnotations(inferenceSet.Annotations)
+	return err != nil || annotations[constants.AnnotationKeyAutoProvision] == "true"
 }
 
 // annotationsWithPrefixChanged reports whether any annotation key starting with
 // prefix differs between the old and new maps (including keys added or removed).
 func annotationsWithPrefixChanged(oldAnnotations, newAnnotations map[string]string, prefix string) bool {
 	for k, v := range oldAnnotations {
-		if strings.HasPrefix(k, prefix) && newAnnotations[k] != v {
+		if newValue, exists := newAnnotations[k]; strings.HasPrefix(k, prefix) && (!exists || newValue != v) {
 			return true
 		}
 	}
 	for k, v := range newAnnotations {
-		if strings.HasPrefix(k, prefix) && oldAnnotations[k] != v {
+		if oldValue, exists := oldAnnotations[k]; strings.HasPrefix(k, prefix) && (!exists || oldValue != v) {
 			return true
 		}
 	}

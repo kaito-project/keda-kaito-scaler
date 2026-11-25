@@ -22,7 +22,9 @@ package scaledobject
 
 import (
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -343,6 +345,37 @@ type metricSpec struct {
 	MetricCacheWindow *int `json:"metriccachewindow,omitempty"`
 }
 
+// NormalizeAnnotations returns a new map without modifying annotations. It
+// lowercases names under the exact "scaledobject.kaito.sh/" prefix, including
+// unknown names; for example, scaleUpCooldown becomes scaleupcooldown. Other
+// prefixes, hyphens, and all values (including metrics YAML) remain unchanged.
+//
+// Keys that normalize to the same name are accepted only if their raw values
+// match exactly, including empty strings. Otherwise it returns a nil map and
+// an error identifying the original keys. Normalization is idempotent; nil
+// input produces an empty, non-nil map.
+func NormalizeAnnotations(annotations map[string]string) (map[string]string, error) {
+	normalized := make(map[string]string, len(annotations))
+	originalKeys := make(map[string]string, len(annotations))
+	// Sort keys so conflict diagnostics are independent of map iteration order.
+	for _, key := range slices.Sorted(maps.Keys(annotations)) {
+		name := key
+		if strings.HasPrefix(key, constants.AnnotationPrefix) {
+			name = constants.AnnotationPrefix + strings.ToLower(strings.TrimPrefix(key, constants.AnnotationPrefix))
+		}
+		value := annotations[key]
+		if original, exists := originalKeys[name]; exists && normalized[name] != value {
+			return nil, fmt.Errorf("conflicting annotations %s=%q and %s=%q: values must match exactly",
+				original, normalized[name], key, value)
+		}
+		if _, exists := originalKeys[name]; !exists {
+			originalKeys[name] = key
+		}
+		normalized[name] = value
+	}
+	return normalized, nil
+}
+
 // parseMetricsConfig parses and validates the auto-provision annotations into a
 // metricsConfig. The per-metric configuration is read from the
 // scaledobject.kaito.sh/metrics annotation (a YAML list); the remaining global
@@ -353,6 +386,10 @@ type metricSpec struct {
 // including the watch predicates, which have no API client.
 func parseMetricsConfig(annotations map[string]string, minReplicas int) (metricsConfig, error) {
 	var cfg metricsConfig
+	annotations, err := NormalizeAnnotations(annotations)
+	if err != nil {
+		return cfg, err
+	}
 
 	// Scale-to-zero is the only mode with a 0 <-> 1 range, so it is what makes
 	// the activation thresholds meaningful and the up/down band optional.
@@ -501,7 +538,6 @@ func parseMetricsConfig(annotations map[string]string, minReplicas int) (metrics
 		})
 	}
 
-	var err error
 	if cfg.scaleUpStabilizationWindow, err = parseStabilizationWindowAnnotation(annotations, constants.AnnotationKeyScaleUpStabilizationWindow, defaultScaleUpStabilizationWindow); err != nil {
 		return cfg, err
 	}

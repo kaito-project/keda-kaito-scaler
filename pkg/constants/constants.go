@@ -16,6 +16,9 @@
 package constants
 
 const (
+	// AnnotationPrefix is the exact namespace prefix for autoscaling annotations.
+	AnnotationPrefix = "scaledobject.kaito.sh/"
+
 	// AnnotationKeyManagedBy marks a ScaledObject as managed by keda-kaito-scaler.
 	AnnotationKeyManagedBy = "scaledobject.kaito.sh/managed-by"
 	// AnnotationKeyAutoProvision enables auto-provisioning when set to "true".

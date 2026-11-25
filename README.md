@@ -164,23 +164,51 @@ The remaining global annotations:
 | --- | --- | --- | --- |
 | `auto-provision` | yes | – | Must be `"true"` to enable auto-provisioning. |
 | `metrics` | yes | – | YAML/JSON list of metric entries (see fields above). At least one entry is required. |
-| `combinepolicy` | no | `AND` | How per-metric conditions are combined. Only `AND` is currently supported. |
-| `scaleupstabilizationwindow` | no | `60` | HPA scale-up stabilization window (0–3600 seconds). |
-| `scaleupcooldown` | no | `900` | Minimum seconds between scale-up steps (HPA Pods policy period). |
-| `scaledowncooldown` | no | `1800` | Minimum seconds between scale-down steps (HPA Pods policy period). |
+| `combinePolicy` | no | `AND` | How per-metric conditions are combined. Only `AND` is currently supported. |
+| `scaleUpStabilizationWindow` | no | `60` | HPA scale-up stabilization window (0–3600 seconds). |
+| `scaleUpCooldown` | no | `900` | Minimum seconds between scale-up steps (HPA Pods policy period). |
+| `scaleDownCooldown` | no | `1800` | Minimum seconds between scale-down steps (HPA Pods policy period). |
 | `min-replicas` | no | `1` | Minimum replica count. `0` enables [scale to zero](#scale-to-zero); any other value below `1`, or a non-numeric value, collapses to `1`. |
 | `max-replicas` | no | derived from `spec.nodeCountLimit` | Maximum replica count. Must be at least `1` and `>= min-replicas`; if absent, `spec.nodeCountLimit` must be set. |
-| `cooldownperiod` | no | `1800` | Seconds KEDA waits after the last active trigger reading before parking the workload at zero. Requires `min-replicas: "0"`. |
-| `initialcooldownperiod` | no | `1800` | Non-negative int32 seconds after ScaledObject creation before applying the scale-to-zero cooldown. Does not delay initial scale-up. Requires `min-replicas: "0"`. |
-| `scaledownstabilizationwindow` | no | `1800` | HPA scale-down stabilization window (0–3600 seconds), independent of `scaledowncooldown`. |
-| `scaleuptolerance` | no | `0.1` | HPA scale-up tolerance ratio (finite, non-negative); `0` disables the deadband. |
-| `scaledowntolerance` | no | `0.1` | HPA scale-down tolerance ratio (finite, non-negative); `0` disables the deadband. |
+| `cooldownPeriod` | no | `1800` | Seconds KEDA waits after the last active trigger reading before parking the workload at zero. Requires `min-replicas: "0"`. |
+| `initialCooldownPeriod` | no | `1800` | Non-negative int32 seconds after ScaledObject creation before applying the scale-to-zero cooldown. Does not delay initial scale-up. Requires `min-replicas: "0"`. |
+| `scaleDownStabilizationWindow` | no | `1800` | HPA scale-down stabilization window (0–3600 seconds), independent of `scaleDownCooldown`. |
+| `scaleUpTolerance` | no | `0.1` | HPA scale-up tolerance ratio (finite, non-negative); `0` disables the deadband. |
+| `scaleDownTolerance` | no | `0.1` | HPA scale-down tolerance ratio (finite, non-negative); `0` disables the deadband. |
+
+#### Annotation spelling and compatibility
+
+Use the camelCase tuning keys above for new configurations. Annotation **names**
+under the exact `scaledobject.kaito.sh/` namespace prefix are case-insensitive:
+`scaleUpStabilizationWindow`, `scaleupStabilizationWindow`,
+`scaleupstabilizationwindow`, and `SCALEUPSTABILIZATIONWINDOW` are equivalent.
+Existing lowercase spellings remain supported. This applies to every name under
+this prefix, including `metrics`, `auto-provision`, `min-replicas`, and
+`max-replicas`. Hyphens are preserved: `AUTO-PROVISION` is accepted, but
+`autoProvision` is not a spelling of `auto-provision`.
+
+Names are normalized to lowercase before reading configuration. When multiple
+keys normalize to the same name, their raw string values must match exactly.
+Identical values are accepted; different values reject the configuration and
+produce an `InvalidConfig` warning Event rather than choosing one spelling or
+cleaning up existing ScaledObjects. Errors name the original keys in a stable
+order. For example, `"60"` and `"060"` conflict, as do `"AND"` and `"and"`, or an
+empty string and `"60"`. Identical empty values retain the existing behavior for
+that setting (defaults for tuning keys). `cooldownPeriod` and
+`initialCooldownPeriod` still require `min-replicas: "0"`, even when empty.
+Unknown names under this prefix are also normalized and checked for collisions,
+but do not otherwise configure any setting.
+
+The namespace prefix itself must match exactly; other namespaces are untouched.
+Annotation values are never case-normalized, including the `metrics` YAML list.
+Its fields, such as `upthreshold`, `downthreshold`, and `metriccachewindow`, and
+metric names keep their existing parsing behavior.
 
 Each field of the generated HPA behavior is driven by exactly one annotation:
-`scaleupstabilizationwindow` / `scaleupcooldown` (scale-up stabilization window /
-policy period), `scaledownstabilizationwindow` / `scaledowncooldown` (scale-down
-stabilization window / policy period) and `scaleuptolerance` /
-`scaledowntolerance`. The policies always allow one pod per period with
+`scaleUpStabilizationWindow` / `scaleUpCooldown` (scale-up stabilization window /
+policy period), `scaleDownStabilizationWindow` / `scaleDownCooldown` (scale-down
+stabilization window / policy period) and `scaleUpTolerance` /
+`scaleDownTolerance`. The policies always allow one pod per period with
 `selectPolicy: Max`, and only affect 1 ↔ N scaling. Per-direction tolerance
 requires the Kubernetes `HPAConfigurableTolerance` feature gate; a tolerance
 `>= 1` for scale-up or `>= 0.5` for scale-down suppresses that direction's
@@ -264,21 +292,21 @@ spec:
     horizontalPodAutoscalerConfig:
       behavior:
         scaleUp:
-          stabilizationWindowSeconds: 60     # scaleupstabilizationwindow
+          stabilizationWindowSeconds: 60     # scaleUpStabilizationWindow
           selectPolicy: Max
           policies:
             - type: Pods
               value: 1
-              periodSeconds: 900             # scaleupcooldown
-          tolerance: "0.1"                   # scaleuptolerance
+              periodSeconds: 900             # scaleUpCooldown
+          tolerance: "0.1"                   # scaleUpTolerance
         scaleDown:
-          stabilizationWindowSeconds: 1800   # scaledownstabilizationwindow
+          stabilizationWindowSeconds: 1800   # scaleDownStabilizationWindow
           selectPolicy: Max
           policies:
             - type: Pods
               value: 1
-              periodSeconds: 1800            # scaledowncooldown
-          tolerance: "0.1"                   # scaledowntolerance
+              periodSeconds: 1800            # scaleDownCooldown
+          tolerance: "0.1"                   # scaleDownTolerance
     scalingModifiers:
       target: "1"
       metricType: Value
@@ -346,13 +374,13 @@ metadata:
         metriccachewindow: 300
 
     # Optional global tuning (defaults shown)
-    scaledobject.kaito.sh/combinepolicy: "AND"
-    scaledobject.kaito.sh/scaleupstabilizationwindow: "60"
-    scaledobject.kaito.sh/scaleupcooldown: "900"
-    scaledobject.kaito.sh/scaledownstabilizationwindow: "1800"
-    scaledobject.kaito.sh/scaledowncooldown: "1800"
-    scaledobject.kaito.sh/scaleuptolerance: "0.1"
-    scaledobject.kaito.sh/scaledowntolerance: "0.1"
+    scaledobject.kaito.sh/combinePolicy: "AND"
+    scaledobject.kaito.sh/scaleUpStabilizationWindow: "60"
+    scaledobject.kaito.sh/scaleUpCooldown: "900"
+    scaledobject.kaito.sh/scaleDownStabilizationWindow: "1800"
+    scaledobject.kaito.sh/scaleDownCooldown: "1800"
+    scaledobject.kaito.sh/scaleUpTolerance: "0.1"
+    scaledobject.kaito.sh/scaleDownTolerance: "0.1"
   name: phi-4
   namespace: default
 spec:
@@ -413,21 +441,21 @@ spec:
     horizontalPodAutoscalerConfig:
       behavior:
         scaleUp:
-          stabilizationWindowSeconds: 60     # scaleupstabilizationwindow
+          stabilizationWindowSeconds: 60     # scaleUpStabilizationWindow
           selectPolicy: Max
           policies:
             - type: Pods
               value: 1
-              periodSeconds: 900             # scaleupcooldown
-          tolerance: "0.1"                   # scaleuptolerance
+              periodSeconds: 900             # scaleUpCooldown
+          tolerance: "0.1"                   # scaleUpTolerance
         scaleDown:
-          stabilizationWindowSeconds: 1800   # scaledownstabilizationwindow
+          stabilizationWindowSeconds: 1800   # scaleDownStabilizationWindow
           selectPolicy: Max
           policies:
             - type: Pods
               value: 1
-              periodSeconds: 1800            # scaledowncooldown
-          tolerance: "0.1"                   # scaledowntolerance
+              periodSeconds: 1800            # scaleDownCooldown
+          tolerance: "0.1"                   # scaleDownTolerance
     scalingModifiers:
       target: "1"
       metricType: Value
@@ -496,9 +524,9 @@ spec:
 >   replicas are Ready, so we don't pile on more while pods are still warming up)
 >   **and** *every* metric is above its `upthreshold`. The `2.0` asks HPA to
 >   double, but the `scaleUp` behavior policy caps the real move at **+1 replica**
->   per `scaleupcooldown`.
+>   per `scaleUpCooldown`.
 > - **Scale down → `0.5`** fires when *every* metric is below its `downthreshold`.
->   The `0.5` asks HPA to halve, capped at **−1 replica** per `scaledowncooldown`.
+>   The `0.5` asks HPA to halve, capped at **−1 replica** per `scaleDownCooldown`.
 > - **Hold → `1.0`** is the default for any mixed or in-between state; multiplying
 >   by 1 leaves the replica count unchanged.
 >
@@ -524,7 +552,7 @@ The 1..N range keeps working exactly as described above. Scale to zero adds the
   does not infer one from the activation value.
 - **`deactivationthreshold`** parks it. *Every* metric that declares one must
   agree the workload is idle (an **AND**), and the wait before parking is
-  governed by `cooldownperiod`.
+  governed by `cooldownPeriod`.
 
 ###### Why activation has to come from the Endpoint Picker
 
@@ -602,17 +630,17 @@ waiting for a backend, so the activation contract is:
   fail. Choose `0` unless you deliberately want a minimum demand level before
   paying for a GPU.
 - Cold start is not instant: the workload has to acquire a node, pull the model
-  and become Ready. Size `cooldownperiod` against how often you are willing to
+  and become Ready. Size `cooldownPeriod` against how often you are willing to
   pay that cost.
 - The workload can park again before the GPU is ready. Until KAITO creates the
   model Service, which happens after the node is provisioned, `modelpod` metrics
   report `0`, so only the EPP queue keeps the workload awake. The EPP queue
   still drains only through the TTL, so with deactivation threshold `D` the
   workload stays awake only while `RPS > D / TTL`. Once that no longer holds,
-  it parks after `cooldownperiod`. Set `cooldownperiod` to at least the
+  it parks after `cooldownPeriod`. Set `cooldownPeriod` to at least the
   worst-case node provisioning time.
-- `cooldownperiod` applies only once the workload has been active. Before its
-  first activation, KEDA uses `initialcooldownperiod` instead (default `1800`
+- `cooldownPeriod` applies only once the workload has been active. Before its
+  first activation, KEDA uses `initialCooldownPeriod` instead (default `1800`
   seconds, counted from ScaledObject creation), so a newly deployed
   `InferenceSet` with no traffic can park once it elapses. Set it to at least
   the worst-case time to provision the first GPU node.
@@ -630,7 +658,7 @@ metadata:
     scaledobject.kaito.sh/max-replicas: "5"
 
     # Wait 10 minutes of idleness before releasing the GPU.
-    scaledobject.kaito.sh/cooldownperiod: "600"
+    scaledobject.kaito.sh/cooldownPeriod: "600"
 
     scaledobject.kaito.sh/metrics: |
       # 0 -> 1: any request queued at the router wakes the workload.
@@ -691,7 +719,7 @@ are not used.
 
 - To turn scale to zero off, make these changes together:
   - Set `min-replicas` to `1` or higher, or remove it.
-  - Remove `cooldownperiod` and `initialcooldownperiod`.
+  - Remove `cooldownPeriod` and `initialCooldownPeriod`.
   - Remove every `activationthreshold` and `deactivationthreshold`.
   - Give every remaining metric an up/down threshold pair, and remove metrics
     that only drove activation or deactivation.
