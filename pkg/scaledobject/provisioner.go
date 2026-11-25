@@ -345,14 +345,19 @@ type metricSpec struct {
 	MetricCacheWindow *int `json:"metriccachewindow,omitempty"`
 }
 
-// NormalizeAnnotations returns a copy with names under the exact autoscaling
-// namespace prefix lowercased. Unknown names follow the same rules; other
-// namespaces and all values (including metrics YAML) are untouched. Colliding
-// names must have identical raw values. Sorting makes conflict errors stable
-// and preserves the original keys in diagnostics. The result is idempotent.
+// NormalizeAnnotations returns a new map without modifying annotations. It
+// lowercases names under the exact "scaledobject.kaito.sh/" prefix, including
+// unknown names; for example, scaleUpCooldown becomes scaleupcooldown. Other
+// prefixes, hyphens, and all values (including metrics YAML) remain unchanged.
+//
+// Keys that normalize to the same name are accepted only if their raw values
+// match exactly, including empty strings. Otherwise it returns a nil map and
+// an error identifying the original keys. Normalization is idempotent; nil
+// input produces an empty, non-nil map.
 func NormalizeAnnotations(annotations map[string]string) (map[string]string, error) {
 	normalized := make(map[string]string, len(annotations))
 	originalKeys := make(map[string]string, len(annotations))
+	// Sort keys so conflict diagnostics are independent of map iteration order.
 	for _, key := range slices.Sorted(maps.Keys(annotations)) {
 		name := key
 		if strings.HasPrefix(key, constants.AnnotationPrefix) {
